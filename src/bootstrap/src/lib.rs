@@ -832,8 +832,8 @@ impl Build {
             features.insert("profiler");
         }
 
-        // If zkvm target, generate memcpy, etc.
-        if target.contains("zkvm") {
+        // If zkvm or toyos target, generate memcpy, etc.
+        if target.contains("zkvm") || target.contains("toyos") {
             features.insert("compiler-builtins-mem");
         }
 

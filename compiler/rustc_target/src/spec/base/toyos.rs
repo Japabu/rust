@@ -1,4 +1,6 @@
-use crate::spec::{Cc, LinkerFlavor, Lld, Os, RelocModel, StackProbeType, TargetOptions};
+use crate::spec::{
+    Cc, LinkerFlavor, Lld, Os, PanicStrategy, RelocModel, StackProbeType, TargetOptions,
+};
 
 pub(crate) fn opts() -> TargetOptions {
     TargetOptions {
@@ -10,6 +12,7 @@ pub(crate) fn opts() -> TargetOptions {
         position_independent_executables: true,
         has_thread_local: false,
         main_needs_argc_argv: false,
+        panic_strategy: PanicStrategy::Abort,
         ..Default::default()
     }
 }
