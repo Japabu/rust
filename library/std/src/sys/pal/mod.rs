@@ -60,6 +60,10 @@ cfg_select! {
         mod zkvm;
         pub use self::zkvm::*;
     }
+    target_os = "toyos" => {
+        mod toyos;
+        pub use self::toyos::*;
+    }
     _ => {
         mod unsupported;
         pub use self::unsupported::*;

@@ -40,6 +40,7 @@ cfg_select! {
         pub use xous::*;
     }
     any(
+        target_os = "toyos",
         target_os = "vexos",
         target_family = "wasm",
         target_os = "zkvm",

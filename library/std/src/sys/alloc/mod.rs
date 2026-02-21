@@ -95,6 +95,9 @@ cfg_select! {
     target_os = "uefi" => {
         mod uefi;
     }
+    target_os = "toyos" => {
+        mod toyos;
+    }
     target_os = "vexos" => {
         mod vexos;
     }

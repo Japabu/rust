@@ -33,6 +33,10 @@ cfg_select! {
         mod uefi;
         pub use uefi::*;
     }
+    target_os = "toyos" => {
+        mod toyos;
+        pub use toyos::*;
+    }
     target_os = "vexos" => {
         mod vexos;
         pub use vexos::*;

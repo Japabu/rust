@@ -78,6 +78,10 @@ cfg_select! {
         mod teeos;
         pub use teeos::fill_bytes;
     }
+    target_os = "toyos" => {
+        mod toyos;
+        pub use toyos::fill_bytes;
+    }
     target_os = "trusty" => {
         mod trusty;
         pub use trusty::fill_bytes;
