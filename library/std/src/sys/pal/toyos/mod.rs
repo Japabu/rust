@@ -6,11 +6,38 @@ mod unsupported_common;
 
 pub use unsupported_common::{cleanup, init, unsupported};
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+// argc/argv stored by _start for std::env::args()
+pub(crate) static ARGC: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static ARGV: AtomicUsize = AtomicUsize::new(0); // *const *const u8 as usize
+
 #[unsafe(no_mangle)]
-extern "C" fn _start() -> ! {
+#[unsafe(naked)]
+unsafe extern "C" fn _start() -> ! {
+    // Stack layout at entry (set up by kernel):
+    //   [RSP]   = argc
+    //   [RSP+8] = argv[0], argv[1], ..., NULL
+    core::arch::naked_asm!(
+        "mov rdi, [rsp]",
+        "lea rsi, [rsp + 8]",
+        "call {start_rust}",
+        "ud2",
+        start_rust = sym start_rust,
+    );
+}
+
+extern "C" fn start_rust(argc: usize, argv: *const *const u8) -> ! {
     unsafe extern "C" {
         fn main() -> i32;
     }
+    ARGC.store(argc, Ordering::Relaxed);
+    ARGV.store(argv as usize, Ordering::Relaxed);
+
+    // Initialize environment variables and seed defaults
+    crate::sys::env::init();
+    unsafe { crate::sys::env::setenv("HOME".as_ref(), "/".as_ref()).ok(); }
+
     let code = unsafe { main() };
     exit(code)
 }

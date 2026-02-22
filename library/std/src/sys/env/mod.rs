@@ -8,6 +8,7 @@
     target_os = "motor",
     all(target_vendor = "fortanix", target_env = "sgx"),
     target_os = "solid_asp3",
+    target_os = "toyos",
     target_os = "uefi",
     target_os = "wasi",
     target_os = "xous",
@@ -50,6 +51,10 @@ cfg_select! {
     target_os = "xous" => {
         mod xous;
         pub use xous::*;
+    }
+    target_os = "toyos" => {
+        mod toyos;
+        pub use toyos::*;
     }
     target_os = "zkvm" => {
         mod zkvm;
