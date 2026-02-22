@@ -142,12 +142,6 @@ pub fn clock() -> u64 {
     syscall(SYS_CLOCK, 0, 0, 0, 0)
 }
 
-#[inline(always)]
-#[allow(dead_code)]
-pub fn screen_size() -> u64 {
-    syscall(SYS_SCREEN_SIZE, 0, 0, 0, 0)
-}
-
 // --- fs ---
 
 #[inline(always)]
