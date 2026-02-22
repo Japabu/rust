@@ -57,7 +57,6 @@ const SYS_FREE: u64 = 3;
 const SYS_REALLOC: u64 = 4;
 const SYS_EXIT: u64 = 5;
 const SYS_RANDOM: u64 = 6;
-#[allow(dead_code)]
 const SYS_SCREEN_SIZE: u64 = 7;
 const SYS_CLOCK: u64 = 8;
 const SYS_OPEN: u64 = 9;
@@ -70,7 +69,9 @@ const SYS_FSYNC: u64 = 15;
 const SYS_EXEC: u64 = 16;
 const SYS_READDIR: u64 = 17;
 const SYS_DELETE: u64 = 18;
+const SYS_SHUTDOWN: u64 = 19;
 const SYS_CHDIR: u64 = 20;
+const SYS_SET_KEYBOARD_LAYOUT: u64 = 23;
 const SYS_GETCWD: u64 = 21;
 
 #[inline(always)]
@@ -204,4 +205,21 @@ pub fn chdir(path: *const u8, path_len: usize) -> u64 {
 #[inline(always)]
 pub fn getcwd(buf: *mut u8, buf_len: usize) -> u64 {
     syscall(SYS_GETCWD, buf as u64, buf_len as u64, 0, 0)
+}
+
+// --- toyos-specific ---
+
+#[inline(always)]
+pub fn screen_size() -> u64 {
+    syscall(SYS_SCREEN_SIZE, 0, 0, 0, 0)
+}
+
+#[inline(always)]
+pub fn shutdown() {
+    syscall(SYS_SHUTDOWN, 0, 0, 0, 0);
+}
+
+#[inline(always)]
+pub fn set_keyboard_layout(name: *const u8, len: usize) -> u64 {
+    syscall(SYS_SET_KEYBOARD_LAYOUT, name as u64, len as u64, 0, 0)
 }

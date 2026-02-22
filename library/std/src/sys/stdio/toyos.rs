@@ -1,4 +1,117 @@
 use crate::io::{self, IoSlice, IoSliceMut};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+// ---------------------------------------------------------------------------
+// Stdin mode flag (canonical by default, raw when explicitly switched)
+// ---------------------------------------------------------------------------
+
+static STDIN_RAW: AtomicBool = AtomicBool::new(false);
+
+pub fn set_stdin_raw(raw: bool) {
+    STDIN_RAW.store(raw, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// Canonical line buffer
+// ---------------------------------------------------------------------------
+
+const LINE_BUF_CAP: usize = 256;
+
+struct LineBuf {
+    buf: [u8; LINE_BUF_CAP],
+    len: usize,
+    pos: usize,
+}
+
+// Safety: Stdin::read() is always called under the global Stdin mutex and ToyOS
+// is single-threaded, so there is no concurrent access.
+static mut LINE_BUF: LineBuf = LineBuf { buf: [0; LINE_BUF_CAP], len: 0, pos: 0 };
+
+fn read_one() -> io::Result<u8> {
+    let mut byte = [0u8; 1];
+    let n = crate::sys::pal::read(byte.as_mut_ptr(), 1);
+    if n < 0 {
+        Err(io::Error::new(io::ErrorKind::Other, "toyos io error"))
+    } else if n == 0 {
+        Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"))
+    } else {
+        Ok(byte[0])
+    }
+}
+
+fn echo(bytes: &[u8]) {
+    crate::sys::pal::write(bytes.as_ptr(), bytes.len());
+}
+
+/// Canonical read: line editing with echo. Buffers a complete line, then
+/// serves bytes from the buffer on subsequent calls.
+fn canonical_read(buf: &mut [u8]) -> io::Result<usize> {
+    // Safety: see LINE_BUF comment above.
+    let lb = unsafe { &mut *core::ptr::addr_of_mut!(LINE_BUF) };
+
+    // Serve remaining data from a previous line first.
+    if lb.pos < lb.len {
+        let avail = lb.len - lb.pos;
+        let n = avail.min(buf.len());
+        buf[..n].copy_from_slice(&lb.buf[lb.pos..lb.pos + n]);
+        lb.pos += n;
+        return Ok(n);
+    }
+
+    // Read a new line with echo + backspace handling.
+    lb.len = 0;
+    lb.pos = 0;
+
+    loop {
+        let ch = read_one()?;
+        match ch {
+            b'\r' | b'\n' => {
+                // Translate CR to LF (like Unix terminal driver ICRNL)
+                echo(b"\n");
+                if lb.len < LINE_BUF_CAP {
+                    lb.buf[lb.len] = b'\n';
+                    lb.len += 1;
+                }
+                let n = lb.len.min(buf.len());
+                buf[..n].copy_from_slice(&lb.buf[..n]);
+                lb.pos = n;
+                return Ok(n);
+            }
+            0x08 | 0x7F => {
+                // Backspace: erase last UTF-8 character
+                if lb.len > 0 {
+                    // Scan past continuation bytes (10xxxxxx)
+                    lb.len -= 1;
+                    while lb.len > 0 && (lb.buf[lb.len] & 0xC0) == 0x80 {
+                        lb.len -= 1;
+                    }
+                    echo(b"\x08 \x08");
+                }
+            }
+            ch if ch >= 0x20 || (ch & 0xC0) == 0x80 => {
+                // Printable ASCII or UTF-8 continuation byte
+                if lb.len < LINE_BUF_CAP - 1 {
+                    lb.buf[lb.len] = ch;
+                    lb.len += 1;
+                    echo(&[ch]);
+                }
+            }
+            ch if (ch & 0xC0) == 0xC0 => {
+                // UTF-8 lead byte
+                if lb.len < LINE_BUF_CAP - 1 {
+                    lb.buf[lb.len] = ch;
+                    lb.len += 1;
+                    echo(&[ch]);
+                }
+            }
+            _ => {} // ignore other control characters
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stdin
+// ---------------------------------------------------------------------------
 
 pub struct Stdin;
 pub struct Stdout;
@@ -12,8 +125,12 @@ impl Stdin {
 
 impl io::Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = crate::sys::pal::read(buf.as_mut_ptr(), buf.len());
-        if n < 0 { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
+        if STDIN_RAW.load(Ordering::Relaxed) {
+            let n = crate::sys::pal::read(buf.as_mut_ptr(), buf.len());
+            if n < 0 { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
+        } else {
+            canonical_read(buf)
+        }
     }
 
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
@@ -66,4 +183,31 @@ pub fn is_ebadf(_err: &io::Error) -> bool {
 
 pub fn panic_output() -> Option<Vec<u8>> {
     Some(Vec::new())
+}
+
+// ---------------------------------------------------------------------------
+// ToyOS-specific public API helpers (forwarded from std::os::toyos)
+// ---------------------------------------------------------------------------
+
+pub fn read_stdin_raw(buf: &mut [u8]) -> io::Result<usize> {
+    let n = crate::sys::pal::read(buf.as_mut_ptr(), buf.len());
+    if n < 0 {
+        Err(io::Error::new(io::ErrorKind::Other, "toyos io error"))
+    } else {
+        Ok(n as usize)
+    }
+}
+
+pub fn screen_size() -> (usize, usize) {
+    let raw = crate::sys::pal::screen_size();
+    ((raw >> 32) as usize, (raw & 0xFFFF_FFFF) as usize)
+}
+
+pub fn set_keyboard_layout(name: &str) -> bool {
+    crate::sys::pal::set_keyboard_layout(name.as_ptr(), name.len()) != 0
+}
+
+pub fn shutdown() -> ! {
+    crate::sys::pal::shutdown();
+    loop {}
 }

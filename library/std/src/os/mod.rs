@@ -173,6 +173,8 @@ pub mod rtems;
 pub mod solaris;
 #[cfg(target_os = "solid_asp3")]
 pub mod solid;
+#[cfg(target_os = "toyos")]
+pub mod toyos;
 #[cfg(target_os = "trusty")]
 pub mod trusty;
 #[cfg(target_os = "uefi")]
