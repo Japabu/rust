@@ -342,7 +342,7 @@ impl DirBuilder {
     }
 
     pub fn mkdir(&self, _p: &Path) -> io::Result<()> {
-        panic!("mkdir not implemented")
+        Ok(()) // Directories are virtual (derived from file path prefixes)
     }
 }
 

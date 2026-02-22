@@ -36,7 +36,10 @@ extern "C" fn start_rust(argc: usize, argv: *const *const u8) -> ! {
 
     // Initialize environment variables and seed defaults
     crate::sys::env::init();
-    unsafe { crate::sys::env::setenv("HOME".as_ref(), "/".as_ref()).ok(); }
+    unsafe {
+        crate::sys::env::setenv("HOME".as_ref(), "/".as_ref()).ok();
+        crate::sys::env::setenv("XDG_CONFIG_HOME".as_ref(), "/nvme/config".as_ref()).ok();
+    }
 
     let code = unsafe { main() };
     exit(code)
