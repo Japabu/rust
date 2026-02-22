@@ -65,6 +65,10 @@ const SYS_SEEK: u64 = 13;
 const SYS_FSTAT: u64 = 14;
 const SYS_FSYNC: u64 = 15;
 const SYS_EXEC: u64 = 16;
+const SYS_READDIR: u64 = 17;
+const SYS_DELETE: u64 = 18;
+const SYS_CHDIR: u64 = 20;
+const SYS_GETCWD: u64 = 21;
 
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -122,8 +126,8 @@ pub fn exit(code: i32) -> ! {
 }
 
 #[inline(always)]
-pub fn exec(path: *const u8, path_len: usize, out_buf: *mut u8, out_buf_len: usize) -> u64 {
-    syscall(SYS_EXEC, path as u64, path_len as u64, out_buf as u64, out_buf_len as u64)
+pub fn exec(argv_buf: *const u8, argv_len: usize, out_buf: *mut u8, out_buf_len: usize) -> u64 {
+    syscall(SYS_EXEC, argv_buf as u64, argv_len as u64, out_buf as u64, out_buf_len as u64)
 }
 
 // --- misc ---
@@ -179,4 +183,28 @@ pub fn fstat(fd: u64) -> u64 {
 #[inline(always)]
 pub fn fsync(fd: u64) {
     syscall(SYS_FSYNC, fd, 0, 0, 0);
+}
+
+// --- readdir / delete ---
+
+#[inline(always)]
+pub fn readdir(path: *const u8, path_len: usize, buf: *mut u8, buf_len: usize) -> u64 {
+    syscall(SYS_READDIR, path as u64, path_len as u64, buf as u64, buf_len as u64)
+}
+
+#[inline(always)]
+pub fn delete(path: *const u8, path_len: usize) -> u64 {
+    syscall(SYS_DELETE, path as u64, path_len as u64, 0, 0)
+}
+
+// --- cwd ---
+
+#[inline(always)]
+pub fn chdir(path: *const u8, path_len: usize) -> u64 {
+    syscall(SYS_CHDIR, path as u64, path_len as u64, 0, 0)
+}
+
+#[inline(always)]
+pub fn getcwd(buf: *mut u8, buf_len: usize) -> u64 {
+    syscall(SYS_GETCWD, buf as u64, buf_len as u64, 0, 0)
 }

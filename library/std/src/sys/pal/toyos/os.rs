@@ -3,14 +3,25 @@ use crate::marker::PhantomData;
 use crate::path::{self, PathBuf};
 use crate::{fmt, io};
 
-use super::unsupported;
-
 pub fn getcwd() -> io::Result<PathBuf> {
-    unsupported()
+    let mut buf = [0u8; 256];
+    let n = super::getcwd(buf.as_mut_ptr(), buf.len());
+    if n == u64::MAX {
+        return Err(io::Error::new(io::ErrorKind::Other, "getcwd failed"));
+    }
+    let s = core::str::from_utf8(&buf[..n as usize])
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "invalid utf-8 in cwd"))?;
+    Ok(PathBuf::from(s))
 }
 
-pub fn chdir(_: &path::Path) -> io::Result<()> {
-    unsupported()
+pub fn chdir(p: &path::Path) -> io::Result<()> {
+    let bytes = p.as_os_str().as_encoded_bytes();
+    let result = super::chdir(bytes.as_ptr(), bytes.len());
+    if result == u64::MAX {
+        Err(io::Error::new(io::ErrorKind::NotFound, "no such directory"))
+    } else {
+        Ok(())
+    }
 }
 
 pub struct SplitPaths<'a>(!, PhantomData<&'a ()>);
@@ -46,7 +57,7 @@ impl fmt::Display for JoinPathsError {
 impl crate::error::Error for JoinPathsError {}
 
 pub fn current_exe() -> io::Result<PathBuf> {
-    unsupported()
+    panic!("current_exe not implemented")
 }
 
 pub fn temp_dir() -> PathBuf {

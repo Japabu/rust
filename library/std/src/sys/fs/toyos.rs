@@ -13,21 +13,25 @@ const O_WRITE: u64 = 2;
 const O_CREATE: u64 = 4;
 const O_TRUNCATE: u64 = 8;
 
-fn unsupported<T>() -> io::Result<T> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "not supported on toyos"))
-}
-
 pub struct File(u64); // file descriptor
 
 #[derive(Clone)]
 pub struct FileAttr {
     size: u64,
-    file_type: u64, // 1 = regular file
+    file_type: u64, // 1 = regular file, 2 = directory
 }
 
-pub struct ReadDir(!);
+pub struct ReadDir {
+    entries: Vec<DirEntry>,
+    index: usize,
+}
 
-pub struct DirEntry(!);
+pub struct DirEntry {
+    dir_path: PathBuf,
+    name: OsString,
+    size: u64,
+    is_dir: bool,
+}
 
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
@@ -68,7 +72,7 @@ impl FileAttr {
     pub fn file_type(&self) -> FileType {
         FileType {
             is_file: self.file_type == 1,
-            is_dir: false,
+            is_dir: self.file_type == 2,
         }
     }
 
@@ -115,8 +119,8 @@ impl FileType {
 }
 
 impl fmt::Debug for ReadDir {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadDir").finish_non_exhaustive()
     }
 }
 
@@ -124,25 +128,44 @@ impl Iterator for ReadDir {
     type Item = io::Result<DirEntry>;
 
     fn next(&mut self) -> Option<io::Result<DirEntry>> {
-        self.0
+        if self.index < self.entries.len() {
+            let i = self.index;
+            self.index += 1;
+            // Reconstruct entry (we can't move out of Vec while iterating)
+            let e = &self.entries[i];
+            Some(Ok(DirEntry {
+                dir_path: e.dir_path.clone(),
+                name: e.name.clone(),
+                size: e.size,
+                is_dir: e.is_dir,
+            }))
+        } else {
+            None
+        }
     }
 }
 
 impl DirEntry {
     pub fn path(&self) -> PathBuf {
-        self.0
+        self.dir_path.join(&self.name)
     }
 
     pub fn file_name(&self) -> OsString {
-        self.0
+        self.name.clone()
     }
 
     pub fn metadata(&self) -> io::Result<FileAttr> {
-        self.0
+        Ok(FileAttr {
+            size: self.size,
+            file_type: if self.is_dir { 2 } else { 1 },
+        })
     }
 
     pub fn file_type(&self) -> io::Result<FileType> {
-        self.0
+        Ok(FileType {
+            is_file: !self.is_dir,
+            is_dir: self.is_dir,
+        })
     }
 }
 
@@ -213,7 +236,7 @@ impl File {
     pub fn unlock(&self) -> io::Result<()> { Ok(()) }
 
     pub fn truncate(&self, _size: u64) -> io::Result<()> {
-        unsupported()
+        panic!("File::truncate not implemented")
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -295,7 +318,7 @@ impl File {
     }
 
     pub fn duplicate(&self) -> io::Result<File> {
-        unsupported()
+        panic!("File::duplicate not implemented")
     }
 
     pub fn set_permissions(&self, _perm: FilePermissions) -> io::Result<()> {
@@ -319,7 +342,7 @@ impl DirBuilder {
     }
 
     pub fn mkdir(&self, _p: &Path) -> io::Result<()> {
-        unsupported()
+        panic!("mkdir not implemented")
     }
 }
 
@@ -329,16 +352,59 @@ impl fmt::Debug for File {
     }
 }
 
-pub fn readdir(_p: &Path) -> io::Result<ReadDir> {
-    unsupported()
+pub fn readdir(p: &Path) -> io::Result<ReadDir> {
+    let path_bytes = p.as_os_str().as_encoded_bytes();
+    let mut buf = vec![0u8; 65536];
+    let n = crate::sys::pal::readdir(
+        path_bytes.as_ptr(),
+        path_bytes.len(),
+        buf.as_mut_ptr(),
+        buf.len(),
+    );
+    if n == u64::MAX {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "directory not found"));
+    }
+
+    // Parse entries: type_u8 name_bytes \0 size_u64_le
+    let data = &buf[..n as usize];
+    let mut entries = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        if pos + 1 >= data.len() { break; }
+        let entry_type = data[pos];
+        pos += 1;
+        let name_end = match data[pos..].iter().position(|&b| b == 0) {
+            Some(i) => pos + i,
+            None => break,
+        };
+        let name = core::str::from_utf8(&data[pos..name_end]).unwrap_or("");
+        pos = name_end + 1;
+        if pos + 8 > data.len() { break; }
+        let size = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        entries.push(DirEntry {
+            dir_path: p.to_path_buf(),
+            name: OsString::from(name),
+            size,
+            is_dir: entry_type == 2,
+        });
+    }
+
+    Ok(ReadDir { entries, index: 0 })
 }
 
-pub fn unlink(_p: &Path) -> io::Result<()> {
-    unsupported()
+pub fn unlink(p: &Path) -> io::Result<()> {
+    let path_bytes = p.as_os_str().as_encoded_bytes();
+    let result = crate::sys::pal::delete(path_bytes.as_ptr(), path_bytes.len());
+    if result == u64::MAX {
+        Err(io::Error::new(io::ErrorKind::NotFound, "file not found"))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn rename(_old: &Path, _new: &Path) -> io::Result<()> {
-    unsupported()
+    panic!("rename not implemented")
 }
 
 pub fn set_perm(_p: &Path, _perm: FilePermissions) -> io::Result<()> {
@@ -346,11 +412,11 @@ pub fn set_perm(_p: &Path, _perm: FilePermissions) -> io::Result<()> {
 }
 
 pub fn rmdir(_p: &Path) -> io::Result<()> {
-    unsupported()
+    panic!("rmdir not implemented")
 }
 
 pub fn remove_dir_all(_path: &Path) -> io::Result<()> {
-    unsupported()
+    panic!("remove_dir_all not implemented")
 }
 
 pub fn exists(path: &Path) -> io::Result<bool> {
@@ -365,15 +431,15 @@ pub fn exists(path: &Path) -> io::Result<bool> {
 }
 
 pub fn readlink(_p: &Path) -> io::Result<PathBuf> {
-    unsupported()
+    panic!("readlink not implemented")
 }
 
 pub fn symlink(_original: &Path, _link: &Path) -> io::Result<()> {
-    unsupported()
+    panic!("symlink not implemented")
 }
 
 pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> {
-    unsupported()
+    panic!("link not implemented")
 }
 
 pub fn stat(path: &Path) -> io::Result<FileAttr> {
@@ -397,17 +463,17 @@ pub fn lstat(p: &Path) -> io::Result<FileAttr> {
 }
 
 pub fn canonicalize(_p: &Path) -> io::Result<PathBuf> {
-    unsupported()
+    panic!("canonicalize not implemented")
 }
 
 pub fn copy(_from: &Path, _to: &Path) -> io::Result<u64> {
-    unsupported()
+    panic!("copy not implemented")
 }
 
 pub fn set_times(_p: &Path, _times: FileTimes) -> io::Result<()> {
-    unsupported()
+    panic!("set_times not implemented")
 }
 
 pub fn set_times_nofollow(_p: &Path, _times: FileTimes) -> io::Result<()> {
-    unsupported()
+    panic!("set_times_nofollow not implemented")
 }

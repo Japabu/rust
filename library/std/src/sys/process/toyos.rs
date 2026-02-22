@@ -95,13 +95,38 @@ impl Command {
 
     pub fn spawn(
         &mut self,
-        _default: Stdio,
+        default: Stdio,
         _needs_stdin: bool,
     ) -> io::Result<(Process, StdioPipes)> {
-        // Allocate output buffer (64KB)
-        let mut stdout_buf = vec![0u8; 65536];
-        let path = self.program.as_encoded_bytes();
-        let result = crate::sys::pal::exec(path.as_ptr(), path.len(), stdout_buf.as_mut_ptr(), stdout_buf.len());
+        // Build null-separated argv buffer: "path\0arg1\0arg2"
+        let mut argv_buf = Vec::new();
+        argv_buf.extend_from_slice(self.program.as_encoded_bytes());
+        for arg in &self.args[1..] {
+            argv_buf.push(0);
+            argv_buf.extend_from_slice(arg.as_encoded_bytes());
+        }
+
+        // Capture stdout only when piped (e.g. Command::output())
+        let capture = matches!(
+            self.stdout.as_ref().unwrap_or(&default),
+            Stdio::MakePipe
+        );
+
+        let (out_ptr, out_len, mut stdout_buf) = if capture {
+            let buf = vec![0u8; 65536];
+            let ptr = buf.as_ptr() as *mut u8;
+            let len = buf.len();
+            (ptr, len, buf)
+        } else {
+            (core::ptr::null_mut(), 0, Vec::new())
+        };
+
+        let result = crate::sys::pal::exec(
+            argv_buf.as_ptr(),
+            argv_buf.len(),
+            out_ptr,
+            out_len,
+        );
 
         if result == u64::MAX {
             return Err(io::Error::new(io::ErrorKind::NotFound, "program not found"));
