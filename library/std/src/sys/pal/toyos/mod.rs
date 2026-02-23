@@ -74,6 +74,7 @@ const SYS_PIPE: u64 = 24;
 const SYS_SPAWN: u64 = 25;
 const SYS_WAITPID: u64 = 26;
 const SYS_POLL: u64 = 27;
+const SYS_MARK_TTY: u64 = 28;
 
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -230,5 +231,10 @@ pub fn waitpid(pid: u64) -> u64 {
 #[inline(always)]
 pub fn poll(fd1: u64, fd2: u64) -> u64 {
     syscall(SYS_POLL, fd1, fd2, 0, 0)
+}
+
+#[inline(always)]
+pub fn mark_tty(fd: u64) -> u64 {
+    syscall(SYS_MARK_TTY, fd, 0, 0, 0)
 }
 

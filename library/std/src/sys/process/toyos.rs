@@ -28,10 +28,11 @@ pub enum Stdio {
     Inherit,
     Null,
     MakePipe,
+    MakeTtyPipe,
     ParentStdout,
     ParentStderr,
-    #[allow(dead_code)]
     InheritFile(File),
+    InheritPipe(Pipe),
 }
 
 impl Command {
@@ -112,13 +113,19 @@ impl Command {
         let mut child_stdin_pipe: Option<Pipe> = None;
         let mut parent_stdin_pipe: Option<Pipe> = None;
         let child_stdin_fd = match stdin {
-            Stdio::MakePipe => {
+            Stdio::MakePipe | Stdio::MakeTtyPipe => {
                 let (r, w) = crate::sys::pipe::pipe()?;
+                if matches!(stdin, Stdio::MakeTtyPipe) {
+                    crate::sys::pal::mark_tty(r.raw_fd());
+                    crate::sys::pal::mark_tty(w.raw_fd());
+                }
                 let fd = r.raw_fd();
                 child_stdin_pipe = Some(r);
                 parent_stdin_pipe = Some(w);
                 fd
             }
+            Stdio::InheritFile(file) => file.raw_fd(),
+            Stdio::InheritPipe(pipe) => pipe.raw_fd(),
             _ => u64::MAX,
         };
 
@@ -126,13 +133,19 @@ impl Command {
         let mut child_stdout_pipe: Option<Pipe> = None;
         let mut parent_stdout_pipe: Option<Pipe> = None;
         let child_stdout_fd = match stdout {
-            Stdio::MakePipe => {
+            Stdio::MakePipe | Stdio::MakeTtyPipe => {
                 let (r, w) = crate::sys::pipe::pipe()?;
+                if matches!(stdout, Stdio::MakeTtyPipe) {
+                    crate::sys::pal::mark_tty(r.raw_fd());
+                    crate::sys::pal::mark_tty(w.raw_fd());
+                }
                 let fd = w.raw_fd();
                 parent_stdout_pipe = Some(r);
                 child_stdout_pipe = Some(w);
                 fd
             }
+            Stdio::InheritFile(file) => file.raw_fd(),
+            Stdio::InheritPipe(pipe) => pipe.raw_fd(),
             _ => u64::MAX,
         };
 
@@ -173,8 +186,8 @@ pub fn output(cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
 }
 
 impl From<ChildPipe> for Stdio {
-    fn from(_pipe: ChildPipe) -> Stdio {
-        panic!("converting ChildPipe to Stdio not supported on ToyOS");
+    fn from(pipe: ChildPipe) -> Stdio {
+        Stdio::InheritPipe(pipe)
     }
 }
 

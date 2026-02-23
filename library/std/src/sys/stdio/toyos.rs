@@ -125,7 +125,9 @@ impl Stdin {
 
 impl io::Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if STDIN_RAW.load(Ordering::Relaxed) {
+        let fd0_type = crate::sys::pal::fstat(0) >> 32;
+        let interactive = fd0_type == 3 || fd0_type == 6;
+        if STDIN_RAW.load(Ordering::Relaxed) || !interactive {
             let n = crate::sys::pal::read(0, buf.as_mut_ptr(), buf.len());
             if n == u64::MAX { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
         } else {

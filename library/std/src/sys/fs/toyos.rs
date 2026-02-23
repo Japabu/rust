@@ -199,6 +199,10 @@ impl OpenOptions {
 }
 
 impl File {
+    pub fn raw_fd(&self) -> u64 {
+        self.0
+    }
+
     pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
         let flags = opts.to_flags();
         let path_bytes = path.as_os_str().as_encoded_bytes();
