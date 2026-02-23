@@ -29,8 +29,8 @@ static mut LINE_BUF: LineBuf = LineBuf { buf: [0; LINE_BUF_CAP], len: 0, pos: 0 
 
 fn read_one() -> io::Result<u8> {
     let mut byte = [0u8; 1];
-    let n = crate::sys::pal::read(byte.as_mut_ptr(), 1);
-    if n < 0 {
+    let n = crate::sys::pal::read(0, byte.as_mut_ptr(), 1);
+    if n == u64::MAX {
         Err(io::Error::new(io::ErrorKind::Other, "toyos io error"))
     } else if n == 0 {
         Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"))
@@ -40,7 +40,7 @@ fn read_one() -> io::Result<u8> {
 }
 
 fn echo(bytes: &[u8]) {
-    crate::sys::pal::write(bytes.as_ptr(), bytes.len());
+    crate::sys::pal::write(1, bytes.as_ptr(), bytes.len());
 }
 
 /// Canonical read: line editing with echo. Buffers a complete line, then
@@ -126,8 +126,8 @@ impl Stdin {
 impl io::Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if STDIN_RAW.load(Ordering::Relaxed) {
-            let n = crate::sys::pal::read(buf.as_mut_ptr(), buf.len());
-            if n < 0 { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
+            let n = crate::sys::pal::read(0, buf.as_mut_ptr(), buf.len());
+            if n == u64::MAX { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
         } else {
             canonical_read(buf)
         }
@@ -154,8 +154,8 @@ impl Stdout {
 
 impl io::Write for Stdout {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = crate::sys::pal::write(buf.as_ptr(), buf.len());
-        if n < 0 { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
+        let n = crate::sys::pal::write(1, buf.as_ptr(), buf.len());
+        if n == u64::MAX { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
     }
 
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
@@ -190,8 +190,8 @@ pub fn panic_output() -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 pub fn read_stdin_raw(buf: &mut [u8]) -> io::Result<usize> {
-    let n = crate::sys::pal::read(buf.as_mut_ptr(), buf.len());
-    if n < 0 {
+    let n = crate::sys::pal::read(0, buf.as_mut_ptr(), buf.len());
+    if n == u64::MAX {
         Err(io::Error::new(io::ErrorKind::Other, "toyos io error"))
     } else {
         Ok(n as usize)
@@ -210,4 +210,32 @@ pub fn set_keyboard_layout(name: &str) -> bool {
 pub fn shutdown() -> ! {
     crate::sys::pal::shutdown();
     loop {}
+}
+
+pub fn poll(fd1: u64, fd2: u64) -> u64 {
+    crate::sys::pal::poll(fd1, fd2)
+}
+
+pub fn pipe() -> u64 {
+    crate::sys::pal::pipe()
+}
+
+pub fn spawn(argv: *const u8, len: usize, stdin_fd: u64, stdout_fd: u64) -> u64 {
+    crate::sys::pal::spawn(argv, len, stdin_fd, stdout_fd)
+}
+
+pub fn waitpid(pid: u64) -> u64 {
+    crate::sys::pal::waitpid(pid)
+}
+
+pub fn read_fd(fd: u64, buf: *mut u8, len: usize) -> u64 {
+    crate::sys::pal::read(fd, buf, len)
+}
+
+pub fn write_fd(fd: u64, buf: *const u8, len: usize) -> u64 {
+    crate::sys::pal::write(fd, buf, len)
+}
+
+pub fn close_fd(fd: u64) {
+    crate::sys::pal::close(fd);
 }

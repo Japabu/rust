@@ -61,8 +61,6 @@ const SYS_SCREEN_SIZE: u64 = 7;
 const SYS_CLOCK: u64 = 8;
 const SYS_OPEN: u64 = 9;
 const SYS_CLOSE: u64 = 10;
-const SYS_READ_FILE: u64 = 11;
-const SYS_WRITE_FILE: u64 = 12;
 const SYS_SEEK: u64 = 13;
 const SYS_FSTAT: u64 = 14;
 const SYS_FSYNC: u64 = 15;
@@ -73,6 +71,10 @@ const SYS_SHUTDOWN: u64 = 19;
 const SYS_CHDIR: u64 = 20;
 const SYS_SET_KEYBOARD_LAYOUT: u64 = 23;
 const SYS_GETCWD: u64 = 21;
+const SYS_PIPE: u64 = 24;
+const SYS_SPAWN: u64 = 25;
+const SYS_WAITPID: u64 = 26;
+const SYS_POLL: u64 = 27;
 
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -93,16 +95,16 @@ fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     ret
 }
 
-// --- stdio ---
+// --- I/O (unified: fd, buf, len) ---
 
 #[inline(always)]
-pub fn write(buf: *const u8, len: usize) -> isize {
-    syscall(SYS_WRITE, buf as u64, len as u64, 0, 0) as isize
+pub fn write(fd: u64, buf: *const u8, len: usize) -> u64 {
+    syscall(SYS_WRITE, fd, buf as u64, len as u64, 0)
 }
 
 #[inline(always)]
-pub fn read(buf: *mut u8, len: usize) -> isize {
-    syscall(SYS_READ, buf as u64, len as u64, 0, 0) as isize
+pub fn read(fd: u64, buf: *mut u8, len: usize) -> u64 {
+    syscall(SYS_READ, fd, buf as u64, len as u64, 0)
 }
 
 // --- alloc ---
@@ -154,18 +156,8 @@ pub fn open(path: *const u8, path_len: usize, flags: u64) -> u64 {
 }
 
 #[inline(always)]
-pub fn close(fd: u64) {
-    syscall(SYS_CLOSE, fd, 0, 0, 0);
-}
-
-#[inline(always)]
-pub fn read_file(fd: u64, buf: *mut u8, len: usize) -> u64 {
-    syscall(SYS_READ_FILE, fd, buf as u64, len as u64, 0)
-}
-
-#[inline(always)]
-pub fn write_file(fd: u64, buf: *const u8, len: usize) -> u64 {
-    syscall(SYS_WRITE_FILE, fd, buf as u64, len as u64, 0)
+pub fn close(fd: u64) -> u64 {
+    syscall(SYS_CLOSE, fd, 0, 0, 0)
 }
 
 #[inline(always)]
@@ -179,8 +171,8 @@ pub fn fstat(fd: u64) -> u64 {
 }
 
 #[inline(always)]
-pub fn fsync(fd: u64) {
-    syscall(SYS_FSYNC, fd, 0, 0, 0);
+pub fn fsync(fd: u64) -> u64 {
+    syscall(SYS_FSYNC, fd, 0, 0, 0)
 }
 
 // --- readdir / delete ---
@@ -222,4 +214,26 @@ pub fn shutdown() {
 #[inline(always)]
 pub fn set_keyboard_layout(name: *const u8, len: usize) -> u64 {
     syscall(SYS_SET_KEYBOARD_LAYOUT, name as u64, len as u64, 0, 0)
+}
+
+// --- process management ---
+
+#[inline(always)]
+pub fn pipe() -> u64 {
+    syscall(SYS_PIPE, 0, 0, 0, 0)
+}
+
+#[inline(always)]
+pub fn spawn(argv: *const u8, len: usize, stdin_fd: u64, stdout_fd: u64) -> u64 {
+    syscall(SYS_SPAWN, argv as u64, len as u64, stdin_fd, stdout_fd)
+}
+
+#[inline(always)]
+pub fn waitpid(pid: u64) -> u64 {
+    syscall(SYS_WAITPID, pid, 0, 0, 0)
+}
+
+#[inline(always)]
+pub fn poll(fd1: u64, fd2: u64) -> u64 {
+    syscall(SYS_POLL, fd1, fd2, 0, 0)
 }

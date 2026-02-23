@@ -221,8 +221,12 @@ impl File {
     }
 
     pub fn fsync(&self) -> io::Result<()> {
-        crate::sys::pal::fsync(self.0);
-        Ok(())
+        let r = crate::sys::pal::fsync(self.0);
+        if r == u64::MAX {
+            Err(io::Error::new(io::ErrorKind::Other, "fsync failed"))
+        } else {
+            Ok(())
+        }
     }
 
     pub fn datasync(&self) -> io::Result<()> {
@@ -240,7 +244,7 @@ impl File {
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = crate::sys::pal::read_file(self.0, buf.as_mut_ptr(), buf.len());
+        let n = crate::sys::pal::read(self.0, buf.as_mut_ptr(), buf.len());
         if n == u64::MAX {
             Err(io::Error::new(io::ErrorKind::Other, "read failed"))
         } else {
@@ -269,7 +273,7 @@ impl File {
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        let n = crate::sys::pal::write_file(self.0, buf.as_ptr(), buf.len());
+        let n = crate::sys::pal::write(self.0, buf.as_ptr(), buf.len());
         if n == u64::MAX {
             Err(io::Error::new(io::ErrorKind::Other, "write failed"))
         } else {
