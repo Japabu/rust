@@ -64,7 +64,6 @@ const SYS_CLOSE: u64 = 10;
 const SYS_SEEK: u64 = 13;
 const SYS_FSTAT: u64 = 14;
 const SYS_FSYNC: u64 = 15;
-const SYS_EXEC: u64 = 16;
 const SYS_READDIR: u64 = 17;
 const SYS_DELETE: u64 = 18;
 const SYS_SHUTDOWN: u64 = 19;
@@ -129,11 +128,6 @@ pub fn realloc(ptr: *mut u8, size: usize, align: usize, new_size: usize) -> *mut
 #[inline(always)]
 pub fn exit(code: i32) -> ! {
     loop { syscall(SYS_EXIT, code as u64, 0, 0, 0); }
-}
-
-#[inline(always)]
-pub fn exec(argv_buf: *const u8, argv_len: usize, out_buf: *mut u8, out_buf_len: usize) -> u64 {
-    syscall(SYS_EXEC, argv_buf as u64, argv_len as u64, out_buf as u64, out_buf_len as u64)
 }
 
 // --- misc ---
@@ -237,3 +231,4 @@ pub fn waitpid(pid: u64) -> u64 {
 pub fn poll(fd1: u64, fd2: u64) -> u64 {
     syscall(SYS_POLL, fd1, fd2, 0, 0)
 }
+

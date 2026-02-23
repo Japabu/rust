@@ -115,7 +115,7 @@ fn canonical_read(buf: &mut [u8]) -> io::Result<usize> {
 
 pub struct Stdin;
 pub struct Stdout;
-pub type Stderr = Stdout;
+pub struct Stderr;
 
 impl Stdin {
     pub const fn new() -> Stdin {
@@ -175,28 +175,48 @@ impl io::Write for Stdout {
     }
 }
 
+impl Stderr {
+    pub const fn new() -> Stderr {
+        Stderr
+    }
+}
+
+impl io::Write for Stderr {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = crate::sys::pal::write(2, buf.as_ptr(), buf.len());
+        if n == u64::MAX { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        let mut total = 0;
+        for buf in bufs {
+            total += self.write(buf)?;
+        }
+        Ok(total)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        false
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 pub const STDIN_BUF_SIZE: usize = 64;
 
 pub fn is_ebadf(_err: &io::Error) -> bool {
     true
 }
 
-pub fn panic_output() -> Option<Vec<u8>> {
-    Some(Vec::new())
+pub fn panic_output() -> Option<Stderr> {
+    Some(Stderr::new())
 }
 
 // ---------------------------------------------------------------------------
 // ToyOS-specific public API helpers (forwarded from std::os::toyos)
 // ---------------------------------------------------------------------------
-
-pub fn read_stdin_raw(buf: &mut [u8]) -> io::Result<usize> {
-    let n = crate::sys::pal::read(0, buf.as_mut_ptr(), buf.len());
-    if n == u64::MAX {
-        Err(io::Error::new(io::ErrorKind::Other, "toyos io error"))
-    } else {
-        Ok(n as usize)
-    }
-}
 
 pub fn screen_size() -> (usize, usize) {
     let raw = crate::sys::pal::screen_size();
@@ -216,26 +236,7 @@ pub fn poll(fd1: u64, fd2: u64) -> u64 {
     crate::sys::pal::poll(fd1, fd2)
 }
 
-pub fn pipe() -> u64 {
-    crate::sys::pal::pipe()
-}
-
-pub fn spawn(argv: *const u8, len: usize, stdin_fd: u64, stdout_fd: u64) -> u64 {
-    crate::sys::pal::spawn(argv, len, stdin_fd, stdout_fd)
-}
-
-pub fn waitpid(pid: u64) -> u64 {
-    crate::sys::pal::waitpid(pid)
-}
-
 pub fn read_fd(fd: u64, buf: *mut u8, len: usize) -> u64 {
     crate::sys::pal::read(fd, buf, len)
 }
 
-pub fn write_fd(fd: u64, buf: *const u8, len: usize) -> u64 {
-    crate::sys::pal::write(fd, buf, len)
-}
-
-pub fn close_fd(fd: u64) {
-    crate::sys::pal::close(fd);
-}

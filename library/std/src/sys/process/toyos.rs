@@ -98,7 +98,6 @@ impl Command {
         default: Stdio,
         _needs_stdin: bool,
     ) -> io::Result<(Process, StdioPipes)> {
-        // Build null-separated argv buffer: "path\0arg1\0arg2"
         let mut argv_buf = Vec::new();
         argv_buf.extend_from_slice(self.program.as_encoded_bytes());
         for arg in &self.args[1..] {
@@ -106,58 +105,76 @@ impl Command {
             argv_buf.extend_from_slice(arg.as_encoded_bytes());
         }
 
-        // Capture stdout only when piped (e.g. Command::output())
-        let capture = matches!(
-            self.stdout.as_ref().unwrap_or(&default),
-            Stdio::MakePipe
-        );
+        let stdin = self.stdin.as_ref().unwrap_or(&default);
+        let stdout = self.stdout.as_ref().unwrap_or(&default);
 
-        let (out_ptr, out_len, mut stdout_buf) = if capture {
-            let buf = vec![0u8; 65536];
-            let ptr = buf.as_ptr() as *mut u8;
-            let len = buf.len();
-            (ptr, len, buf)
-        } else {
-            (core::ptr::null_mut(), 0, Vec::new())
+        // Set up stdin pipe
+        let mut child_stdin_pipe: Option<Pipe> = None;
+        let mut parent_stdin_pipe: Option<Pipe> = None;
+        let child_stdin_fd = match stdin {
+            Stdio::MakePipe => {
+                let (r, w) = crate::sys::pipe::pipe()?;
+                let fd = r.raw_fd();
+                child_stdin_pipe = Some(r);
+                parent_stdin_pipe = Some(w);
+                fd
+            }
+            _ => u64::MAX,
         };
 
-        let result = crate::sys::pal::exec(
+        // Set up stdout pipe
+        let mut child_stdout_pipe: Option<Pipe> = None;
+        let mut parent_stdout_pipe: Option<Pipe> = None;
+        let child_stdout_fd = match stdout {
+            Stdio::MakePipe => {
+                let (r, w) = crate::sys::pipe::pipe()?;
+                let fd = w.raw_fd();
+                parent_stdout_pipe = Some(r);
+                child_stdout_pipe = Some(w);
+                fd
+            }
+            _ => u64::MAX,
+        };
+
+        let pid = crate::sys::pal::spawn(
             argv_buf.as_ptr(),
             argv_buf.len(),
-            out_ptr,
-            out_len,
+            child_stdin_fd,
+            child_stdout_fd,
         );
 
-        if result == u64::MAX {
+        // Close child-side pipe ends in the parent
+        drop(child_stdin_pipe);
+        drop(child_stdout_pipe);
+
+        if pid == u64::MAX {
             return Err(io::Error::new(io::ErrorKind::NotFound, "program not found"));
         }
 
-        let exit_code = (result >> 32) as i32;
-        let stdout_len = (result & 0xFFFF_FFFF) as usize;
-        stdout_buf.truncate(stdout_len);
-
         Ok((
-            Process {
-                exit_code,
-                stdout: stdout_buf,
+            Process { pid: pid as u32 },
+            StdioPipes {
+                stdin: parent_stdin_pipe,
+                stdout: parent_stdout_pipe,
+                stderr: None,
             },
-            StdioPipes { stdin: None, stdout: None, stderr: None },
         ))
     }
 }
 
 pub fn output(cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
-    let (process, _pipes) = cmd.spawn(Stdio::MakePipe, false)?;
-    Ok((
-        ExitStatus(process.exit_code),
-        process.stdout,
-        Vec::new(), // no stderr
-    ))
+    let (mut process, pipes) = cmd.spawn(Stdio::MakePipe, false)?;
+    let mut stdout_data = Vec::new();
+    if let Some(pipe) = pipes.stdout {
+        pipe.read_to_end(&mut stdout_data)?;
+    }
+    let status = process.wait()?;
+    Ok((status, stdout_data, Vec::new()))
 }
 
 impl From<ChildPipe> for Stdio {
-    fn from(pipe: ChildPipe) -> Stdio {
-        pipe.diverge()
+    fn from(_pipe: ChildPipe) -> Stdio {
+        panic!("converting ChildPipe to Stdio not supported on ToyOS");
     }
 }
 
@@ -302,25 +319,25 @@ impl From<u8> for ExitCode {
 }
 
 pub struct Process {
-    exit_code: i32,
-    stdout: Vec<u8>,
+    pid: u32,
 }
 
 impl Process {
     pub fn id(&self) -> u32 {
-        0
+        self.pid
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
-        Ok(())
+        panic!("Process::kill not supported on ToyOS");
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        Ok(ExitStatus(self.exit_code))
+        let code = crate::sys::pal::waitpid(self.pid as u64);
+        Ok(ExitStatus(code as i32))
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        Ok(Some(ExitStatus(self.exit_code)))
+        self.wait().map(Some)
     }
 }
 
@@ -356,10 +373,10 @@ impl<'a> fmt::Debug for CommandArgs<'a> {
 pub type ChildPipe = Pipe;
 
 pub fn read_output(
-    out: ChildPipe,
+    _out: ChildPipe,
     _stdout: &mut Vec<u8>,
     _err: ChildPipe,
     _stderr: &mut Vec<u8>,
 ) -> io::Result<()> {
-    match out.diverge() {}
+    panic!("read_output not supported on ToyOS (stderr is never piped)");
 }
