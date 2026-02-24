@@ -75,6 +75,8 @@ const SYS_SPAWN: u64 = 25;
 const SYS_WAITPID: u64 = 26;
 const SYS_POLL: u64 = 27;
 const SYS_MARK_TTY: u64 = 28;
+const SYS_SEND_MSG: u64 = 29;
+const SYS_RECV_MSG: u64 = 30;
 
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -236,5 +238,15 @@ pub fn poll(fd1: u64, fd2: u64) -> u64 {
 #[inline(always)]
 pub fn mark_tty(fd: u64) -> u64 {
     syscall(SYS_MARK_TTY, fd, 0, 0, 0)
+}
+
+#[inline(always)]
+pub fn send_msg(target_pid: u64, msg_ptr: u64) -> u64 {
+    syscall(SYS_SEND_MSG, target_pid, msg_ptr, 0, 0)
+}
+
+#[inline(always)]
+pub fn recv_msg(msg_ptr: u64) -> u64 {
+    syscall(SYS_RECV_MSG, msg_ptr, 0, 0, 0)
 }
 
