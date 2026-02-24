@@ -231,8 +231,8 @@ pub fn waitpid(pid: u64) -> u64 {
 }
 
 #[inline(always)]
-pub fn poll(fd1: u64, fd2: u64) -> u64 {
-    syscall(SYS_POLL, fd1, fd2, 0, 0)
+pub fn poll(fds_ptr: u64, fds_len: u64) -> u64 {
+    syscall(SYS_POLL, fds_ptr, fds_len, 0, 0)
 }
 
 #[inline(always)]

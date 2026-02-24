@@ -29,11 +29,34 @@ pub fn shutdown() -> ! {
     crate::sys::stdio::shutdown()
 }
 
-/// Poll two file descriptors for readiness. Blocks until at least one has data.
-/// Returns a bitmask: bit 0 = fd1 ready, bit 1 = fd2 ready.
+/// Result of a [`poll`] call.
 #[stable(feature = "toyos_ext", since = "1.0.0")]
-pub fn poll(fd1: u64, fd2: u64) -> u64 {
-    crate::sys::stdio::poll(fd1, fd2)
+pub struct PollResult {
+    mask: u64,
+    fd_count: usize,
+}
+
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+impl PollResult {
+    /// Whether the file descriptor at `index` is ready.
+    #[stable(feature = "toyos_ext", since = "1.0.0")]
+    pub fn fd(&self, index: usize) -> bool {
+        self.mask & (1 << index) != 0
+    }
+
+    /// Whether the process message queue has messages.
+    #[stable(feature = "toyos_ext", since = "1.0.0")]
+    pub fn messages(&self) -> bool {
+        self.mask & (1 << self.fd_count) != 0
+    }
+}
+
+/// Poll file descriptors and the message queue for readiness.
+/// Blocks until at least one source has data.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn poll(fds: &[u64]) -> PollResult {
+    let mask = crate::sys::stdio::poll(fds.as_ptr() as u64, fds.len() as u64);
+    PollResult { mask, fd_count: fds.len() }
 }
 
 /// Read from a file descriptor. Returns bytes read.

@@ -234,8 +234,8 @@ pub fn shutdown() -> ! {
     loop {}
 }
 
-pub fn poll(fd1: u64, fd2: u64) -> u64 {
-    crate::sys::pal::poll(fd1, fd2)
+pub fn poll(fds_ptr: u64, fds_len: u64) -> u64 {
+    crate::sys::pal::poll(fds_ptr, fds_len)
 }
 
 pub fn read_fd(fd: u64, buf: *mut u8, len: usize) -> u64 {
