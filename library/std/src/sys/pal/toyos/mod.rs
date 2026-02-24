@@ -77,6 +77,9 @@ const SYS_POLL: u64 = 27;
 const SYS_MARK_TTY: u64 = 28;
 const SYS_SEND_MSG: u64 = 29;
 const SYS_RECV_MSG: u64 = 30;
+const SYS_OPEN_DEVICE: u64 = 31;
+const SYS_REGISTER_NAME: u64 = 32;
+const SYS_FIND_PID: u64 = 33;
 
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -248,5 +251,22 @@ pub fn send_msg(target_pid: u64, msg_ptr: u64) -> u64 {
 #[inline(always)]
 pub fn recv_msg(msg_ptr: u64) -> u64 {
     syscall(SYS_RECV_MSG, msg_ptr, 0, 0, 0)
+}
+
+// --- devices & names ---
+
+#[inline(always)]
+pub fn open_device(device_type: u64) -> u64 {
+    syscall(SYS_OPEN_DEVICE, device_type, 0, 0, 0)
+}
+
+#[inline(always)]
+pub fn register_name(name: *const u8, len: usize) -> u64 {
+    syscall(SYS_REGISTER_NAME, name as u64, len as u64, 0, 0)
+}
+
+#[inline(always)]
+pub fn find_pid(name: *const u8, len: usize) -> u64 {
+    syscall(SYS_FIND_PID, name as u64, len as u64, 0, 0)
 }
 

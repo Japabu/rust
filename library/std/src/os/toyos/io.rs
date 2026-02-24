@@ -85,3 +85,56 @@ impl AsRawFd for crate::process::ChildStdout {
         self.as_inner().raw_fd()
     }
 }
+
+// --- Device access ---
+
+/// Device types for [`open_device`].
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+#[repr(u64)]
+#[derive(Debug, Clone, Copy)]
+pub enum DeviceType {
+    #[stable(feature = "toyos_ext", since = "1.0.0")]
+    Keyboard = 0,
+    #[stable(feature = "toyos_ext", since = "1.0.0")]
+    Mouse = 1,
+    #[stable(feature = "toyos_ext", since = "1.0.0")]
+    Framebuffer = 2,
+}
+
+/// Claim exclusive access to a device. Returns the FD number on success.
+/// Fails if the device is already claimed by another process.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn open_device(device: DeviceType) -> Option<u64> {
+    let fd = crate::sys::open_device(device as u64);
+    if fd == u64::MAX { None } else { Some(fd) }
+}
+
+// --- Name registry ---
+
+/// Register the current process under the given name.
+/// Fails if the name is already taken by another process.
+/// Other processes can discover this process via [`find_pid`].
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn register_name(name: &str) -> Result<(), NameTaken> {
+    let result = crate::sys::register_name(name.as_ptr(), name.len());
+    if result == 0 { Ok(()) } else { Err(NameTaken) }
+}
+
+/// Error returned when [`register_name`] fails because the name is already registered.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+#[derive(Debug)]
+pub struct NameTaken;
+
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+impl core::fmt::Display for NameTaken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("name already registered")
+    }
+}
+
+/// Find the PID of a process registered under the given name.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn find_pid(name: &str) -> Option<u32> {
+    let pid = crate::sys::find_pid(name.as_ptr(), name.len());
+    if pid == u64::MAX { None } else { Some(pid as u32) }
+}
