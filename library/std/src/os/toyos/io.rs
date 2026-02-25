@@ -152,3 +152,38 @@ pub fn find_pid(name: &str) -> Option<u32> {
     let pid = crate::sys::find_pid(name.as_ptr(), name.len());
     if pid == u64::MAX { None } else { Some(pid as u32) }
 }
+
+// --- Shared memory ---
+
+/// Allocate a 2MB-aligned shared memory region. Returns an opaque token.
+/// The region is mapped into the caller's address space automatically.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn alloc_shared(size: usize) -> u32 {
+    let token = crate::sys::alloc_shared(size as u64);
+    assert!(token != u64::MAX, "alloc_shared failed");
+    token as u32
+}
+
+/// Grant another process permission to map a shared memory region.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn grant_shared(token: u32, target_pid: u32) {
+    let result = crate::sys::grant_shared(token as u64, target_pid as u64);
+    assert_eq!(result, 0, "grant_shared failed");
+}
+
+/// Map a shared memory region into this process's address space.
+/// Returns a pointer to the mapped memory.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn map_shared(token: u32) -> *mut u8 {
+    let addr = crate::sys::map_shared(token as u64);
+    assert!(addr != u64::MAX, "map_shared failed");
+    core::ptr::with_exposed_provenance_mut(addr as usize)
+}
+
+/// Free a shared memory region owned by the caller.
+/// Unmaps from all processes that mapped it and deallocates the backing memory.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn free_shared(token: u32) {
+    let result = crate::sys::free_shared(token as u64);
+    assert_eq!(result, 0, "free_shared failed");
+}

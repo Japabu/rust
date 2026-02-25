@@ -1,8 +1,8 @@
 //! Type-safe kernel message queue API for inter-process communication.
 //!
-//! Messages carry a `msg_type` tag and an optional typed payload. The payload
-//! is heap-allocated by the sender and freed by the receiver — safe because
-//! all ToyOS processes share the same address space.
+//! Messages carry a `msg_type` tag and an optional typed payload. The kernel
+//! copies payload bytes between address spaces — sender and receiver don't
+//! need to share memory.
 
 /// A message passed between processes via the kernel message queue.
 ///
@@ -57,18 +57,24 @@ impl Message {
             "message payload size mismatch: expected {expected}, got {}",
             self.len,
         );
-        let ptr: *mut T = core::ptr::with_exposed_provenance_mut(self.data as usize);
-        let value = *unsafe { Box::from_raw(ptr) };
+        let ptr: *const T = core::ptr::with_exposed_provenance(self.data as usize);
+        let value = unsafe { core::ptr::read(ptr) };
+        // Free the kernel-allocated buffer
+        crate::sys::free(core::ptr::with_exposed_provenance_mut(self.data as usize), self.len as usize, 1);
         core::mem::forget(self);
         value
     }
 }
 
 /// Send a message to another process. Panics on failure.
-/// Consumes the message — payload ownership transfers to the receiver.
+/// The kernel copies the payload bytes — the sender's allocation is freed after sending.
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 pub fn send(target_pid: u32, msg: Message) {
     let result = crate::sys::send_msg(target_pid as u64, &msg as *const Message as u64);
+    // Free the sender's heap allocation — kernel has already copied the bytes
+    if msg.data != 0 && msg.len != 0 {
+        crate::sys::free(core::ptr::with_exposed_provenance_mut(msg.data as usize), msg.len as usize, 1);
+    }
     core::mem::forget(msg);
     assert_eq!(result, 0, "failed to send message to pid {target_pid}");
 }

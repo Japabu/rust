@@ -82,6 +82,10 @@ const SYS_REGISTER_NAME: u64 = 32;
 const SYS_FIND_PID: u64 = 33;
 const SYS_SET_SCREEN_SIZE: u64 = 34;
 const SYS_GPU_PRESENT: u64 = 35;
+const SYS_ALLOC_SHARED: u64 = 36;
+const SYS_GRANT_SHARED: u64 = 37;
+const SYS_MAP_SHARED: u64 = 38;
+const SYS_FREE_SHARED: u64 = 39;
 
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -280,5 +284,27 @@ pub fn register_name(name: *const u8, len: usize) -> u64 {
 #[inline(always)]
 pub fn find_pid(name: *const u8, len: usize) -> u64 {
     syscall(SYS_FIND_PID, name as u64, len as u64, 0, 0)
+}
+
+// --- shared memory ---
+
+#[inline(always)]
+pub fn alloc_shared(size: u64) -> u64 {
+    syscall(SYS_ALLOC_SHARED, size, 0, 0, 0)
+}
+
+#[inline(always)]
+pub fn grant_shared(token: u64, target_pid: u64) -> u64 {
+    syscall(SYS_GRANT_SHARED, token, target_pid, 0, 0)
+}
+
+#[inline(always)]
+pub fn map_shared(token: u64) -> u64 {
+    syscall(SYS_MAP_SHARED, token, 0, 0, 0)
+}
+
+#[inline(always)]
+pub fn free_shared(token: u64) -> u64 {
+    syscall(SYS_FREE_SHARED, token, 0, 0, 0)
 }
 
