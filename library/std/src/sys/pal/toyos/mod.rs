@@ -80,6 +80,7 @@ const SYS_RECV_MSG: u64 = 30;
 const SYS_OPEN_DEVICE: u64 = 31;
 const SYS_REGISTER_NAME: u64 = 32;
 const SYS_FIND_PID: u64 = 33;
+const SYS_SET_SCREEN_SIZE: u64 = 34;
 
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -204,6 +205,11 @@ pub fn getcwd(buf: *mut u8, buf_len: usize) -> u64 {
 #[inline(always)]
 pub fn screen_size() -> u64 {
     syscall(SYS_SCREEN_SIZE, 0, 0, 0, 0)
+}
+
+#[inline(always)]
+pub fn set_screen_size(width: u32, height: u32) {
+    syscall(SYS_SET_SCREEN_SIZE, width as u64, height as u64, 0, 0);
 }
 
 #[inline(always)]

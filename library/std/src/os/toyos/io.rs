@@ -17,6 +17,13 @@ pub fn screen_size() -> (usize, usize) {
     crate::sys::stdio::screen_size()
 }
 
+/// Set the screen size from pixel dimensions (width, height).
+/// The kernel computes rows/columns assuming an 8x16 font.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn set_screen_size(width: u32, height: u32) {
+    crate::sys::stdio::set_screen_size(width, height);
+}
+
 /// Set the active keyboard layout by name. Returns `true` on success.
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 pub fn set_keyboard_layout(name: &str) -> bool {
