@@ -24,6 +24,13 @@ pub fn set_screen_size(width: u32, height: u32) {
     crate::sys::stdio::set_screen_size(width, height);
 }
 
+/// Flush the VirtIO GPU framebuffer to the display.
+/// No-op when using the GOP framebuffer fallback.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn gpu_present() {
+    crate::sys::stdio::gpu_present();
+}
+
 /// Set the active keyboard layout by name. Returns `true` on success.
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 pub fn set_keyboard_layout(name: &str) -> bool {

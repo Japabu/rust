@@ -81,6 +81,7 @@ const SYS_OPEN_DEVICE: u64 = 31;
 const SYS_REGISTER_NAME: u64 = 32;
 const SYS_FIND_PID: u64 = 33;
 const SYS_SET_SCREEN_SIZE: u64 = 34;
+const SYS_GPU_PRESENT: u64 = 35;
 
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -210,6 +211,11 @@ pub fn screen_size() -> u64 {
 #[inline(always)]
 pub fn set_screen_size(width: u32, height: u32) {
     syscall(SYS_SET_SCREEN_SIZE, width as u64, height as u64, 0, 0);
+}
+
+#[inline(always)]
+pub fn gpu_present() {
+    syscall(SYS_GPU_PRESENT, 0, 0, 0, 0);
 }
 
 #[inline(always)]

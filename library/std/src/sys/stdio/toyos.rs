@@ -229,6 +229,10 @@ pub fn set_screen_size(width: u32, height: u32) {
     crate::sys::pal::set_screen_size(width, height);
 }
 
+pub fn gpu_present() {
+    crate::sys::pal::gpu_present();
+}
+
 pub fn set_keyboard_layout(name: &str) -> bool {
     crate::sys::pal::set_keyboard_layout(name.as_ptr(), name.len()) != 0
 }
