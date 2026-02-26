@@ -37,6 +37,10 @@ cfg_select! {
         mod xous;
         pub use xous::Condvar;
     }
+    target_os = "toyos" => {
+        mod toyos;
+        pub use toyos::Condvar;
+    }
     _ => {
         mod no_threads;
         pub use no_threads::Condvar;

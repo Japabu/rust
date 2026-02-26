@@ -4,7 +4,11 @@ pub mod os;
 #[path = "../unsupported/common.rs"]
 mod unsupported_common;
 
-pub use unsupported_common::{cleanup, init, unsupported};
+pub use unsupported_common::{cleanup, init};
+
+pub fn unsupported<T>() -> crate::io::Result<T> {
+    panic!("unsupported operation on ToyOS");
+}
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -86,6 +90,8 @@ const SYS_ALLOC_SHARED: u64 = 36;
 const SYS_GRANT_SHARED: u64 = 37;
 const SYS_MAP_SHARED: u64 = 38;
 const SYS_FREE_SHARED: u64 = 39;
+const SYS_THREAD_SPAWN: u64 = 40;
+const SYS_THREAD_JOIN: u64 = 41;
 
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -306,5 +312,17 @@ pub fn map_shared(token: u64) -> u64 {
 #[inline(always)]
 pub fn free_shared(token: u64) -> u64 {
     syscall(SYS_FREE_SHARED, token, 0, 0, 0)
+}
+
+// --- threads ---
+
+#[inline(always)]
+pub fn thread_spawn(entry: u64, stack: u64, arg: u64) -> u64 {
+    syscall(SYS_THREAD_SPAWN, entry, stack, arg, 0)
+}
+
+#[inline(always)]
+pub fn thread_join(tid: u64) -> u64 {
+    syscall(SYS_THREAD_JOIN, tid, 0, 0, 0)
 }
 

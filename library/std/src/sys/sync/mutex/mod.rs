@@ -40,6 +40,10 @@ cfg_select! {
         mod xous;
         pub use xous::Mutex;
     }
+    target_os = "toyos" => {
+        mod toyos;
+        pub use toyos::Mutex;
+    }
     _ => {
         mod no_threads;
         pub use no_threads::Mutex;

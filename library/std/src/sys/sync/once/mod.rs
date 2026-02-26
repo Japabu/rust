@@ -33,6 +33,10 @@ cfg_select! {
         mod queue;
         pub use queue::{Once, OnceState};
     }
+    target_os = "toyos" => {
+        mod toyos;
+        pub use toyos::{Once, OnceState};
+    }
     _ => {
         mod no_threads;
         pub use no_threads::{Once, OnceState};

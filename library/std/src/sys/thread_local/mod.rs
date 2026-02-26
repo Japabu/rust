@@ -26,7 +26,6 @@
 cfg_select! {
     any(
         all(target_family = "wasm", not(target_feature = "atomics")),
-        target_os = "toyos",
         target_os = "uefi",
         target_os = "zkvm",
         target_os = "trusty",

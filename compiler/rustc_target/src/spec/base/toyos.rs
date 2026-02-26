@@ -10,7 +10,7 @@ pub(crate) fn opts() -> TargetOptions {
         stack_probes: StackProbeType::Inline,
         relocation_model: RelocModel::Pic,
         position_independent_executables: true,
-        has_thread_local: false,
+        has_thread_local: true,
         main_needs_argc_argv: false,
         panic_strategy: PanicStrategy::Abort,
         ..Default::default()

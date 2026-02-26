@@ -187,3 +187,9 @@ pub fn free_shared(token: u32) {
     let result = crate::sys::free_shared(token as u64);
     assert_eq!(result, 0, "free_shared failed");
 }
+
+/// Nanoseconds since boot (monotonic clock).
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn clock_nanos() -> u64 {
+    crate::sys::clock()
+}

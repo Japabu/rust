@@ -28,6 +28,10 @@ cfg_select! {
         mod solid;
         pub use solid::RwLock;
     }
+    target_os = "toyos" => {
+        mod toyos;
+        pub use toyos::RwLock;
+    }
     _ => {
         mod no_threads;
         pub use no_threads::RwLock;
