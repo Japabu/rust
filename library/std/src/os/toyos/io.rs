@@ -24,11 +24,23 @@ pub fn set_screen_size(width: u32, height: u32) {
     crate::sys::stdio::set_screen_size(width, height);
 }
 
-/// Flush the VirtIO GPU framebuffer to the display.
-/// No-op when using the GOP framebuffer fallback.
+/// Transfer a region of the framebuffer to the GPU and flush it.
+/// Pass (0, 0, 0, 0) to flush the full screen.
 #[stable(feature = "toyos_ext", since = "1.0.0")]
-pub fn gpu_present() {
-    crate::sys::stdio::gpu_present();
+pub fn gpu_present(x: u32, y: u32, w: u32, h: u32) {
+    crate::sys::stdio::gpu_present(x, y, w, h);
+}
+
+/// Upload the cursor image from backing and enable hardware cursor.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn gpu_set_cursor(hot_x: u32, hot_y: u32) {
+    crate::sys::stdio::gpu_set_cursor(hot_x, hot_y);
+}
+
+/// Move the hardware cursor to screen position (x, y).
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn gpu_move_cursor(x: u32, y: u32) {
+    crate::sys::stdio::gpu_move_cursor(x, y);
 }
 
 /// Set the active keyboard layout by name. Returns `true` on success.
@@ -69,7 +81,15 @@ impl PollResult {
 /// Blocks until at least one source has data.
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 pub fn poll(fds: &[u64]) -> PollResult {
-    let mask = crate::sys::stdio::poll(fds.as_ptr() as u64, fds.len() as u64);
+    poll_timeout(fds, 0)
+}
+
+/// Poll file descriptors and the message queue for readiness.
+/// Returns when at least one source has data, or after `timeout_nanos`
+/// nanoseconds (whichever comes first). Pass 0 to block indefinitely.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn poll_timeout(fds: &[u64], timeout_nanos: u64) -> PollResult {
+    let mask = crate::sys::stdio::poll(fds.as_ptr() as u64, fds.len() as u64, timeout_nanos);
     PollResult { mask, fd_count: fds.len() }
 }
 
@@ -186,6 +206,15 @@ pub fn map_shared(token: u32) -> *mut u8 {
 pub fn free_shared(token: u32) {
     let result = crate::sys::free_shared(token as u64);
     assert_eq!(result, 0, "free_shared failed");
+}
+
+/// Query system information (memory, CPUs, processes).
+/// Fills `buf` with a header followed by per-process entries.
+/// Returns the number of bytes written.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn sysinfo(buf: &mut [u8]) -> usize {
+    let n = crate::sys::stdio::sysinfo(buf.as_mut_ptr(), buf.len());
+    if n == u64::MAX { 0 } else { n as usize }
 }
 
 /// Nanoseconds since boot (monotonic clock).

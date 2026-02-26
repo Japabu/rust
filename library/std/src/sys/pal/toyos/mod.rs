@@ -93,6 +93,9 @@ const SYS_FREE_SHARED: u64 = 39;
 const SYS_THREAD_SPAWN: u64 = 40;
 const SYS_THREAD_JOIN: u64 = 41;
 const SYS_CLOCK_REALTIME: u64 = 42;
+const SYS_GPU_SET_CURSOR: u64 = 43;
+const SYS_GPU_MOVE_CURSOR: u64 = 44;
+const SYS_SYSINFO: u64 = 45;
 
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -225,8 +228,18 @@ pub fn set_screen_size(width: u32, height: u32) {
 }
 
 #[inline(always)]
-pub fn gpu_present() {
-    syscall(SYS_GPU_PRESENT, 0, 0, 0, 0);
+pub fn gpu_present(x: u64, y: u64, w: u64, h: u64) {
+    syscall(SYS_GPU_PRESENT, x, y, w, h);
+}
+
+#[inline(always)]
+pub fn gpu_set_cursor(hot_x: u64, hot_y: u64) {
+    syscall(SYS_GPU_SET_CURSOR, hot_x, hot_y, 0, 0);
+}
+
+#[inline(always)]
+pub fn gpu_move_cursor(x: u64, y: u64) {
+    syscall(SYS_GPU_MOVE_CURSOR, x, y, 0, 0);
 }
 
 #[inline(always)]
@@ -257,8 +270,8 @@ pub fn waitpid(pid: u64) -> u64 {
 }
 
 #[inline(always)]
-pub fn poll(fds_ptr: u64, fds_len: u64) -> u64 {
-    syscall(SYS_POLL, fds_ptr, fds_len, 0, 0)
+pub fn poll(fds_ptr: u64, fds_len: u64, timeout_nanos: u64) -> u64 {
+    syscall(SYS_POLL, fds_ptr, fds_len, timeout_nanos, 0)
 }
 
 #[inline(always)]
@@ -331,5 +344,10 @@ pub fn thread_join(tid: u64) -> u64 {
 #[inline(always)]
 pub fn clock_realtime() -> u64 {
     syscall(SYS_CLOCK_REALTIME, 0, 0, 0, 0)
+}
+
+#[inline(always)]
+pub fn sysinfo(buf: *mut u8, len: usize) -> u64 {
+    syscall(SYS_SYSINFO, buf as u64, len as u64, 0, 0)
 }
 

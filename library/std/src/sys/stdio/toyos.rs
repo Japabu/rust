@@ -229,8 +229,16 @@ pub fn set_screen_size(width: u32, height: u32) {
     crate::sys::pal::set_screen_size(width, height);
 }
 
-pub fn gpu_present() {
-    crate::sys::pal::gpu_present();
+pub fn gpu_present(x: u32, y: u32, w: u32, h: u32) {
+    crate::sys::pal::gpu_present(x as u64, y as u64, w as u64, h as u64);
+}
+
+pub fn gpu_set_cursor(hot_x: u32, hot_y: u32) {
+    crate::sys::pal::gpu_set_cursor(hot_x as u64, hot_y as u64);
+}
+
+pub fn gpu_move_cursor(x: u32, y: u32) {
+    crate::sys::pal::gpu_move_cursor(x as u64, y as u64);
 }
 
 pub fn set_keyboard_layout(name: &str) -> bool {
@@ -242,11 +250,15 @@ pub fn shutdown() -> ! {
     loop {}
 }
 
-pub fn poll(fds_ptr: u64, fds_len: u64) -> u64 {
-    crate::sys::pal::poll(fds_ptr, fds_len)
+pub fn poll(fds_ptr: u64, fds_len: u64, timeout_nanos: u64) -> u64 {
+    crate::sys::pal::poll(fds_ptr, fds_len, timeout_nanos)
 }
 
 pub fn read_fd(fd: u64, buf: *mut u8, len: usize) -> u64 {
     crate::sys::pal::read(fd, buf, len)
+}
+
+pub fn sysinfo(buf: *mut u8, len: usize) -> u64 {
+    crate::sys::pal::sysinfo(buf, len)
 }
 
