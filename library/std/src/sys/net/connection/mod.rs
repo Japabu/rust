@@ -29,6 +29,10 @@ cfg_select! {
         mod uefi;
         pub use uefi::*;
     }
+    target_os = "toyos" => {
+        mod toyos;
+        pub use toyos::*;
+    }
     _ => {
         mod unsupported;
         pub use unsupported::*;

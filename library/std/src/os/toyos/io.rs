@@ -217,6 +217,37 @@ pub fn sysinfo(buf: &mut [u8]) -> usize {
     if n == u64::MAX { 0 } else { n as usize }
 }
 
+// --- networking ---
+
+/// Get the MAC address of the network interface.
+/// Returns `None` if no NIC is present.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn net_mac() -> Option<[u8; 6]> {
+    let mut buf = [0u8; 6];
+    let r = crate::sys::net_info(buf.as_mut_ptr(), buf.len());
+    if r == u64::MAX { None } else { Some(buf) }
+}
+
+/// Send a raw Ethernet frame.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn net_send(frame: &[u8]) {
+    crate::sys::net_send(frame.as_ptr(), frame.len());
+}
+
+/// Receive a raw Ethernet frame. Blocks until a frame arrives.
+/// Returns the number of bytes written to `buf`.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn net_recv(buf: &mut [u8]) -> usize {
+    crate::sys::net_recv(buf.as_mut_ptr(), buf.len(), 0) as usize
+}
+
+/// Receive a raw Ethernet frame with a timeout.
+/// Returns the number of bytes written, or 0 on timeout.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn net_recv_timeout(buf: &mut [u8], timeout_nanos: u64) -> usize {
+    crate::sys::net_recv(buf.as_mut_ptr(), buf.len(), timeout_nanos) as usize
+}
+
 /// Nanoseconds since boot (monotonic clock).
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 pub fn clock_nanos() -> u64 {

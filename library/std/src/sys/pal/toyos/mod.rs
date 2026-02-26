@@ -6,10 +6,6 @@ mod unsupported_common;
 
 pub use unsupported_common::{cleanup, init};
 
-pub fn unsupported<T>() -> crate::io::Result<T> {
-    panic!("unsupported operation on ToyOS");
-}
-
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 // argc/argv stored by _start for std::env::args()
@@ -96,6 +92,9 @@ const SYS_CLOCK_REALTIME: u64 = 42;
 const SYS_GPU_SET_CURSOR: u64 = 43;
 const SYS_GPU_MOVE_CURSOR: u64 = 44;
 const SYS_SYSINFO: u64 = 45;
+const SYS_NET_INFO: u64 = 46;
+const SYS_NET_SEND: u64 = 47;
+const SYS_NET_RECV: u64 = 48;
 
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -349,5 +348,22 @@ pub fn clock_realtime() -> u64 {
 #[inline(always)]
 pub fn sysinfo(buf: *mut u8, len: usize) -> u64 {
     syscall(SYS_SYSINFO, buf as u64, len as u64, 0, 0)
+}
+
+// --- networking ---
+
+#[inline(always)]
+pub fn net_info(buf: *mut u8, len: usize) -> u64 {
+    syscall(SYS_NET_INFO, buf as u64, len as u64, 0, 0)
+}
+
+#[inline(always)]
+pub fn net_send(buf: *const u8, len: usize) -> u64 {
+    syscall(SYS_NET_SEND, buf as u64, len as u64, 0, 0)
+}
+
+#[inline(always)]
+pub fn net_recv(buf: *mut u8, len: usize, timeout_nanos: u64) -> u64 {
+    syscall(SYS_NET_RECV, buf as u64, len as u64, timeout_nanos, 0)
 }
 
