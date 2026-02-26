@@ -89,7 +89,7 @@ const SYS_GPU_PRESENT: u64 = 35;
 const SYS_ALLOC_SHARED: u64 = 36;
 const SYS_GRANT_SHARED: u64 = 37;
 const SYS_MAP_SHARED: u64 = 38;
-const SYS_FREE_SHARED: u64 = 39;
+const SYS_RELEASE_SHARED: u64 = 39;
 const SYS_THREAD_SPAWN: u64 = 40;
 const SYS_THREAD_JOIN: u64 = 41;
 const SYS_CLOCK_REALTIME: u64 = 42;
@@ -324,8 +324,8 @@ pub fn map_shared(token: u64) -> u64 {
 }
 
 #[inline(always)]
-pub fn free_shared(token: u64) -> u64 {
-    syscall(SYS_FREE_SHARED, token, 0, 0, 0)
+pub fn release_shared(token: u64) -> u64 {
+    syscall(SYS_RELEASE_SHARED, token, 0, 0, 0)
 }
 
 // --- threads ---

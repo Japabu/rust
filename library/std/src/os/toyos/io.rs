@@ -200,12 +200,12 @@ pub fn map_shared(token: u32) -> *mut u8 {
     core::ptr::with_exposed_provenance_mut(addr as usize)
 }
 
-/// Free a shared memory region owned by the caller.
-/// Unmaps from all processes that mapped it and deallocates the backing memory.
+/// Release this process's mapping of a shared memory region.
+/// Unmaps only from the caller's address space. Deallocates when no mappings remain.
 #[stable(feature = "toyos_ext", since = "1.0.0")]
-pub fn free_shared(token: u32) {
-    let result = crate::sys::free_shared(token as u64);
-    assert_eq!(result, 0, "free_shared failed");
+pub fn release_shared(token: u32) {
+    let result = crate::sys::release_shared(token as u64);
+    assert_eq!(result, 0, "release_shared failed");
 }
 
 /// Query system information (memory, CPUs, processes).
