@@ -47,6 +47,30 @@ impl Message {
         self.msg_type
     }
 
+    /// Create a message with a variable-length byte payload.
+    #[stable(feature = "toyos_ext", since = "1.0.0")]
+    pub fn from_bytes(msg_type: u32, bytes: &[u8]) -> Self {
+        let boxed = bytes.to_vec().into_boxed_slice();
+        let len = boxed.len();
+        let data = Box::into_raw(boxed) as *mut u8 as u64;
+        Self { sender: 0, msg_type, data, len: len as u64 }
+    }
+
+    /// Extract the payload as raw bytes, consuming the message.
+    #[stable(feature = "toyos_ext", since = "1.0.0")]
+    pub fn take_bytes(self) -> Vec<u8> {
+        if self.data == 0 || self.len == 0 {
+            core::mem::forget(self);
+            return Vec::new();
+        }
+        let bytes = unsafe {
+            core::slice::from_raw_parts(core::ptr::with_exposed_provenance(self.data as usize), self.len as usize)
+        }.to_vec();
+        crate::sys::free(core::ptr::with_exposed_provenance_mut(self.data as usize), self.len as usize, 1);
+        core::mem::forget(self);
+        bytes
+    }
+
     /// Extract the typed payload, consuming the message.
     /// Panics if `size_of::<T>()` doesn't match the payload size.
     #[stable(feature = "toyos_ext", since = "1.0.0")]
