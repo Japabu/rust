@@ -92,6 +92,7 @@ const SYS_MAP_SHARED: u64 = 38;
 const SYS_FREE_SHARED: u64 = 39;
 const SYS_THREAD_SPAWN: u64 = 40;
 const SYS_THREAD_JOIN: u64 = 41;
+const SYS_CLOCK_REALTIME: u64 = 42;
 
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -324,5 +325,11 @@ pub fn thread_spawn(entry: u64, stack: u64, arg: u64) -> u64 {
 #[inline(always)]
 pub fn thread_join(tid: u64) -> u64 {
     syscall(SYS_THREAD_JOIN, tid, 0, 0, 0)
+}
+
+/// Read wall-clock time: (hours << 16) | (minutes << 8) | seconds.
+#[inline(always)]
+pub fn clock_realtime() -> u64 {
+    syscall(SYS_CLOCK_REALTIME, 0, 0, 0, 0)
 }
 

@@ -193,3 +193,10 @@ pub fn free_shared(token: u32) {
 pub fn clock_nanos() -> u64 {
     crate::sys::clock()
 }
+
+/// Read wall-clock time from RTC.
+/// Returns packed: (hours << 16) | (minutes << 8) | seconds.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub fn clock_realtime() -> u64 {
+    crate::sys::clock_realtime()
+}
