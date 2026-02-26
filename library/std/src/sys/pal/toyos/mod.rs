@@ -7,6 +7,7 @@ mod unsupported_common;
 pub use unsupported_common::{cleanup, init};
 
 use core::sync::atomic::{AtomicUsize, Ordering};
+use toyos_abi::syscall::*;
 
 // argc/argv stored by _start for std::env::args()
 pub(crate) static ARGC: AtomicUsize = AtomicUsize::new(0);
@@ -47,72 +48,6 @@ extern "C" fn start_rust(argc: usize, argv: *const *const u8) -> ! {
 
 pub fn abort_internal() -> ! {
     exit(128 + 6); // SIGABRT-like
-}
-
-// Syscall numbers (must match kernel)
-const SYS_WRITE: u64 = 0;
-const SYS_READ: u64 = 1;
-const SYS_ALLOC: u64 = 2;
-const SYS_FREE: u64 = 3;
-const SYS_REALLOC: u64 = 4;
-const SYS_EXIT: u64 = 5;
-const SYS_RANDOM: u64 = 6;
-const SYS_SCREEN_SIZE: u64 = 7;
-const SYS_CLOCK: u64 = 8;
-const SYS_OPEN: u64 = 9;
-const SYS_CLOSE: u64 = 10;
-const SYS_SEEK: u64 = 13;
-const SYS_FSTAT: u64 = 14;
-const SYS_FSYNC: u64 = 15;
-const SYS_READDIR: u64 = 17;
-const SYS_DELETE: u64 = 18;
-const SYS_SHUTDOWN: u64 = 19;
-const SYS_CHDIR: u64 = 20;
-const SYS_SET_KEYBOARD_LAYOUT: u64 = 23;
-const SYS_GETCWD: u64 = 21;
-const SYS_PIPE: u64 = 24;
-const SYS_SPAWN: u64 = 25;
-const SYS_WAITPID: u64 = 26;
-const SYS_POLL: u64 = 27;
-const SYS_MARK_TTY: u64 = 28;
-const SYS_SEND_MSG: u64 = 29;
-const SYS_RECV_MSG: u64 = 30;
-const SYS_OPEN_DEVICE: u64 = 31;
-const SYS_REGISTER_NAME: u64 = 32;
-const SYS_FIND_PID: u64 = 33;
-const SYS_SET_SCREEN_SIZE: u64 = 34;
-const SYS_GPU_PRESENT: u64 = 35;
-const SYS_ALLOC_SHARED: u64 = 36;
-const SYS_GRANT_SHARED: u64 = 37;
-const SYS_MAP_SHARED: u64 = 38;
-const SYS_RELEASE_SHARED: u64 = 39;
-const SYS_THREAD_SPAWN: u64 = 40;
-const SYS_THREAD_JOIN: u64 = 41;
-const SYS_CLOCK_REALTIME: u64 = 42;
-const SYS_GPU_SET_CURSOR: u64 = 43;
-const SYS_GPU_MOVE_CURSOR: u64 = 44;
-const SYS_SYSINFO: u64 = 45;
-const SYS_NET_INFO: u64 = 46;
-const SYS_NET_SEND: u64 = 47;
-const SYS_NET_RECV: u64 = 48;
-
-#[inline(always)]
-fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rdi") num,
-            in("rsi") a1,
-            in("rdx") a2,
-            in("r8") a3,
-            in("r9") a4,
-            lateout("rax") ret,
-            out("rcx") _,
-            out("r11") _,
-        );
-    }
-    ret
 }
 
 // --- I/O (unified: fd, buf, len) ---
@@ -214,43 +149,6 @@ pub fn getcwd(buf: *mut u8, buf_len: usize) -> u64 {
     syscall(SYS_GETCWD, buf as u64, buf_len as u64, 0, 0)
 }
 
-// --- toyos-specific ---
-
-#[inline(always)]
-pub fn screen_size() -> u64 {
-    syscall(SYS_SCREEN_SIZE, 0, 0, 0, 0)
-}
-
-#[inline(always)]
-pub fn set_screen_size(width: u32, height: u32) {
-    syscall(SYS_SET_SCREEN_SIZE, width as u64, height as u64, 0, 0);
-}
-
-#[inline(always)]
-pub fn gpu_present(x: u64, y: u64, w: u64, h: u64) {
-    syscall(SYS_GPU_PRESENT, x, y, w, h);
-}
-
-#[inline(always)]
-pub fn gpu_set_cursor(hot_x: u64, hot_y: u64) {
-    syscall(SYS_GPU_SET_CURSOR, hot_x, hot_y, 0, 0);
-}
-
-#[inline(always)]
-pub fn gpu_move_cursor(x: u64, y: u64) {
-    syscall(SYS_GPU_MOVE_CURSOR, x, y, 0, 0);
-}
-
-#[inline(always)]
-pub fn shutdown() {
-    syscall(SYS_SHUTDOWN, 0, 0, 0, 0);
-}
-
-#[inline(always)]
-pub fn set_keyboard_layout(name: *const u8, len: usize) -> u64 {
-    syscall(SYS_SET_KEYBOARD_LAYOUT, name as u64, len as u64, 0, 0)
-}
-
 // --- process management ---
 
 #[inline(always)]
@@ -259,18 +157,13 @@ pub fn pipe() -> u64 {
 }
 
 #[inline(always)]
-pub fn spawn(argv: *const u8, len: usize, stdin_fd: u64, stdout_fd: u64) -> u64 {
-    syscall(SYS_SPAWN, argv as u64, len as u64, stdin_fd, stdout_fd)
+pub fn spawn(argv: *const u8, len: usize, fd_map: *const [u32; 2], fd_map_count: usize) -> u64 {
+    syscall(SYS_SPAWN, argv as u64, len as u64, fd_map as u64, fd_map_count as u64)
 }
 
 #[inline(always)]
 pub fn waitpid(pid: u64) -> u64 {
     syscall(SYS_WAITPID, pid, 0, 0, 0)
-}
-
-#[inline(always)]
-pub fn poll(fds_ptr: u64, fds_len: u64, timeout_nanos: u64) -> u64 {
-    syscall(SYS_POLL, fds_ptr, fds_len, timeout_nanos, 0)
 }
 
 #[inline(always)]
@@ -288,45 +181,6 @@ pub fn recv_msg(msg_ptr: u64) -> u64 {
     syscall(SYS_RECV_MSG, msg_ptr, 0, 0, 0)
 }
 
-// --- devices & names ---
-
-#[inline(always)]
-pub fn open_device(device_type: u64) -> u64 {
-    syscall(SYS_OPEN_DEVICE, device_type, 0, 0, 0)
-}
-
-#[inline(always)]
-pub fn register_name(name: *const u8, len: usize) -> u64 {
-    syscall(SYS_REGISTER_NAME, name as u64, len as u64, 0, 0)
-}
-
-#[inline(always)]
-pub fn find_pid(name: *const u8, len: usize) -> u64 {
-    syscall(SYS_FIND_PID, name as u64, len as u64, 0, 0)
-}
-
-// --- shared memory ---
-
-#[inline(always)]
-pub fn alloc_shared(size: u64) -> u64 {
-    syscall(SYS_ALLOC_SHARED, size, 0, 0, 0)
-}
-
-#[inline(always)]
-pub fn grant_shared(token: u64, target_pid: u64) -> u64 {
-    syscall(SYS_GRANT_SHARED, token, target_pid, 0, 0)
-}
-
-#[inline(always)]
-pub fn map_shared(token: u64) -> u64 {
-    syscall(SYS_MAP_SHARED, token, 0, 0, 0)
-}
-
-#[inline(always)]
-pub fn release_shared(token: u64) -> u64 {
-    syscall(SYS_RELEASE_SHARED, token, 0, 0, 0)
-}
-
 // --- threads ---
 
 #[inline(always)]
@@ -339,31 +193,4 @@ pub fn thread_join(tid: u64) -> u64 {
     syscall(SYS_THREAD_JOIN, tid, 0, 0, 0)
 }
 
-/// Read wall-clock time: (hours << 16) | (minutes << 8) | seconds.
-#[inline(always)]
-pub fn clock_realtime() -> u64 {
-    syscall(SYS_CLOCK_REALTIME, 0, 0, 0, 0)
-}
-
-#[inline(always)]
-pub fn sysinfo(buf: *mut u8, len: usize) -> u64 {
-    syscall(SYS_SYSINFO, buf as u64, len as u64, 0, 0)
-}
-
-// --- networking ---
-
-#[inline(always)]
-pub fn net_info(buf: *mut u8, len: usize) -> u64 {
-    syscall(SYS_NET_INFO, buf as u64, len as u64, 0, 0)
-}
-
-#[inline(always)]
-pub fn net_send(buf: *const u8, len: usize) -> u64 {
-    syscall(SYS_NET_SEND, buf as u64, len as u64, 0, 0)
-}
-
-#[inline(always)]
-pub fn net_recv(buf: *mut u8, len: usize, timeout_nanos: u64) -> u64 {
-    syscall(SYS_NET_RECV, buf as u64, len as u64, timeout_nanos, 0)
-}
 

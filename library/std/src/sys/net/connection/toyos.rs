@@ -2,143 +2,11 @@ use crate::cell::Cell;
 use crate::fmt;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, ToSocketAddrs};
-use crate::os::toyos::io as toyos_io;
 use crate::os::toyos::message::{self, Message};
 use crate::sync::OnceLock;
 use crate::time::Duration;
-
-// --- IPC protocol constants (must match netd) ---
-
-const MSG_TCP_CONNECT: u32 = 1;
-const MSG_TCP_SEND: u32 = 2;
-const MSG_TCP_RECV: u32 = 3;
-const MSG_TCP_CLOSE: u32 = 4;
-const MSG_TCP_BIND: u32 = 5;
-const MSG_TCP_ACCEPT: u32 = 6;
-const MSG_TCP_SHUTDOWN: u32 = 7;
-const MSG_UDP_BIND: u32 = 8;
-const MSG_UDP_SEND_TO: u32 = 9;
-const MSG_UDP_RECV_FROM: u32 = 10;
-const MSG_UDP_CLOSE: u32 = 11;
-const MSG_DNS_LOOKUP: u32 = 12;
-const MSG_TCP_SET_OPTION: u32 = 13;
-const MSG_ERROR: u32 = 129;
-
-const ERR_CONNECTION_REFUSED: u32 = 1;
-const ERR_CONNECTION_RESET: u32 = 2;
-const ERR_TIMED_OUT: u32 = 3;
-const ERR_ADDR_IN_USE: u32 = 5;
-const ERR_NOT_CONNECTED: u32 = 6;
-const ERR_INVALID_INPUT: u32 = 7;
-
-const OPT_NODELAY: u32 = 1;
-
-// --- IPC payload structures (must match netd) ---
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpConnectRequest {
-    addr: [u8; 4],
-    port: u16,
-    _pad: u16,
-    timeout_ms: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpConnectResponse {
-    socket_id: u32,
-    local_port: u16,
-    _pad: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpRecvRequest {
-    socket_id: u32,
-    max_len: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpCloseRequest {
-    socket_id: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpBindRequest {
-    addr: [u8; 4],
-    port: u16,
-    _pad: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpBindResponse {
-    socket_id: u32,
-    bound_port: u16,
-    _pad: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpAcceptRequest {
-    socket_id: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpAcceptResponse {
-    socket_id: u32,
-    remote_addr: [u8; 4],
-    remote_port: u16,
-    local_port: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpShutdownRequest {
-    socket_id: u32,
-    how: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct UdpBindRequest {
-    addr: [u8; 4],
-    port: u16,
-    _pad: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct UdpBindResponse {
-    socket_id: u32,
-    bound_port: u16,
-    _pad: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct UdpRecvFromRequest {
-    socket_id: u32,
-    max_len: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SocketOptionRequest {
-    socket_id: u32,
-    option: u32,
-    value: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ErrorResponse {
-    code: u32,
-}
+use toyos_abi::net::*;
+use toyos_abi::syscall;
 
 // --- Helpers ---
 
@@ -146,10 +14,10 @@ fn netd_pid() -> u32 {
     static PID: OnceLock<u32> = OnceLock::new();
     *PID.get_or_init(|| {
         for _ in 0..100 {
-            if let Some(pid) = toyos_io::find_pid("netd") {
+            if let Some(pid) = syscall::find_pid("netd") {
                 return pid;
             }
-            toyos_io::poll_timeout(&[], 10_000_000); // 10ms
+            syscall::poll_timeout(&[], 10_000_000); // 10ms
         }
         panic!("netd not found");
     })

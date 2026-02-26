@@ -1,0 +1,274 @@
+// Syscall numbers (must match kernel dispatch table)
+pub const SYS_WRITE: u64 = 0;
+pub const SYS_READ: u64 = 1;
+pub const SYS_ALLOC: u64 = 2;
+pub const SYS_FREE: u64 = 3;
+pub const SYS_REALLOC: u64 = 4;
+pub const SYS_EXIT: u64 = 5;
+pub const SYS_RANDOM: u64 = 6;
+pub const SYS_SCREEN_SIZE: u64 = 7;
+pub const SYS_CLOCK: u64 = 8;
+pub const SYS_OPEN: u64 = 9;
+pub const SYS_CLOSE: u64 = 10;
+pub const SYS_SEEK: u64 = 13;
+pub const SYS_FSTAT: u64 = 14;
+pub const SYS_FSYNC: u64 = 15;
+pub const SYS_READDIR: u64 = 17;
+pub const SYS_DELETE: u64 = 18;
+pub const SYS_SHUTDOWN: u64 = 19;
+pub const SYS_CHDIR: u64 = 20;
+pub const SYS_GETCWD: u64 = 21;
+pub const SYS_SET_KEYBOARD_LAYOUT: u64 = 23;
+pub const SYS_PIPE: u64 = 24;
+pub const SYS_SPAWN: u64 = 25;
+pub const SYS_WAITPID: u64 = 26;
+pub const SYS_POLL: u64 = 27;
+pub const SYS_MARK_TTY: u64 = 28;
+pub const SYS_SEND_MSG: u64 = 29;
+pub const SYS_RECV_MSG: u64 = 30;
+pub const SYS_OPEN_DEVICE: u64 = 31;
+pub const SYS_REGISTER_NAME: u64 = 32;
+pub const SYS_FIND_PID: u64 = 33;
+pub const SYS_SET_SCREEN_SIZE: u64 = 34;
+pub const SYS_GPU_PRESENT: u64 = 35;
+pub const SYS_ALLOC_SHARED: u64 = 36;
+pub const SYS_GRANT_SHARED: u64 = 37;
+pub const SYS_MAP_SHARED: u64 = 38;
+pub const SYS_RELEASE_SHARED: u64 = 39;
+pub const SYS_THREAD_SPAWN: u64 = 40;
+pub const SYS_THREAD_JOIN: u64 = 41;
+pub const SYS_CLOCK_REALTIME: u64 = 42;
+pub const SYS_GPU_SET_CURSOR: u64 = 43;
+pub const SYS_GPU_MOVE_CURSOR: u64 = 44;
+pub const SYS_SYSINFO: u64 = 45;
+pub const SYS_NET_INFO: u64 = 46;
+pub const SYS_NET_SEND: u64 = 47;
+pub const SYS_NET_RECV: u64 = 48;
+
+#[inline(always)]
+pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rdi") num,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r8") a3,
+            in("r9") a4,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+        );
+    }
+    ret
+}
+
+// ---------------------------------------------------------------------------
+// Safe, high-level wrappers for userland
+// ---------------------------------------------------------------------------
+
+// --- Screen / GPU ---
+
+/// Get the screen size as (rows, columns).
+pub fn screen_size() -> (usize, usize) {
+    let raw = syscall(SYS_SCREEN_SIZE, 0, 0, 0, 0);
+    ((raw >> 32) as usize, (raw & 0xFFFF_FFFF) as usize)
+}
+
+/// Set the screen size from pixel dimensions (width, height).
+/// The kernel computes rows/columns assuming an 8x16 font.
+pub fn set_screen_size(width: u32, height: u32) {
+    syscall(SYS_SET_SCREEN_SIZE, width as u64, height as u64, 0, 0);
+}
+
+/// Transfer a region of the framebuffer to the GPU and flush it.
+/// Pass (0, 0, 0, 0) to flush the full screen.
+pub fn gpu_present(x: u32, y: u32, w: u32, h: u32) {
+    syscall(SYS_GPU_PRESENT, x as u64, y as u64, w as u64, h as u64);
+}
+
+/// Upload the cursor image from backing and enable hardware cursor.
+pub fn gpu_set_cursor(hot_x: u32, hot_y: u32) {
+    syscall(SYS_GPU_SET_CURSOR, hot_x as u64, hot_y as u64, 0, 0);
+}
+
+/// Move the hardware cursor to screen position (x, y).
+pub fn gpu_move_cursor(x: u32, y: u32) {
+    syscall(SYS_GPU_MOVE_CURSOR, x as u64, y as u64, 0, 0);
+}
+
+/// Set the active keyboard layout by name. Returns `true` on success.
+pub fn set_keyboard_layout(name: &str) -> bool {
+    syscall(SYS_SET_KEYBOARD_LAYOUT, name.as_ptr() as u64, name.len() as u64, 0, 0) != 0
+}
+
+/// Shut down the machine. Does not return.
+pub fn shutdown() -> ! {
+    syscall(SYS_SHUTDOWN, 0, 0, 0, 0);
+    loop {}
+}
+
+// --- Poll ---
+
+/// Result of a [`poll`] or [`poll_timeout`] call.
+pub struct PollResult {
+    mask: u64,
+    fd_count: usize,
+}
+
+impl PollResult {
+    /// Whether the file descriptor at `index` is ready.
+    pub fn fd(&self, index: usize) -> bool {
+        self.mask & (1 << index) != 0
+    }
+
+    /// Whether the process message queue has messages.
+    pub fn messages(&self) -> bool {
+        self.mask & (1 << self.fd_count) != 0
+    }
+}
+
+/// Poll file descriptors and the message queue for readiness.
+/// Blocks until at least one source has data.
+pub fn poll(fds: &[u64]) -> PollResult {
+    poll_timeout(fds, 0)
+}
+
+/// Poll file descriptors and the message queue for readiness.
+/// Returns when at least one source has data, or after `timeout_nanos`
+/// nanoseconds (whichever comes first). Pass 0 to block indefinitely.
+pub fn poll_timeout(fds: &[u64], timeout_nanos: u64) -> PollResult {
+    let mask = syscall(SYS_POLL, fds.as_ptr() as u64, fds.len() as u64, timeout_nanos, 0);
+    PollResult { mask, fd_count: fds.len() }
+}
+
+/// Read from a file descriptor. Returns bytes read.
+pub fn read_fd(fd: u64, buf: &mut [u8]) -> usize {
+    syscall(SYS_READ, fd, buf.as_mut_ptr() as u64, buf.len() as u64, 0) as usize
+}
+
+// --- Devices ---
+
+/// Device types for [`open_device`].
+#[repr(u64)]
+#[derive(Debug, Clone, Copy)]
+pub enum DeviceType {
+    Keyboard = 0,
+    Mouse = 1,
+    Framebuffer = 2,
+}
+
+/// Claim exclusive access to a device. Returns the FD number on success.
+/// Fails if the device is already claimed by another process.
+pub fn open_device(device: DeviceType) -> Option<u64> {
+    let fd = syscall(SYS_OPEN_DEVICE, device as u64, 0, 0, 0);
+    if fd == u64::MAX { None } else { Some(fd) }
+}
+
+// --- Name registry ---
+
+/// Error returned when [`register_name`] fails because the name is already registered.
+#[derive(Debug)]
+pub struct NameTaken;
+
+impl core::fmt::Display for NameTaken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("name already registered")
+    }
+}
+
+/// Register the current process under the given name.
+/// Fails if the name is already taken by another process.
+/// Other processes can discover this process via [`find_pid`].
+pub fn register_name(name: &str) -> Result<(), NameTaken> {
+    let result = syscall(SYS_REGISTER_NAME, name.as_ptr() as u64, name.len() as u64, 0, 0);
+    if result == 0 { Ok(()) } else { Err(NameTaken) }
+}
+
+/// Find the PID of a process registered under the given name.
+pub fn find_pid(name: &str) -> Option<u32> {
+    let pid = syscall(SYS_FIND_PID, name.as_ptr() as u64, name.len() as u64, 0, 0);
+    if pid == u64::MAX { None } else { Some(pid as u32) }
+}
+
+// --- Shared memory ---
+
+/// Allocate a 2MB-aligned shared memory region. Returns an opaque token.
+/// The region is mapped into the caller's address space automatically.
+pub fn alloc_shared(size: usize) -> u32 {
+    let token = syscall(SYS_ALLOC_SHARED, size as u64, 0, 0, 0);
+    assert!(token != u64::MAX, "alloc_shared failed");
+    token as u32
+}
+
+/// Grant another process permission to map a shared memory region.
+pub fn grant_shared(token: u32, target_pid: u32) {
+    let result = syscall(SYS_GRANT_SHARED, token as u64, target_pid as u64, 0, 0);
+    assert_eq!(result, 0, "grant_shared failed");
+}
+
+/// Map a shared memory region into this process's address space.
+/// Returns a pointer to the mapped memory.
+pub fn map_shared(token: u32) -> *mut u8 {
+    let addr = syscall(SYS_MAP_SHARED, token as u64, 0, 0, 0);
+    assert!(addr != u64::MAX, "map_shared failed");
+    core::ptr::with_exposed_provenance_mut(addr as usize)
+}
+
+/// Release this process's mapping of a shared memory region.
+/// Unmaps only from the caller's address space. Deallocates when no mappings remain.
+pub fn release_shared(token: u32) {
+    let result = syscall(SYS_RELEASE_SHARED, token as u64, 0, 0, 0);
+    assert_eq!(result, 0, "release_shared failed");
+}
+
+// --- System info ---
+
+/// Query system information (memory, CPUs, processes).
+/// Fills `buf` with a header followed by per-process entries.
+/// Returns the number of bytes written.
+pub fn sysinfo(buf: &mut [u8]) -> usize {
+    let n = syscall(SYS_SYSINFO, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0);
+    if n == u64::MAX { 0 } else { n as usize }
+}
+
+// --- Networking ---
+
+/// Get the MAC address of the network interface.
+/// Returns `None` if no NIC is present.
+pub fn net_mac() -> Option<[u8; 6]> {
+    let mut buf = [0u8; 6];
+    let r = syscall(SYS_NET_INFO, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0);
+    if r == u64::MAX { None } else { Some(buf) }
+}
+
+/// Send a raw Ethernet frame.
+pub fn net_send(frame: &[u8]) {
+    syscall(SYS_NET_SEND, frame.as_ptr() as u64, frame.len() as u64, 0, 0);
+}
+
+/// Receive a raw Ethernet frame. Blocks until a frame arrives.
+/// Returns the number of bytes written to `buf`.
+pub fn net_recv(buf: &mut [u8]) -> usize {
+    syscall(SYS_NET_RECV, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) as usize
+}
+
+/// Receive a raw Ethernet frame with a timeout.
+/// Returns the number of bytes written, or 0 on timeout.
+pub fn net_recv_timeout(buf: &mut [u8], timeout_nanos: u64) -> usize {
+    syscall(SYS_NET_RECV, buf.as_mut_ptr() as u64, buf.len() as u64, timeout_nanos, 0) as usize
+}
+
+// --- Clock ---
+
+/// Nanoseconds since boot (monotonic clock).
+pub fn clock_nanos() -> u64 {
+    syscall(SYS_CLOCK, 0, 0, 0, 0)
+}
+
+/// Read wall-clock time from RTC.
+/// Returns packed: (hours << 16) | (minutes << 8) | seconds.
+pub fn clock_realtime() -> u64 {
+    syscall(SYS_CLOCK_REALTIME, 0, 0, 0, 0)
+}

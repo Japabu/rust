@@ -108,57 +108,28 @@ impl Command {
 
         let stdin = self.stdin.as_ref().unwrap_or(&default);
         let stdout = self.stdout.as_ref().unwrap_or(&default);
+        let stderr = self.stderr.as_ref().unwrap_or(&default);
 
-        // Set up stdin pipe
-        let mut child_stdin_pipe: Option<Pipe> = None;
-        let mut parent_stdin_pipe: Option<Pipe> = None;
-        let child_stdin_fd = match stdin {
-            Stdio::MakePipe | Stdio::MakeTtyPipe => {
-                let (r, w) = crate::sys::pipe::pipe()?;
-                if matches!(stdin, Stdio::MakeTtyPipe) {
-                    crate::sys::pal::mark_tty(r.raw_fd());
-                    crate::sys::pal::mark_tty(w.raw_fd());
-                }
-                let fd = r.raw_fd();
-                child_stdin_pipe = Some(r);
-                parent_stdin_pipe = Some(w);
-                fd
-            }
-            Stdio::InheritFile(file) => file.raw_fd(),
-            Stdio::InheritPipe(pipe) => pipe.raw_fd(),
-            _ => u64::MAX,
-        };
+        let mut fd_map: Vec<[u32; 2]> = Vec::new();
+        let mut child_pipes: Vec<Pipe> = Vec::new();
+        let mut stdin_pipe: Option<Pipe> = None;
+        let mut stdout_pipe: Option<Pipe> = None;
+        let mut stderr_pipe: Option<Pipe> = None;
 
-        // Set up stdout pipe
-        let mut child_stdout_pipe: Option<Pipe> = None;
-        let mut parent_stdout_pipe: Option<Pipe> = None;
-        let child_stdout_fd = match stdout {
-            Stdio::MakePipe | Stdio::MakeTtyPipe => {
-                let (r, w) = crate::sys::pipe::pipe()?;
-                if matches!(stdout, Stdio::MakeTtyPipe) {
-                    crate::sys::pal::mark_tty(r.raw_fd());
-                    crate::sys::pal::mark_tty(w.raw_fd());
-                }
-                let fd = w.raw_fd();
-                parent_stdout_pipe = Some(r);
-                child_stdout_pipe = Some(w);
-                fd
-            }
-            Stdio::InheritFile(file) => file.raw_fd(),
-            Stdio::InheritPipe(pipe) => pipe.raw_fd(),
-            _ => u64::MAX,
-        };
+        // Resolve each stdio to an fd_map entry: [child_fd, parent_fd]
+        Self::setup_fd(&mut fd_map, &mut child_pipes, &mut stdin_pipe, stdin, 0, true)?;
+        Self::setup_fd(&mut fd_map, &mut child_pipes, &mut stdout_pipe, stdout, 1, false)?;
+        Self::setup_fd(&mut fd_map, &mut child_pipes, &mut stderr_pipe, stderr, 2, false)?;
 
         let pid = crate::sys::pal::spawn(
             argv_buf.as_ptr(),
             argv_buf.len(),
-            child_stdin_fd,
-            child_stdout_fd,
+            fd_map.as_ptr(),
+            fd_map.len(),
         );
 
         // Close child-side pipe ends in the parent
-        drop(child_stdin_pipe);
-        drop(child_stdout_pipe);
+        drop(child_pipes);
 
         if pid == u64::MAX {
             return Err(io::Error::new(io::ErrorKind::NotFound, "program not found"));
@@ -167,11 +138,46 @@ impl Command {
         Ok((
             Process { pid: pid as u32 },
             StdioPipes {
-                stdin: parent_stdin_pipe,
-                stdout: parent_stdout_pipe,
-                stderr: None,
+                stdin: stdin_pipe,
+                stdout: stdout_pipe,
+                stderr: stderr_pipe,
             },
         ))
+    }
+
+    fn setup_fd(
+        fd_map: &mut Vec<[u32; 2]>,
+        child_pipes: &mut Vec<Pipe>,
+        parent_pipe: &mut Option<Pipe>,
+        stdio: &Stdio,
+        child_fd: u32,
+        is_input: bool,
+    ) -> io::Result<()> {
+        match stdio {
+            Stdio::Inherit => fd_map.push([child_fd, child_fd]),
+            Stdio::MakePipe | Stdio::MakeTtyPipe => {
+                let (r, w) = crate::sys::pipe::pipe()?;
+                if matches!(stdio, Stdio::MakeTtyPipe) {
+                    crate::sys::pal::mark_tty(r.raw_fd());
+                    crate::sys::pal::mark_tty(w.raw_fd());
+                }
+                if is_input {
+                    fd_map.push([child_fd, r.raw_fd() as u32]);
+                    child_pipes.push(r);
+                    *parent_pipe = Some(w);
+                } else {
+                    fd_map.push([child_fd, w.raw_fd() as u32]);
+                    child_pipes.push(w);
+                    *parent_pipe = Some(r);
+                }
+            }
+            Stdio::InheritFile(file) => fd_map.push([child_fd, file.raw_fd() as u32]),
+            Stdio::InheritPipe(pipe) => fd_map.push([child_fd, pipe.raw_fd() as u32]),
+            Stdio::ParentStdout => fd_map.push([child_fd, 1]),
+            Stdio::ParentStderr => fd_map.push([child_fd, 2]),
+            Stdio::Null => {}
+        }
+        Ok(())
     }
 }
 
