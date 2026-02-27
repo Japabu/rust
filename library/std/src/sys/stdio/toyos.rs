@@ -29,7 +29,7 @@ static mut LINE_BUF: LineBuf = LineBuf { buf: [0; LINE_BUF_CAP], len: 0, pos: 0 
 
 fn read_one() -> io::Result<u8> {
     let mut byte = [0u8; 1];
-    let n = crate::sys::pal::read(0, byte.as_mut_ptr(), 1);
+    let n = toyos_abi::syscall::read(0, byte.as_mut_ptr(), 1);
     if n == u64::MAX {
         Err(io::Error::new(io::ErrorKind::Other, "toyos io error"))
     } else if n == 0 {
@@ -40,7 +40,7 @@ fn read_one() -> io::Result<u8> {
 }
 
 fn echo(bytes: &[u8]) {
-    crate::sys::pal::write(1, bytes.as_ptr(), bytes.len());
+    toyos_abi::syscall::write(1, bytes.as_ptr(), bytes.len());
 }
 
 /// Canonical read: line editing with echo. Buffers a complete line, then
@@ -125,10 +125,10 @@ impl Stdin {
 
 impl io::Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let fd0_type = crate::sys::pal::fstat(0) >> 32;
+        let fd0_type = toyos_abi::syscall::fstat(0) >> 32;
         let interactive = fd0_type == 3 || fd0_type == 6;
         if STDIN_RAW.load(Ordering::Relaxed) || !interactive {
-            let n = crate::sys::pal::read(0, buf.as_mut_ptr(), buf.len());
+            let n = toyos_abi::syscall::read(0, buf.as_mut_ptr(), buf.len());
             if n == u64::MAX { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
         } else {
             canonical_read(buf)
@@ -156,7 +156,7 @@ impl Stdout {
 
 impl io::Write for Stdout {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = crate::sys::pal::write(1, buf.as_ptr(), buf.len());
+        let n = toyos_abi::syscall::write(1, buf.as_ptr(), buf.len());
         if n == u64::MAX { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
     }
 
@@ -185,7 +185,7 @@ impl Stderr {
 
 impl io::Write for Stderr {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = crate::sys::pal::write(2, buf.as_ptr(), buf.len());
+        let n = toyos_abi::syscall::write(2, buf.as_ptr(), buf.len());
         if n == u64::MAX { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
     }
 

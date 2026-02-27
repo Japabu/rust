@@ -10,7 +10,7 @@ pub const UNIX_EPOCH: SystemTime = SystemTime(Duration::from_secs(0));
 
 impl Instant {
     pub fn now() -> Instant {
-        Instant(Duration::from_nanos(crate::sys::pal::clock()))
+        Instant(Duration::from_nanos(toyos_abi::syscall::clock_nanos()))
     }
 
     pub fn checked_sub_instant(&self, other: &Instant) -> Option<Duration> {

@@ -121,7 +121,7 @@ impl Command {
         Self::setup_fd(&mut fd_map, &mut child_pipes, &mut stdout_pipe, stdout, 1, false)?;
         Self::setup_fd(&mut fd_map, &mut child_pipes, &mut stderr_pipe, stderr, 2, false)?;
 
-        let pid = crate::sys::pal::spawn(
+        let pid = toyos_abi::syscall::spawn(
             argv_buf.as_ptr(),
             argv_buf.len(),
             fd_map.as_ptr(),
@@ -158,8 +158,8 @@ impl Command {
             Stdio::MakePipe | Stdio::MakeTtyPipe => {
                 let (r, w) = crate::sys::pipe::pipe()?;
                 if matches!(stdio, Stdio::MakeTtyPipe) {
-                    crate::sys::pal::mark_tty(r.raw_fd());
-                    crate::sys::pal::mark_tty(w.raw_fd());
+                    toyos_abi::syscall::mark_tty(r.raw_fd());
+                    toyos_abi::syscall::mark_tty(w.raw_fd());
                 }
                 if is_input {
                     fd_map.push([child_fd, r.raw_fd() as u32]);
@@ -351,7 +351,7 @@ impl Process {
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        let code = crate::sys::pal::waitpid(self.pid as u64);
+        let code = toyos_abi::syscall::waitpid(self.pid as u64);
         Ok(ExitStatus(code as i32))
     }
 

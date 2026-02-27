@@ -46,7 +46,7 @@ pub const SYS_NET_SEND: u64 = 47;
 pub const SYS_NET_RECV: u64 = 48;
 
 #[inline(always)]
-pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     let ret: u64;
     unsafe {
         core::arch::asm!(
@@ -65,8 +65,160 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Safe, high-level wrappers for userland
+// Wrappers
 // ---------------------------------------------------------------------------
+
+// --- I/O ---
+
+/// Write `len` bytes from `buf` to file descriptor `fd`. Returns bytes written.
+pub fn write(fd: u64, buf: *const u8, len: usize) -> u64 {
+    syscall(SYS_WRITE, fd, buf as u64, len as u64, 0)
+}
+
+/// Read up to `len` bytes from file descriptor `fd` into `buf`. Returns bytes read.
+pub fn read(fd: u64, buf: *mut u8, len: usize) -> u64 {
+    syscall(SYS_READ, fd, buf as u64, len as u64, 0)
+}
+
+/// Read from a file descriptor into a slice. Returns bytes read.
+pub fn read_fd(fd: u64, buf: &mut [u8]) -> usize {
+    syscall(SYS_READ, fd, buf.as_mut_ptr() as u64, buf.len() as u64, 0) as usize
+}
+
+// --- Memory ---
+
+/// Allocate `size` bytes with `align` alignment.
+pub fn alloc(size: usize, align: usize) -> *mut u8 {
+    core::ptr::with_exposed_provenance_mut(syscall(SYS_ALLOC, size as u64, align as u64, 0, 0) as usize)
+}
+
+/// Free an allocation at `ptr` with original `size` and `align`.
+pub fn free(ptr: *mut u8, size: usize, align: usize) {
+    syscall(SYS_FREE, ptr as u64, size as u64, align as u64, 0);
+}
+
+/// Reallocate `ptr` (with original `size`/`align`) to `new_size`.
+pub fn realloc(ptr: *mut u8, size: usize, align: usize, new_size: usize) -> *mut u8 {
+    core::ptr::with_exposed_provenance_mut(syscall(SYS_REALLOC, ptr as u64, size as u64, align as u64, new_size as u64) as usize)
+}
+
+// --- Process ---
+
+/// Exit the process with `code`. Does not return.
+pub fn exit(code: i32) -> ! {
+    loop { syscall(SYS_EXIT, code as u64, 0, 0, 0); }
+}
+
+/// Create a pipe. Returns packed (read_fd, write_fd) as u64.
+pub fn pipe() -> u64 {
+    syscall(SYS_PIPE, 0, 0, 0, 0)
+}
+
+/// Spawn a new process. Returns pid on success, u64::MAX on failure.
+pub fn spawn(argv: *const u8, len: usize, fd_map: *const [u32; 2], fd_map_count: usize) -> u64 {
+    syscall(SYS_SPAWN, argv as u64, len as u64, fd_map as u64, fd_map_count as u64)
+}
+
+/// Wait for process `pid` to exit. Returns exit code.
+pub fn waitpid(pid: u64) -> u64 {
+    syscall(SYS_WAITPID, pid, 0, 0, 0)
+}
+
+/// Mark file descriptor `fd` as the controlling TTY for this process.
+pub fn mark_tty(fd: u64) -> u64 {
+    syscall(SYS_MARK_TTY, fd, 0, 0, 0)
+}
+
+// --- Threads ---
+
+/// Spawn a new thread with the given entry point, stack pointer, and argument.
+pub fn thread_spawn(entry: u64, stack: u64, arg: u64) -> u64 {
+    syscall(SYS_THREAD_SPAWN, entry, stack, arg, 0)
+}
+
+/// Wait for thread `tid` to exit.
+pub fn thread_join(tid: u64) -> u64 {
+    syscall(SYS_THREAD_JOIN, tid, 0, 0, 0)
+}
+
+// --- IPC ---
+
+/// Send a message to process `target_pid`.
+pub fn send_msg(target_pid: u64, msg_ptr: u64) -> u64 {
+    syscall(SYS_SEND_MSG, target_pid, msg_ptr, 0, 0)
+}
+
+/// Receive a message into the buffer at `msg_ptr`.
+pub fn recv_msg(msg_ptr: u64) -> u64 {
+    syscall(SYS_RECV_MSG, msg_ptr, 0, 0, 0)
+}
+
+// --- Filesystem ---
+
+/// Open a file. Returns fd on success, u64::MAX on failure.
+pub fn open(path: *const u8, path_len: usize, flags: u64) -> u64 {
+    syscall(SYS_OPEN, path as u64, path_len as u64, flags, 0)
+}
+
+/// Close a file descriptor.
+pub fn close(fd: u64) -> u64 {
+    syscall(SYS_CLOSE, fd, 0, 0, 0)
+}
+
+/// Seek within a file descriptor. Returns new offset.
+pub fn seek(fd: u64, offset: i64, whence: u64) -> u64 {
+    syscall(SYS_SEEK, fd, offset as u64, whence, 0)
+}
+
+/// Get file size for a file descriptor.
+pub fn fstat(fd: u64) -> u64 {
+    syscall(SYS_FSTAT, fd, 0, 0, 0)
+}
+
+/// Flush file descriptor to disk.
+pub fn fsync(fd: u64) -> u64 {
+    syscall(SYS_FSYNC, fd, 0, 0, 0)
+}
+
+/// Read directory entries. Returns bytes written to `buf`.
+pub fn readdir(path: *const u8, path_len: usize, buf: *mut u8, buf_len: usize) -> u64 {
+    syscall(SYS_READDIR, path as u64, path_len as u64, buf as u64, buf_len as u64)
+}
+
+/// Delete a file or directory.
+pub fn delete(path: *const u8, path_len: usize) -> u64 {
+    syscall(SYS_DELETE, path as u64, path_len as u64, 0, 0)
+}
+
+/// Change current working directory.
+pub fn chdir(path: *const u8, path_len: usize) -> u64 {
+    syscall(SYS_CHDIR, path as u64, path_len as u64, 0, 0)
+}
+
+/// Get current working directory. Returns bytes written to `buf`.
+pub fn getcwd(buf: *mut u8, buf_len: usize) -> u64 {
+    syscall(SYS_GETCWD, buf as u64, buf_len as u64, 0, 0)
+}
+
+// --- Random ---
+
+/// Fill `buf` with cryptographically secure random bytes.
+pub fn random(buf: &mut [u8]) {
+    syscall(SYS_RANDOM, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0);
+}
+
+// --- Clock ---
+
+/// Nanoseconds since boot (monotonic clock).
+pub fn clock_nanos() -> u64 {
+    syscall(SYS_CLOCK, 0, 0, 0, 0)
+}
+
+/// Read wall-clock time from RTC.
+/// Returns packed: (hours << 16) | (minutes << 8) | seconds.
+pub fn clock_realtime() -> u64 {
+    syscall(SYS_CLOCK_REALTIME, 0, 0, 0, 0)
+}
 
 // --- Screen / GPU ---
 
@@ -141,11 +293,6 @@ pub fn poll(fds: &[u64]) -> PollResult {
 pub fn poll_timeout(fds: &[u64], timeout_nanos: u64) -> PollResult {
     let mask = syscall(SYS_POLL, fds.as_ptr() as u64, fds.len() as u64, timeout_nanos, 0);
     PollResult { mask, fd_count: fds.len() }
-}
-
-/// Read from a file descriptor. Returns bytes read.
-pub fn read_fd(fd: u64, buf: &mut [u8]) -> usize {
-    syscall(SYS_READ, fd, buf.as_mut_ptr() as u64, buf.len() as u64, 0) as usize
 }
 
 // --- Devices ---
@@ -258,17 +405,4 @@ pub fn net_recv(buf: &mut [u8]) -> usize {
 /// Returns the number of bytes written, or 0 on timeout.
 pub fn net_recv_timeout(buf: &mut [u8], timeout_nanos: u64) -> usize {
     syscall(SYS_NET_RECV, buf.as_mut_ptr() as u64, buf.len() as u64, timeout_nanos, 0) as usize
-}
-
-// --- Clock ---
-
-/// Nanoseconds since boot (monotonic clock).
-pub fn clock_nanos() -> u64 {
-    syscall(SYS_CLOCK, 0, 0, 0, 0)
-}
-
-/// Read wall-clock time from RTC.
-/// Returns packed: (hours << 16) | (minutes << 8) | seconds.
-pub fn clock_realtime() -> u64 {
-    syscall(SYS_CLOCK_REALTIME, 0, 0, 0, 0)
 }

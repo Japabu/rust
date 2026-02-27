@@ -1,9 +1,9 @@
 use crate::ffi::CStr;
 use crate::io;
 use crate::num::NonZero;
-use crate::sys::pal as pal;
 use crate::thread::ThreadInit;
 use crate::time::Duration;
+use toyos_abi::syscall;
 
 pub struct Thread {
     tid: u32,
@@ -26,7 +26,7 @@ impl Thread {
         let stack_top = stack_base as u64 + stack_size as u64;
 
         let data = Box::into_raw(init);
-        let tid = pal::thread_spawn(
+        let tid = syscall::thread_spawn(
             thread_trampoline as *const () as u64,
             stack_top,
             data.expose_provenance() as u64,
@@ -42,7 +42,7 @@ impl Thread {
     }
 
     pub fn join(self) {
-        pal::thread_join(self.tid as u64);
+        syscall::thread_join(self.tid as u64);
     }
 }
 
@@ -56,7 +56,7 @@ extern "C" fn thread_trampoline(data: u64) {
     // The guard module is no-op on ToyOS, so we drive cleanup explicitly.
     unsafe { crate::sys::thread_local::destructors::run(); }
     crate::rt::thread_cleanup();
-    pal::exit(0);
+    syscall::exit(0);
 }
 
 pub fn available_parallelism() -> io::Result<NonZero<usize>> {

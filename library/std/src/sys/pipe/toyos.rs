@@ -6,7 +6,7 @@ pub struct Pipe {
 }
 
 pub fn pipe() -> io::Result<(Pipe, Pipe)> {
-    let result = crate::sys::pal::pipe();
+    let result = toyos_abi::syscall::pipe();
     if result == u64::MAX {
         return Err(io::Error::new(io::ErrorKind::Other, "failed to create pipe"));
     }
@@ -25,7 +25,7 @@ impl Pipe {
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = crate::sys::pal::read(self.fd, buf.as_mut_ptr(), buf.len());
+        let n = toyos_abi::syscall::read(self.fd, buf.as_mut_ptr(), buf.len());
         Ok(n as usize)
     }
 
@@ -62,7 +62,7 @@ impl Pipe {
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        let n = crate::sys::pal::write(self.fd, buf.as_ptr(), buf.len());
+        let n = toyos_abi::syscall::write(self.fd, buf.as_ptr(), buf.len());
         Ok(n as usize)
     }
 
@@ -81,7 +81,7 @@ impl Pipe {
 
 impl Drop for Pipe {
     fn drop(&mut self) {
-        crate::sys::pal::close(self.fd);
+        toyos_abi::syscall::close(self.fd);
     }
 }
 

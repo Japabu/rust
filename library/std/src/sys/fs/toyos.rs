@@ -206,7 +206,7 @@ impl File {
     pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
         let flags = opts.to_flags();
         let path_bytes = path.as_os_str().as_encoded_bytes();
-        let fd = crate::sys::pal::open(path_bytes.as_ptr(), path_bytes.len(), flags);
+        let fd = toyos_abi::syscall::open(path_bytes.as_ptr(), path_bytes.len(), flags);
         if fd == u64::MAX {
             Err(io::Error::new(io::ErrorKind::NotFound, "file not found"))
         } else {
@@ -215,7 +215,7 @@ impl File {
     }
 
     pub fn file_attr(&self) -> io::Result<FileAttr> {
-        let result = crate::sys::pal::fstat(self.0);
+        let result = toyos_abi::syscall::fstat(self.0);
         if result == u64::MAX {
             return Err(io::Error::new(io::ErrorKind::Other, "fstat failed"));
         }
@@ -225,7 +225,7 @@ impl File {
     }
 
     pub fn fsync(&self) -> io::Result<()> {
-        let r = crate::sys::pal::fsync(self.0);
+        let r = toyos_abi::syscall::fsync(self.0);
         if r == u64::MAX {
             Err(io::Error::new(io::ErrorKind::Other, "fsync failed"))
         } else {
@@ -248,7 +248,7 @@ impl File {
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = crate::sys::pal::read(self.0, buf.as_mut_ptr(), buf.len());
+        let n = toyos_abi::syscall::read(self.0, buf.as_mut_ptr(), buf.len());
         if n == u64::MAX {
             Err(io::Error::new(io::ErrorKind::Other, "read failed"))
         } else {
@@ -277,7 +277,7 @@ impl File {
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        let n = crate::sys::pal::write(self.0, buf.as_ptr(), buf.len());
+        let n = toyos_abi::syscall::write(self.0, buf.as_ptr(), buf.len());
         if n == u64::MAX {
             Err(io::Error::new(io::ErrorKind::Other, "write failed"))
         } else {
@@ -309,7 +309,7 @@ impl File {
             SeekFrom::Current(n) => (n, 1u64),
             SeekFrom::End(n) => (n, 2u64),
         };
-        let result = crate::sys::pal::seek(self.0, offset, whence);
+        let result = toyos_abi::syscall::seek(self.0, offset, whence);
         if result == u64::MAX {
             Err(io::Error::new(io::ErrorKind::Other, "seek failed"))
         } else {
@@ -340,7 +340,7 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
-        crate::sys::pal::close(self.0);
+        toyos_abi::syscall::close(self.0);
     }
 }
 
@@ -363,7 +363,7 @@ impl fmt::Debug for File {
 pub fn readdir(p: &Path) -> io::Result<ReadDir> {
     let path_bytes = p.as_os_str().as_encoded_bytes();
     let mut buf = vec![0u8; 65536];
-    let n = crate::sys::pal::readdir(
+    let n = toyos_abi::syscall::readdir(
         path_bytes.as_ptr(),
         path_bytes.len(),
         buf.as_mut_ptr(),
@@ -403,7 +403,7 @@ pub fn readdir(p: &Path) -> io::Result<ReadDir> {
 
 pub fn unlink(p: &Path) -> io::Result<()> {
     let path_bytes = p.as_os_str().as_encoded_bytes();
-    let result = crate::sys::pal::delete(path_bytes.as_ptr(), path_bytes.len());
+    let result = toyos_abi::syscall::delete(path_bytes.as_ptr(), path_bytes.len());
     if result == u64::MAX {
         Err(io::Error::new(io::ErrorKind::NotFound, "file not found"))
     } else {
@@ -429,11 +429,11 @@ pub fn remove_dir_all(_path: &Path) -> io::Result<()> {
 
 pub fn exists(path: &Path) -> io::Result<bool> {
     let path_bytes = path.as_os_str().as_encoded_bytes();
-    let fd = crate::sys::pal::open(path_bytes.as_ptr(), path_bytes.len(), O_READ);
+    let fd = toyos_abi::syscall::open(path_bytes.as_ptr(), path_bytes.len(), O_READ);
     if fd == u64::MAX {
         Ok(false)
     } else {
-        crate::sys::pal::close(fd);
+        toyos_abi::syscall::close(fd);
         Ok(true)
     }
 }
@@ -452,12 +452,12 @@ pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> {
 
 pub fn stat(path: &Path) -> io::Result<FileAttr> {
     let path_bytes = path.as_os_str().as_encoded_bytes();
-    let fd = crate::sys::pal::open(path_bytes.as_ptr(), path_bytes.len(), O_READ);
+    let fd = toyos_abi::syscall::open(path_bytes.as_ptr(), path_bytes.len(), O_READ);
     if fd == u64::MAX {
         return Err(io::Error::new(io::ErrorKind::NotFound, "file not found"));
     }
-    let result = crate::sys::pal::fstat(fd);
-    crate::sys::pal::close(fd);
+    let result = toyos_abi::syscall::fstat(fd);
+    toyos_abi::syscall::close(fd);
     if result == u64::MAX {
         return Err(io::Error::new(io::ErrorKind::Other, "fstat failed"));
     }
