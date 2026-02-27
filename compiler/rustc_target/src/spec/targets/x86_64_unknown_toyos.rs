@@ -11,7 +11,7 @@ pub(crate) fn target() -> Target {
         metadata: TargetMetadata {
             description: Some("x86_64 ToyOS".into()),
             tier: Some(3),
-            host_tools: Some(false),
+            host_tools: Some(true),
             std: Some(true),
         },
         pointer_width: 64,

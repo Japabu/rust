@@ -184,6 +184,11 @@ fn current_dll_path() -> Result<PathBuf, String> {
     Err("current_dll_path is not supported on WASI".to_string())
 }
 
+#[cfg(target_os = "toyos")]
+fn current_dll_path() -> Result<PathBuf, String> {
+    Err("current_dll_path is not supported on ToyOS".to_string())
+}
+
 /// This function checks if sysroot is found using env::args().next(), and if it
 /// is not found, finds sysroot from current rustc_driver dll.
 pub(crate) fn default_sysroot() -> PathBuf {

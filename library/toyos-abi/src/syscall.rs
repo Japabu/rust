@@ -50,6 +50,9 @@ pub const SYS_GETPID: u64 = 51;
 pub const SYS_RENAME: u64 = 52;
 pub const SYS_MKDIR: u64 = 53;
 pub const SYS_RMDIR: u64 = 54;
+pub const SYS_DLOPEN: u64 = 55;
+pub const SYS_DLSYM: u64 = 56;
+pub const SYS_DLCLOSE: u64 = 57;
 
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -443,4 +446,21 @@ pub fn mkdir(path: *const u8, path_len: usize) -> u64 {
 /// Remove a directory. Returns 0 on success, u64::MAX on failure.
 pub fn rmdir(path: *const u8, path_len: usize) -> u64 {
     syscall(SYS_RMDIR, path as u64, path_len as u64, 0, 0)
+}
+
+// --- Dynamic linking ---
+
+/// Load a shared library (.so) into the current process. Returns a handle, or u64::MAX on failure.
+pub fn dl_open(path: *const u8, path_len: usize) -> u64 {
+    syscall(SYS_DLOPEN, path as u64, path_len as u64, 0, 0)
+}
+
+/// Look up a symbol in a loaded shared library. Returns the address, or u64::MAX on failure.
+pub fn dl_sym(handle: u64, name: *const u8, name_len: usize) -> u64 {
+    syscall(SYS_DLSYM, handle, name as u64, name_len as u64, 0)
+}
+
+/// Close a loaded shared library handle.
+pub fn dl_close(handle: u64) -> u64 {
+    syscall(SYS_DLCLOSE, handle, 0, 0, 0)
 }
