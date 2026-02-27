@@ -5,7 +5,7 @@ use crate::{fmt, io};
 
 pub fn getcwd() -> io::Result<PathBuf> {
     let mut buf = [0u8; 256];
-    let n = super::getcwd(buf.as_mut_ptr(), buf.len());
+    let n = toyos_abi::syscall::getcwd(buf.as_mut_ptr(), buf.len());
     if n == u64::MAX {
         return Err(io::Error::new(io::ErrorKind::Other, "getcwd failed"));
     }
@@ -16,7 +16,7 @@ pub fn getcwd() -> io::Result<PathBuf> {
 
 pub fn chdir(p: &path::Path) -> io::Result<()> {
     let bytes = p.as_os_str().as_encoded_bytes();
-    let result = super::chdir(bytes.as_ptr(), bytes.len());
+    let result = toyos_abi::syscall::chdir(bytes.as_ptr(), bytes.len());
     if result == u64::MAX {
         Err(io::Error::new(io::ErrorKind::NotFound, "no such directory"))
     } else {
@@ -24,44 +24,69 @@ pub fn chdir(p: &path::Path) -> io::Result<()> {
     }
 }
 
-pub struct SplitPaths<'a>(!, PhantomData<&'a ()>);
+pub struct SplitPaths<'a> {
+    iter: crate::vec::IntoIter<PathBuf>,
+    _marker: PhantomData<&'a ()>,
+}
 
-pub fn split_paths(_unparsed: &OsStr) -> SplitPaths<'_> {
-    panic!("unsupported")
+pub fn split_paths(unparsed: &OsStr) -> SplitPaths<'_> {
+    let s = unparsed.as_encoded_bytes();
+    let paths: crate::vec::Vec<PathBuf> = if s.is_empty() {
+        crate::vec::Vec::new()
+    } else {
+        s.split(|&b| b == b':')
+            .map(|p| PathBuf::from(unsafe { OsStr::from_encoded_bytes_unchecked(p) }))
+            .collect()
+    };
+    SplitPaths { iter: paths.into_iter(), _marker: PhantomData }
 }
 
 impl<'a> Iterator for SplitPaths<'a> {
     type Item = PathBuf;
     fn next(&mut self) -> Option<PathBuf> {
-        self.0
+        self.iter.next()
     }
 }
 
 #[derive(Debug)]
 pub struct JoinPathsError;
 
-pub fn join_paths<I, T>(_paths: I) -> Result<OsString, JoinPathsError>
+pub fn join_paths<I, T>(paths: I) -> Result<OsString, JoinPathsError>
 where
     I: Iterator<Item = T>,
     T: AsRef<OsStr>,
 {
-    Err(JoinPathsError)
+    let mut joined = OsString::new();
+    for (i, path) in paths.enumerate() {
+        if i > 0 { joined.push(":"); }
+        let p = path.as_ref();
+        if p.as_encoded_bytes().contains(&b':') {
+            return Err(JoinPathsError);
+        }
+        joined.push(p);
+    }
+    Ok(joined)
 }
 
 impl fmt::Display for JoinPathsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        "not supported on this platform yet".fmt(f)
+        "path contains colon separator".fmt(f)
     }
 }
 
 impl crate::error::Error for JoinPathsError {}
 
 pub fn current_exe() -> io::Result<PathBuf> {
-    panic!("current_exe not implemented")
+    let args: crate::vec::Vec<_> = crate::env::args().collect();
+    if let Some(arg0) = args.first() {
+        Ok(PathBuf::from(arg0))
+    } else {
+        Err(io::Error::new(io::ErrorKind::NotFound, "no argv[0]"))
+    }
 }
 
 pub fn temp_dir() -> PathBuf {
-    panic!("no filesystem on this platform")
+    PathBuf::from("/nvme/tmp")
 }
 
 pub fn home_dir() -> Option<PathBuf> {
@@ -69,9 +94,9 @@ pub fn home_dir() -> Option<PathBuf> {
 }
 
 pub fn exit(code: i32) -> ! {
-    super::exit(code)
+    toyos_abi::syscall::exit(code)
 }
 
 pub fn getpid() -> u32 {
-    panic!("no pids on this platform")
+    toyos_abi::syscall::getpid() as u32
 }

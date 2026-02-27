@@ -21,7 +21,12 @@ impl Pipe {
     }
 
     pub fn try_clone(&self) -> io::Result<Self> {
-        panic!("Pipe::try_clone not supported on ToyOS");
+        let new_fd = toyos_abi::syscall::dup(self.fd);
+        if new_fd == u64::MAX {
+            Err(io::Error::new(io::ErrorKind::Other, "pipe dup failed"))
+        } else {
+            Ok(Pipe { fd: new_fd })
+        }
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {

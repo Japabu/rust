@@ -66,7 +66,7 @@ impl Message {
         let bytes = unsafe {
             core::slice::from_raw_parts(core::ptr::with_exposed_provenance(self.data as usize), self.len as usize)
         }.to_vec();
-        crate::sys::free(core::ptr::with_exposed_provenance_mut(self.data as usize), self.len as usize, 1);
+        toyos_abi::syscall::free(core::ptr::with_exposed_provenance_mut(self.data as usize), self.len as usize, 1);
         core::mem::forget(self);
         bytes
     }
@@ -84,7 +84,7 @@ impl Message {
         let ptr: *const T = core::ptr::with_exposed_provenance(self.data as usize);
         let value = unsafe { core::ptr::read(ptr) };
         // Free the kernel-allocated buffer
-        crate::sys::free(core::ptr::with_exposed_provenance_mut(self.data as usize), self.len as usize, 1);
+        toyos_abi::syscall::free(core::ptr::with_exposed_provenance_mut(self.data as usize), self.len as usize, 1);
         core::mem::forget(self);
         value
     }
@@ -94,10 +94,10 @@ impl Message {
 /// The kernel copies the payload bytes — the sender's allocation is freed after sending.
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 pub fn send(target_pid: u32, msg: Message) {
-    let result = crate::sys::send_msg(target_pid as u64, &msg as *const Message as u64);
+    let result = toyos_abi::syscall::send_msg(target_pid as u64, &msg as *const Message as u64);
     // Free the sender's heap allocation — kernel has already copied the bytes
     if msg.data != 0 && msg.len != 0 {
-        crate::sys::free(core::ptr::with_exposed_provenance_mut(msg.data as usize), msg.len as usize, 1);
+        toyos_abi::syscall::free(core::ptr::with_exposed_provenance_mut(msg.data as usize), msg.len as usize, 1);
     }
     core::mem::forget(msg);
     assert_eq!(result, 0, "failed to send message to pid {target_pid}");
@@ -107,6 +107,6 @@ pub fn send(target_pid: u32, msg: Message) {
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 pub fn recv() -> Message {
     let mut msg = Message { sender: 0, msg_type: 0, data: 0, len: 0 };
-    crate::sys::recv_msg(&mut msg as *mut Message as u64);
+    toyos_abi::syscall::recv_msg(&mut msg as *mut Message as u64);
     msg
 }

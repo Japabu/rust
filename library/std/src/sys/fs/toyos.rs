@@ -326,7 +326,12 @@ impl File {
     }
 
     pub fn duplicate(&self) -> io::Result<File> {
-        panic!("File::duplicate not implemented")
+        let new_fd = toyos_abi::syscall::dup(self.0);
+        if new_fd == u64::MAX {
+            Err(io::Error::new(io::ErrorKind::Other, "dup failed"))
+        } else {
+            Ok(File(new_fd))
+        }
     }
 
     pub fn set_permissions(&self, _perm: FilePermissions) -> io::Result<()> {
@@ -349,8 +354,14 @@ impl DirBuilder {
         DirBuilder {}
     }
 
-    pub fn mkdir(&self, _p: &Path) -> io::Result<()> {
-        Ok(()) // Directories are virtual (derived from file path prefixes)
+    pub fn mkdir(&self, p: &Path) -> io::Result<()> {
+        let path_bytes = p.as_os_str().as_encoded_bytes();
+        let result = toyos_abi::syscall::mkdir(path_bytes.as_ptr(), path_bytes.len());
+        if result == u64::MAX {
+            Err(io::Error::new(io::ErrorKind::Other, "mkdir failed"))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -411,20 +422,41 @@ pub fn unlink(p: &Path) -> io::Result<()> {
     }
 }
 
-pub fn rename(_old: &Path, _new: &Path) -> io::Result<()> {
-    panic!("rename not implemented")
+pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
+    let old_bytes = old.as_os_str().as_encoded_bytes();
+    let new_bytes = new.as_os_str().as_encoded_bytes();
+    let result = toyos_abi::syscall::rename(
+        old_bytes.as_ptr(), old_bytes.len(),
+        new_bytes.as_ptr(), new_bytes.len(),
+    );
+    if result == u64::MAX {
+        Err(io::Error::new(io::ErrorKind::NotFound, "rename failed"))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn set_perm(_p: &Path, _perm: FilePermissions) -> io::Result<()> {
     Ok(())
 }
 
-pub fn rmdir(_p: &Path) -> io::Result<()> {
-    panic!("rmdir not implemented")
+pub fn rmdir(p: &Path) -> io::Result<()> {
+    let path_bytes = p.as_os_str().as_encoded_bytes();
+    toyos_abi::syscall::rmdir(path_bytes.as_ptr(), path_bytes.len());
+    Ok(())
 }
 
-pub fn remove_dir_all(_path: &Path) -> io::Result<()> {
-    panic!("remove_dir_all not implemented")
+pub fn remove_dir_all(path: &Path) -> io::Result<()> {
+    for entry in readdir(path)? {
+        let entry = entry?;
+        let child_path = entry.path();
+        if entry.file_type()?.is_dir() {
+            remove_dir_all(&child_path)?;
+        } else {
+            unlink(&child_path)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn exists(path: &Path) -> io::Result<bool> {
@@ -439,15 +471,15 @@ pub fn exists(path: &Path) -> io::Result<bool> {
 }
 
 pub fn readlink(_p: &Path) -> io::Result<PathBuf> {
-    panic!("readlink not implemented")
+    Err(io::Error::new(io::ErrorKind::Unsupported, "no symlinks on ToyOS"))
 }
 
 pub fn symlink(_original: &Path, _link: &Path) -> io::Result<()> {
-    panic!("symlink not implemented")
+    Err(io::Error::new(io::ErrorKind::Unsupported, "no symlinks on ToyOS"))
 }
 
 pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> {
-    panic!("link not implemented")
+    Err(io::Error::new(io::ErrorKind::Unsupported, "no hard links on ToyOS"))
 }
 
 pub fn stat(path: &Path) -> io::Result<FileAttr> {
@@ -470,18 +502,28 @@ pub fn lstat(p: &Path) -> io::Result<FileAttr> {
     stat(p) // no symlinks on toyos
 }
 
-pub fn canonicalize(_p: &Path) -> io::Result<PathBuf> {
-    panic!("canonicalize not implemented")
+pub fn canonicalize(p: &Path) -> io::Result<PathBuf> {
+    crate::path::absolute(p)
 }
 
-pub fn copy(_from: &Path, _to: &Path) -> io::Result<u64> {
-    panic!("copy not implemented")
+pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
+    let reader = File::open(from, &OpenOptions { read: true, write: false, append: false, truncate: false, create: false, create_new: false })?;
+    let writer = File::open(to, &OpenOptions { read: false, write: true, append: false, truncate: true, create: true, create_new: false })?;
+    let mut buf = vec![0u8; 8192];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 { break; }
+        writer.write(&buf[..n])?;
+        total += n as u64;
+    }
+    Ok(total)
 }
 
 pub fn set_times(_p: &Path, _times: FileTimes) -> io::Result<()> {
-    panic!("set_times not implemented")
+    Ok(()) // Timestamps not tracked on ToyOS
 }
 
 pub fn set_times_nofollow(_p: &Path, _times: FileTimes) -> io::Result<()> {
-    panic!("set_times_nofollow not implemented")
+    Ok(()) // Timestamps not tracked on ToyOS
 }

@@ -78,6 +78,7 @@ pub fn set_name(_name: &CStr) {
     // Thread naming not supported
 }
 
-pub fn sleep(_dur: Duration) {
-    panic!("sleep not implemented on ToyOS");
+pub fn sleep(dur: Duration) {
+    let nanos = dur.as_nanos().min(u64::MAX as u128) as u64;
+    syscall::nanosleep(nanos);
 }

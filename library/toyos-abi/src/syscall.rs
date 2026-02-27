@@ -44,6 +44,12 @@ pub const SYS_SYSINFO: u64 = 45;
 pub const SYS_NET_INFO: u64 = 46;
 pub const SYS_NET_SEND: u64 = 47;
 pub const SYS_NET_RECV: u64 = 48;
+pub const SYS_NANOSLEEP: u64 = 49;
+pub const SYS_DUP: u64 = 50;
+pub const SYS_GETPID: u64 = 51;
+pub const SYS_RENAME: u64 = 52;
+pub const SYS_MKDIR: u64 = 53;
+pub const SYS_RMDIR: u64 = 54;
 
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -405,4 +411,36 @@ pub fn net_recv(buf: &mut [u8]) -> usize {
 /// Returns the number of bytes written, or 0 on timeout.
 pub fn net_recv_timeout(buf: &mut [u8], timeout_nanos: u64) -> usize {
     syscall(SYS_NET_RECV, buf.as_mut_ptr() as u64, buf.len() as u64, timeout_nanos, 0) as usize
+}
+
+// --- Process / OS ---
+
+/// Sleep for the given number of nanoseconds.
+pub fn nanosleep(nanos: u64) {
+    syscall(SYS_NANOSLEEP, nanos, 0, 0, 0);
+}
+
+/// Duplicate a file descriptor. Returns the new fd, or u64::MAX on failure.
+pub fn dup(fd: u64) -> u64 {
+    syscall(SYS_DUP, fd, 0, 0, 0)
+}
+
+/// Get the current process ID.
+pub fn getpid() -> u64 {
+    syscall(SYS_GETPID, 0, 0, 0, 0)
+}
+
+/// Rename a file. Returns 0 on success, u64::MAX on failure.
+pub fn rename(old: *const u8, old_len: usize, new: *const u8, new_len: usize) -> u64 {
+    syscall(SYS_RENAME, old as u64, old_len as u64, new as u64, new_len as u64)
+}
+
+/// Create a directory. Returns 0 on success, u64::MAX on failure.
+pub fn mkdir(path: *const u8, path_len: usize) -> u64 {
+    syscall(SYS_MKDIR, path as u64, path_len as u64, 0, 0)
+}
+
+/// Remove a directory. Returns 0 on success, u64::MAX on failure.
+pub fn rmdir(path: *const u8, path_len: usize) -> u64 {
+    syscall(SYS_RMDIR, path as u64, path_len as u64, 0, 0)
 }
