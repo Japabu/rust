@@ -19,6 +19,7 @@ pub struct File(u64); // file descriptor
 pub struct FileAttr {
     size: u64,
     file_type: u64, // 1 = regular file, 2 = directory
+    mtime: u64,     // nanoseconds since boot
 }
 
 pub struct ReadDir {
@@ -77,15 +78,15 @@ impl FileAttr {
     }
 
     pub fn modified(&self) -> io::Result<SystemTime> {
-        Ok(SystemTime::now())
+        Ok(SystemTime(crate::time::Duration::from_nanos(self.mtime)))
     }
 
     pub fn accessed(&self) -> io::Result<SystemTime> {
-        Ok(SystemTime::now())
+        Err(io::Error::new(io::ErrorKind::Unsupported, "ToyOS does not track access time"))
     }
 
     pub fn created(&self) -> io::Result<SystemTime> {
-        Ok(SystemTime::now())
+        Err(io::Error::new(io::ErrorKind::Unsupported, "ToyOS does not track creation time"))
     }
 }
 
@@ -158,6 +159,7 @@ impl DirEntry {
         Ok(FileAttr {
             size: self.size,
             file_type: if self.is_dir { 2 } else { 1 },
+            mtime: 0,
         })
     }
 
@@ -215,13 +217,12 @@ impl File {
     }
 
     pub fn file_attr(&self) -> io::Result<FileAttr> {
-        let result = toyos_abi::syscall::fstat(self.0);
+        let mut stat = toyos_abi::syscall::Stat::default();
+        let result = toyos_abi::syscall::fstat(self.0, &mut stat);
         if result == u64::MAX {
             return Err(io::Error::new(io::ErrorKind::Other, "fstat failed"));
         }
-        let file_type = result >> 32;
-        let size = result & 0xFFFF_FFFF;
-        Ok(FileAttr { size, file_type })
+        Ok(FileAttr { size: stat.size, file_type: stat.file_type, mtime: stat.mtime })
     }
 
     pub fn fsync(&self) -> io::Result<()> {
@@ -488,14 +489,13 @@ pub fn stat(path: &Path) -> io::Result<FileAttr> {
     if fd == u64::MAX {
         return Err(io::Error::new(io::ErrorKind::NotFound, "file not found"));
     }
-    let result = toyos_abi::syscall::fstat(fd);
+    let mut st = toyos_abi::syscall::Stat::default();
+    let result = toyos_abi::syscall::fstat(fd, &mut st);
     toyos_abi::syscall::close(fd);
     if result == u64::MAX {
         return Err(io::Error::new(io::ErrorKind::Other, "fstat failed"));
     }
-    let file_type = result >> 32;
-    let size = result & 0xFFFF_FFFF;
-    Ok(FileAttr { size, file_type })
+    Ok(FileAttr { size: st.size, file_type: st.file_type, mtime: st.mtime })
 }
 
 pub fn lstat(p: &Path) -> io::Result<FileAttr> {
