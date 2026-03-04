@@ -391,6 +391,10 @@ impl<'a> fmt::Debug for CommandArgs<'a> {
 
 pub type ChildPipe = Pipe;
 
+pub fn getpid() -> u32 {
+    toyos_abi::syscall::getpid() as u32
+}
+
 pub fn read_output(
     _out: ChildPipe,
     _stdout: &mut Vec<u8>,
