@@ -78,7 +78,7 @@ impl FileAttr {
     }
 
     pub fn modified(&self) -> io::Result<SystemTime> {
-        Ok(SystemTime(crate::time::Duration::from_nanos(self.mtime)))
+        Ok(SystemTime::from_nanos(self.mtime))
     }
 
     pub fn accessed(&self) -> io::Result<SystemTime> {

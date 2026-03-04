@@ -47,4 +47,8 @@ impl SystemTime {
     pub fn checked_sub_duration(&self, other: &Duration) -> Option<SystemTime> {
         Some(SystemTime(self.0.checked_sub(*other)?))
     }
+
+    pub(crate) fn from_nanos(nanos: u64) -> SystemTime {
+        SystemTime(Duration::from_nanos(nanos))
+    }
 }

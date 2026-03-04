@@ -46,7 +46,9 @@ pub fn check(root: &Path, tidy_ctx: TidyCtx) {
             let source = line.split_once('=').unwrap().1.trim();
 
             // Ensure source is allowed.
-            if !ALLOWED_SOURCES.contains(&source) {
+            if !ALLOWED_SOURCES.contains(&source)
+                && !source.starts_with(r#""git+https://github.com/Japabu/"#)
+            {
                 check.error(format!("invalid source: {}", source));
             }
         }

@@ -96,4 +96,5 @@ libloading = { path = "../userland/libloading" }
 memmap2 = { path = "../userland/memmap2" }
 stacker = { path = "../userland/stacker" }
 getrandom = { path = "../userland/getrandom" }
+getrandom03 = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.3", package = "getrandom" }
 ctrlc = { path = "../userland/ctrlc" }

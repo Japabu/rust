@@ -1,9 +1,9 @@
-use crate::cell::Cell;
 use crate::fmt;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, ToSocketAddrs};
 use crate::os::toyos::message::{self, Message};
 use crate::sync::OnceLock;
+use crate::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use crate::time::Duration;
 use toyos_abi::net::*;
 use toyos_abi::syscall;
@@ -76,9 +76,9 @@ pub struct TcpStream {
     socket_id: u32,
     peer: SocketAddr,
     local_port: u16,
-    read_timeout_ms: Cell<u32>,
-    write_timeout_ms: Cell<u32>,
-    nodelay: Cell<bool>,
+    read_timeout_ms: AtomicU32,
+    write_timeout_ms: AtomicU32,
+    nodelay: AtomicBool,
 }
 
 impl TcpStream {
@@ -106,29 +106,29 @@ impl TcpStream {
             socket_id: resp.socket_id,
             peer: *addr,
             local_port: resp.local_port,
-            read_timeout_ms: Cell::new(0),
-            write_timeout_ms: Cell::new(0),
-            nodelay: Cell::new(false),
+            read_timeout_ms: AtomicU32::new(0),
+            write_timeout_ms: AtomicU32::new(0),
+            nodelay: AtomicBool::new(false),
         })
     }
 
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
-        self.read_timeout_ms.set(duration_to_ms(dur));
+        self.read_timeout_ms.store(duration_to_ms(dur), Relaxed);
         Ok(())
     }
 
     pub fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
-        self.write_timeout_ms.set(duration_to_ms(dur));
+        self.write_timeout_ms.store(duration_to_ms(dur), Relaxed);
         Ok(())
     }
 
     pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
-        let ms = self.read_timeout_ms.get();
+        let ms = self.read_timeout_ms.load(Relaxed);
         Ok(if ms == 0 { None } else { Some(Duration::from_millis(ms as u64)) })
     }
 
     pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
-        let ms = self.write_timeout_ms.get();
+        let ms = self.write_timeout_ms.load(Relaxed);
         Ok(if ms == 0 { None } else { Some(Duration::from_millis(ms as u64)) })
     }
 
@@ -245,9 +245,9 @@ impl TcpStream {
             socket_id: self.socket_id,
             peer: self.peer,
             local_port: self.local_port,
-            read_timeout_ms: Cell::new(self.read_timeout_ms.get()),
-            write_timeout_ms: Cell::new(self.write_timeout_ms.get()),
-            nodelay: Cell::new(self.nodelay.get()),
+            read_timeout_ms: AtomicU32::new(self.read_timeout_ms.load(Relaxed)),
+            write_timeout_ms: AtomicU32::new(self.write_timeout_ms.load(Relaxed)),
+            nodelay: AtomicBool::new(self.nodelay.load(Relaxed)),
         })
     }
 
@@ -266,12 +266,12 @@ impl TcpStream {
             value: nodelay as u32,
         });
         check_response(&resp)?;
-        self.nodelay.set(nodelay);
+        self.nodelay.store(nodelay, Relaxed);
         Ok(())
     }
 
     pub fn nodelay(&self) -> io::Result<bool> {
-        Ok(self.nodelay.get())
+        Ok(self.nodelay.load(Relaxed))
     }
 
     pub fn set_ttl(&self, _ttl: u32) -> io::Result<()> {
@@ -357,9 +357,9 @@ impl TcpListener {
                 socket_id: resp.socket_id,
                 peer,
                 local_port: resp.local_port,
-                read_timeout_ms: Cell::new(0),
-                write_timeout_ms: Cell::new(0),
-                nodelay: Cell::new(false),
+                read_timeout_ms: AtomicU32::new(0),
+                write_timeout_ms: AtomicU32::new(0),
+                nodelay: AtomicBool::new(false),
             },
             peer,
         ))
@@ -414,9 +414,9 @@ impl fmt::Debug for TcpListener {
 pub struct UdpSocket {
     socket_id: u32,
     local: SocketAddr,
-    peer: Cell<Option<SocketAddr>>,
-    read_timeout_ms: Cell<u32>,
-    write_timeout_ms: Cell<u32>,
+    peer: crate::sync::Mutex<Option<SocketAddr>>,
+    read_timeout_ms: AtomicU32,
+    write_timeout_ms: AtomicU32,
 }
 
 impl UdpSocket {
@@ -441,14 +441,14 @@ impl UdpSocket {
                 Ipv4Addr::from(ip),
                 resp.bound_port,
             )),
-            peer: Cell::new(None),
-            read_timeout_ms: Cell::new(0),
-            write_timeout_ms: Cell::new(0),
+            peer: crate::sync::Mutex::new(None),
+            read_timeout_ms: AtomicU32::new(0),
+            write_timeout_ms: AtomicU32::new(0),
         })
     }
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.peer.get().ok_or_else(|| {
+        self.peer.lock().unwrap().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "not connected")
         })
     }
@@ -504,29 +504,29 @@ impl UdpSocket {
         Ok(UdpSocket {
             socket_id: self.socket_id,
             local: self.local,
-            peer: Cell::new(self.peer.get()),
-            read_timeout_ms: Cell::new(self.read_timeout_ms.get()),
-            write_timeout_ms: Cell::new(self.write_timeout_ms.get()),
+            peer: crate::sync::Mutex::new(*self.peer.lock().unwrap()),
+            read_timeout_ms: AtomicU32::new(self.read_timeout_ms.load(Relaxed)),
+            write_timeout_ms: AtomicU32::new(self.write_timeout_ms.load(Relaxed)),
         })
     }
 
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
-        self.read_timeout_ms.set(duration_to_ms(dur));
+        self.read_timeout_ms.store(duration_to_ms(dur), Relaxed);
         Ok(())
     }
 
     pub fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
-        self.write_timeout_ms.set(duration_to_ms(dur));
+        self.write_timeout_ms.store(duration_to_ms(dur), Relaxed);
         Ok(())
     }
 
     pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
-        let ms = self.read_timeout_ms.get();
+        let ms = self.read_timeout_ms.load(Relaxed);
         Ok(if ms == 0 { None } else { Some(Duration::from_millis(ms as u64)) })
     }
 
     pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
-        let ms = self.write_timeout_ms.get();
+        let ms = self.write_timeout_ms.load(Relaxed);
         Ok(if ms == 0 { None } else { Some(Duration::from_millis(ms as u64)) })
     }
 
@@ -604,7 +604,7 @@ impl UdpSocket {
     }
 
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        let peer = self.peer.get().ok_or_else(|| {
+        let peer = self.peer.lock().unwrap().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "not connected")
         })?;
         self.send_to(buf, &peer)
@@ -614,7 +614,7 @@ impl UdpSocket {
         let addr = addr.to_socket_addrs()?.next().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "no addresses found")
         })?;
-        self.peer.set(Some(addr));
+        *self.peer.lock().unwrap() = Some(addr);
         Ok(())
     }
 }

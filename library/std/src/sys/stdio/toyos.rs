@@ -125,8 +125,9 @@ impl Stdin {
 
 impl io::Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let fd0_type = toyos_abi::syscall::fstat(0) >> 32;
-        let interactive = fd0_type == 3 || fd0_type == 6;
+        let mut stat = toyos_abi::syscall::Stat::default();
+        toyos_abi::syscall::fstat(0, &mut stat);
+        let interactive = stat.file_type == 3 || stat.file_type == 6;
         if STDIN_RAW.load(Ordering::Relaxed) || !interactive {
             let n = toyos_abi::syscall::read(0, buf.as_mut_ptr(), buf.len());
             if n == u64::MAX { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
