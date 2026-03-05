@@ -29,7 +29,7 @@ unsafe extern "C" fn _start() -> ! {
 
 extern "C" fn start_rust(argc: usize, argv: *const *const u8) -> ! {
     unsafe extern "C" {
-        fn main() -> i32;
+        fn main(argc: i32, argv: *const *const u8) -> i32;
     }
     ARGC.store(argc, Ordering::Relaxed);
     ARGV.store(argv as usize, Ordering::Relaxed);
@@ -41,7 +41,7 @@ extern "C" fn start_rust(argc: usize, argv: *const *const u8) -> ! {
         crate::sys::env::setenv("XDG_CONFIG_HOME".as_ref(), "/nvme/config".as_ref()).ok();
     }
 
-    let code = unsafe { main() };
+    let code = unsafe { main(argc as i32, argv) };
     toyos_abi::syscall::exit(code)
 }
 
