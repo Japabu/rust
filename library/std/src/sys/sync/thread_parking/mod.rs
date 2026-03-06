@@ -10,6 +10,7 @@ cfg_select! {
         target_os = "fuchsia",
         target_os = "motor",
         target_os = "hermit",
+        target_os = "toyos",
     ) => {
         mod futex;
         pub use futex::Parker;

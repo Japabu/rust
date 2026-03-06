@@ -9,6 +9,7 @@ cfg_select! {
         target_os = "dragonfly",
         all(target_family = "wasm", target_feature = "atomics"),
         target_os = "hermit",
+        target_os = "toyos",
     ) => {
         mod futex;
         pub use futex::Mutex;
@@ -39,10 +40,6 @@ cfg_select! {
     target_os = "xous" => {
         mod xous;
         pub use xous::Mutex;
-    }
-    target_os = "toyos" => {
-        mod toyos;
-        pub use toyos::Mutex;
     }
     _ => {
         mod no_threads;

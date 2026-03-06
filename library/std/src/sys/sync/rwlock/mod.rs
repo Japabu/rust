@@ -10,6 +10,7 @@ cfg_select! {
         all(target_family = "wasm", target_feature = "atomics"),
         target_os = "hermit",
        target_os = "motor",
+        target_os = "toyos",
     ) => {
         mod futex;
         pub use futex::RwLock;
@@ -27,10 +28,6 @@ cfg_select! {
     target_os = "solid_asp3" => {
         mod solid;
         pub use solid::RwLock;
-    }
-    target_os = "toyos" => {
-        mod toyos;
-        pub use toyos::RwLock;
     }
     _ => {
         mod no_threads;

@@ -19,6 +19,7 @@ cfg_select! {
         target_os = "dragonfly",
         target_os = "fuchsia",
         target_os = "hermit",
+        target_os = "toyos",
     ) => {
         mod futex;
         pub use futex::{Once, OnceState};
@@ -32,10 +33,6 @@ cfg_select! {
     ) => {
         mod queue;
         pub use queue::{Once, OnceState};
-    }
-    target_os = "toyos" => {
-        mod toyos;
-        pub use toyos::{Once, OnceState};
     }
     _ => {
         mod no_threads;

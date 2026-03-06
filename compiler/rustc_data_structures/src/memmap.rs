@@ -86,8 +86,7 @@ impl MmapMut {
 impl MmapMut {
     #[inline]
     pub fn map_anon(len: usize) -> io::Result<Self> {
-        let data = Vec::with_capacity(len);
-        Ok(MmapMut(data))
+        Ok(MmapMut(vec![0u8; len]))
     }
 
     #[inline]

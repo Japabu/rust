@@ -5219,6 +5219,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
+ "toyos-abi",
  "windows-sys 0.59.0",
 ]
 

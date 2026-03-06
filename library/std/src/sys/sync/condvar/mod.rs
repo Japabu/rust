@@ -10,6 +10,7 @@ cfg_select! {
         target_os = "fuchsia",
         all(target_family = "wasm", target_feature = "atomics"),
         target_os = "hermit",
+        target_os = "toyos",
     ) => {
         mod futex;
         pub use futex::Condvar;
@@ -36,10 +37,6 @@ cfg_select! {
     target_os = "xous" => {
         mod xous;
         pub use xous::Condvar;
-    }
-    target_os = "toyos" => {
-        mod toyos;
-        pub use toyos::Condvar;
     }
     _ => {
         mod no_threads;

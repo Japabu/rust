@@ -1,3 +1,4 @@
+pub mod futex;
 pub mod os;
 
 #[expect(dead_code)]
