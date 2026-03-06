@@ -845,7 +845,8 @@ impl<'tcx> Printer<'tcx> for V0SymbolMangler<'tcx> {
             self.push_disambiguator(stable_crate_id.as_u64());
         }
         let name = self.tcx.crate_name(cnum);
-        self.push_ident(name.as_str());
+        let name_str = name.as_str();
+        self.push_ident(name_str);
         Ok(())
     }
 
@@ -981,7 +982,9 @@ pub(crate) fn push_ident(ident: &str, output: &mut String) {
         match b {
             b'_' | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => {}
             0x80..=0xff => use_punycode = true,
-            _ => bug!("symbol_names: bad byte {} in ident {:?}", b, ident),
+            _ => {
+                bug!("symbol_names: bad byte {} in ident {:?}", b, ident);
+            }
         }
     }
 
