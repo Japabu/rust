@@ -1,37 +1,39 @@
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 
+use toyos_abi::syscall::{self, Fd, SyscallError};
+
+fn to_io_error(e: SyscallError) -> io::Error {
+    let kind = match e {
+        SyscallError::NotFound => io::ErrorKind::NotFound,
+        SyscallError::PermissionDenied => io::ErrorKind::PermissionDenied,
+        SyscallError::WouldBlock => io::ErrorKind::WouldBlock,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::from(kind)
+}
+
 #[derive(Debug)]
 pub struct Pipe {
-    fd: u64,
+    fd: Fd,
 }
 
 pub fn pipe() -> io::Result<(Pipe, Pipe)> {
-    let result = toyos_abi::syscall::pipe();
-    if result == u64::MAX {
-        return Err(io::Error::new(io::ErrorKind::Other, "failed to create pipe"));
-    }
-    let read_fd = result >> 32;
-    let write_fd = result & 0xFFFF_FFFF;
-    Ok((Pipe { fd: read_fd }, Pipe { fd: write_fd }))
+    let fds = syscall::pipe();
+    Ok((Pipe { fd: fds.read }, Pipe { fd: fds.write }))
 }
 
 impl Pipe {
     pub fn raw_fd(&self) -> u64 {
-        self.fd
+        self.fd.0
     }
 
     pub fn try_clone(&self) -> io::Result<Self> {
-        let new_fd = toyos_abi::syscall::dup(self.fd);
-        if new_fd == u64::MAX {
-            Err(io::Error::new(io::ErrorKind::Other, "pipe dup failed"))
-        } else {
-            Ok(Pipe { fd: new_fd })
-        }
+        let new_fd = syscall::dup(self.fd).map_err(to_io_error)?;
+        Ok(Pipe { fd: new_fd })
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = toyos_abi::syscall::read(self.fd, buf.as_mut_ptr(), buf.len());
-        Ok(n as usize)
+        syscall::read(self.fd, buf).map_err(to_io_error)
     }
 
     pub fn read_buf(&self, mut buf: BorrowedCursor<'_>) -> io::Result<()> {
@@ -67,8 +69,7 @@ impl Pipe {
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        let n = toyos_abi::syscall::write(self.fd, buf.as_ptr(), buf.len());
-        Ok(n as usize)
+        syscall::write(self.fd, buf).map_err(to_io_error)
     }
 
     pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
@@ -81,12 +82,11 @@ impl Pipe {
     pub fn is_write_vectored(&self) -> bool {
         false
     }
-
 }
 
 impl Drop for Pipe {
     fn drop(&mut self) {
-        toyos_abi::syscall::close(self.fd);
+        syscall::close(self.fd);
     }
 }
 

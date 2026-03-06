@@ -15,9 +15,9 @@ fn netd_pid() -> u32 {
     *PID.get_or_init(|| {
         for _ in 0..100 {
             if let Some(pid) = syscall::find_pid("netd") {
-                return pid;
+                return pid.0;
             }
-            syscall::poll_timeout(&[], 10_000_000); // 10ms
+            syscall::poll_timeout(&[], Some(10_000_000)); // 10ms
         }
         panic!("netd not found");
     })

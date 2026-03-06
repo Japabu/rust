@@ -32,7 +32,7 @@ impl Thread {
             data.expose_provenance() as u64,
         );
 
-        if tid == u64::MAX {
+        if syscall::SyscallError::from_u64(tid).is_some() {
             unsafe { drop(Box::from_raw(data)); }
             unsafe { crate::alloc::dealloc(stack_base, layout); }
             return Err(io::const_error!(io::ErrorKind::Uncategorized, "thread spawn failed"));

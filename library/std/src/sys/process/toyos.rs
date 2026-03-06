@@ -121,22 +121,21 @@ impl Command {
         Self::setup_fd(&mut fd_map, &mut child_pipes, &mut stdout_pipe, stdout, 1, false)?;
         Self::setup_fd(&mut fd_map, &mut child_pipes, &mut stderr_pipe, stderr, 2, false)?;
 
-        let pid = toyos_abi::syscall::spawn(
-            argv_buf.as_ptr(),
-            argv_buf.len(),
-            fd_map.as_ptr(),
-            fd_map.len(),
-        );
+        let pid = toyos_abi::syscall::spawn(&argv_buf, &fd_map);
 
         // Close child-side pipe ends in the parent
         drop(child_pipes);
 
-        if pid == u64::MAX {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "program not found"));
-        }
+        let pid = pid.map_err(|e| {
+            let kind = match e {
+                toyos_abi::syscall::SyscallError::NotFound => io::ErrorKind::NotFound,
+                _ => io::ErrorKind::Other,
+            };
+            io::Error::from(kind)
+        })?;
 
         Ok((
-            Process { pid: pid as u32 },
+            Process { pid: pid.0 },
             StdioPipes {
                 stdin: stdin_pipe,
                 stdout: stdout_pipe,
@@ -158,8 +157,8 @@ impl Command {
             Stdio::MakePipe | Stdio::MakeTtyPipe => {
                 let (r, w) = crate::sys::pipe::pipe()?;
                 if matches!(stdio, Stdio::MakeTtyPipe) {
-                    toyos_abi::syscall::mark_tty(r.raw_fd());
-                    toyos_abi::syscall::mark_tty(w.raw_fd());
+                    toyos_abi::syscall::mark_tty(toyos_abi::syscall::Fd(r.raw_fd()));
+                    toyos_abi::syscall::mark_tty(toyos_abi::syscall::Fd(w.raw_fd()));
                 }
                 if is_input {
                     fd_map.push([child_fd, r.raw_fd() as u32]);
@@ -351,7 +350,7 @@ impl Process {
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        let code = toyos_abi::syscall::waitpid(self.pid as u64);
+        let code = toyos_abi::syscall::waitpid(toyos_abi::syscall::Pid(self.pid));
         Ok(ExitStatus(code as i32))
     }
 
@@ -392,7 +391,7 @@ impl<'a> fmt::Debug for CommandArgs<'a> {
 pub type ChildPipe = Pipe;
 
 pub fn getpid() -> u32 {
-    toyos_abi::syscall::getpid() as u32
+    toyos_abi::syscall::getpid().0
 }
 
 pub fn read_output(

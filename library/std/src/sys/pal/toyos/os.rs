@@ -5,23 +5,24 @@ use crate::{fmt, io};
 
 pub fn getcwd() -> io::Result<PathBuf> {
     let mut buf = [0u8; 256];
-    let n = toyos_abi::syscall::getcwd(buf.as_mut_ptr(), buf.len());
-    if n == u64::MAX {
+    let n = toyos_abi::syscall::getcwd(&mut buf);
+    if n == 0 {
         return Err(io::Error::new(io::ErrorKind::Other, "getcwd failed"));
     }
-    let s = core::str::from_utf8(&buf[..n as usize])
+    let s = core::str::from_utf8(&buf[..n])
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "invalid utf-8 in cwd"))?;
     Ok(PathBuf::from(s))
 }
 
 pub fn chdir(p: &path::Path) -> io::Result<()> {
     let bytes = p.as_os_str().as_encoded_bytes();
-    let result = toyos_abi::syscall::chdir(bytes.as_ptr(), bytes.len());
-    if result == u64::MAX {
-        Err(io::Error::new(io::ErrorKind::NotFound, "no such directory"))
-    } else {
-        Ok(())
-    }
+    toyos_abi::syscall::chdir(bytes).map_err(|e| {
+        let kind = match e {
+            toyos_abi::syscall::SyscallError::NotFound => io::ErrorKind::NotFound,
+            _ => io::ErrorKind::Other,
+        };
+        io::Error::from(kind)
+    })
 }
 
 pub struct SplitPaths<'a> {
@@ -98,5 +99,5 @@ pub fn exit(code: i32) -> ! {
 }
 
 pub fn getpid() -> u32 {
-    toyos_abi::syscall::getpid() as u32
+    toyos_abi::syscall::getpid().0
 }

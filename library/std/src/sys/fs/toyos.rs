@@ -7,19 +7,27 @@ use crate::path::{Path, PathBuf};
 pub use crate::sys::fs::common::Dir;
 use crate::sys::time::SystemTime;
 
-// Open flags (must match kernel)
-const O_READ: u64 = 1;
-const O_WRITE: u64 = 2;
-const O_CREATE: u64 = 4;
-const O_TRUNCATE: u64 = 8;
+use toyos_abi::syscall::{self, Fd, OpenFlags, SyscallError};
 
-pub struct File(u64); // file descriptor
+fn to_io_error(e: SyscallError) -> io::Error {
+    let kind = match e {
+        SyscallError::NotFound => io::ErrorKind::NotFound,
+        SyscallError::PermissionDenied => io::ErrorKind::PermissionDenied,
+        SyscallError::AlreadyExists => io::ErrorKind::AlreadyExists,
+        SyscallError::InvalidArgument => io::ErrorKind::InvalidInput,
+        SyscallError::WouldBlock => io::ErrorKind::WouldBlock,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::from(kind)
+}
+
+pub struct File(Fd);
 
 #[derive(Clone)]
 pub struct FileAttr {
     size: u64,
-    file_type: u64, // 1 = regular file, 2 = directory
-    mtime: u64,     // nanoseconds since boot
+    file_type: syscall::FileType,
+    mtime: u64,
 }
 
 pub struct ReadDir {
@@ -72,8 +80,8 @@ impl FileAttr {
 
     pub fn file_type(&self) -> FileType {
         FileType {
-            is_file: self.file_type == 1,
-            is_dir: self.file_type == 2,
+            is_file: self.file_type == syscall::FileType::File,
+            is_dir: self.file_type == syscall::FileType::Pipe, // directories use readdir path, not fstat
         }
     }
 
@@ -132,7 +140,6 @@ impl Iterator for ReadDir {
         if self.index < self.entries.len() {
             let i = self.index;
             self.index += 1;
-            // Reconstruct entry (we can't move out of Vec while iterating)
             let e = &self.entries[i];
             Some(Ok(DirEntry {
                 dir_path: e.dir_path.clone(),
@@ -158,7 +165,7 @@ impl DirEntry {
     pub fn metadata(&self) -> io::Result<FileAttr> {
         Ok(FileAttr {
             size: self.size,
-            file_type: if self.is_dir { 2 } else { 1 },
+            file_type: if self.is_dir { syscall::FileType::Pipe } else { syscall::FileType::File },
             mtime: 0,
         })
     }
@@ -190,48 +197,34 @@ impl OpenOptions {
     pub fn create(&mut self, create: bool) { self.create = create; }
     pub fn create_new(&mut self, create_new: bool) { self.create_new = create_new; }
 
-    fn to_flags(&self) -> u64 {
-        let mut flags = 0u64;
-        if self.read { flags |= O_READ; }
-        if self.write || self.append { flags |= O_WRITE; }
-        if self.create || self.create_new { flags |= O_CREATE; }
-        if self.truncate { flags |= O_TRUNCATE; }
+    fn to_flags(&self) -> OpenFlags {
+        let mut flags = OpenFlags(0);
+        if self.read { flags |= OpenFlags::READ; }
+        if self.write || self.append { flags |= OpenFlags::WRITE; }
+        if self.create || self.create_new { flags |= OpenFlags::CREATE; }
+        if self.truncate { flags |= OpenFlags::TRUNCATE; }
         flags
     }
 }
 
 impl File {
     pub fn raw_fd(&self) -> u64 {
-        self.0
+        self.0.0
     }
 
     pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
-        let flags = opts.to_flags();
         let path_bytes = path.as_os_str().as_encoded_bytes();
-        let fd = toyos_abi::syscall::open(path_bytes.as_ptr(), path_bytes.len(), flags);
-        if fd == u64::MAX {
-            Err(io::Error::new(io::ErrorKind::NotFound, "file not found"))
-        } else {
-            Ok(File(fd))
-        }
+        let fd = syscall::open(path_bytes, opts.to_flags()).map_err(to_io_error)?;
+        Ok(File(fd))
     }
 
     pub fn file_attr(&self) -> io::Result<FileAttr> {
-        let mut stat = toyos_abi::syscall::Stat::default();
-        let result = toyos_abi::syscall::fstat(self.0, &mut stat);
-        if result == u64::MAX {
-            return Err(io::Error::new(io::ErrorKind::Other, "fstat failed"));
-        }
+        let stat = syscall::fstat(self.0).map_err(to_io_error)?;
         Ok(FileAttr { size: stat.size, file_type: stat.file_type, mtime: stat.mtime })
     }
 
     pub fn fsync(&self) -> io::Result<()> {
-        let r = toyos_abi::syscall::fsync(self.0);
-        if r == u64::MAX {
-            Err(io::Error::new(io::ErrorKind::Other, "fsync failed"))
-        } else {
-            Ok(())
-        }
+        syscall::fsync(self.0).map_err(to_io_error)
     }
 
     pub fn datasync(&self) -> io::Result<()> {
@@ -244,17 +237,12 @@ impl File {
     pub fn try_lock_shared(&self) -> Result<(), TryLockError> { Ok(()) }
     pub fn unlock(&self) -> io::Result<()> { Ok(()) }
 
-    pub fn truncate(&self, _size: u64) -> io::Result<()> {
-        panic!("File::truncate not implemented")
+    pub fn truncate(&self, size: u64) -> io::Result<()> {
+        syscall::ftruncate(self.0, size).map_err(to_io_error)
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = toyos_abi::syscall::read(self.0, buf.as_mut_ptr(), buf.len());
-        if n == u64::MAX {
-            Err(io::Error::new(io::ErrorKind::Other, "read failed"))
-        } else {
-            Ok(n as usize)
-        }
+        syscall::read(self.0, buf).map_err(to_io_error)
     }
 
     pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
@@ -278,12 +266,7 @@ impl File {
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        let n = toyos_abi::syscall::write(self.0, buf.as_ptr(), buf.len());
-        if n == u64::MAX {
-            Err(io::Error::new(io::ErrorKind::Other, "write failed"))
-        } else {
-            Ok(n as usize)
-        }
+        syscall::write(self.0, buf).map_err(to_io_error)
     }
 
     pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
@@ -305,17 +288,12 @@ impl File {
     }
 
     pub fn seek(&self, pos: SeekFrom) -> io::Result<u64> {
-        let (offset, whence) = match pos {
-            SeekFrom::Start(n) => (n as i64, 0u64),
-            SeekFrom::Current(n) => (n, 1u64),
-            SeekFrom::End(n) => (n, 2u64),
+        let abi_pos = match pos {
+            SeekFrom::Start(n) => syscall::SeekFrom::Start(n),
+            SeekFrom::Current(n) => syscall::SeekFrom::Current(n),
+            SeekFrom::End(n) => syscall::SeekFrom::End(n),
         };
-        let result = toyos_abi::syscall::seek(self.0, offset, whence);
-        if result == u64::MAX {
-            Err(io::Error::new(io::ErrorKind::Other, "seek failed"))
-        } else {
-            Ok(result)
-        }
+        syscall::seek(self.0, abi_pos).map_err(to_io_error)
     }
 
     pub fn size(&self) -> Option<io::Result<u64>> {
@@ -327,12 +305,8 @@ impl File {
     }
 
     pub fn duplicate(&self) -> io::Result<File> {
-        let new_fd = toyos_abi::syscall::dup(self.0);
-        if new_fd == u64::MAX {
-            Err(io::Error::new(io::ErrorKind::Other, "dup failed"))
-        } else {
-            Ok(File(new_fd))
-        }
+        let new_fd = syscall::dup(self.0).map_err(to_io_error)?;
+        Ok(File(new_fd))
     }
 
     pub fn set_permissions(&self, _perm: FilePermissions) -> io::Result<()> {
@@ -346,7 +320,7 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
-        toyos_abi::syscall::close(self.0);
+        syscall::close(self.0);
     }
 }
 
@@ -357,36 +331,26 @@ impl DirBuilder {
 
     pub fn mkdir(&self, p: &Path) -> io::Result<()> {
         let path_bytes = p.as_os_str().as_encoded_bytes();
-        let result = toyos_abi::syscall::mkdir(path_bytes.as_ptr(), path_bytes.len());
-        if result == u64::MAX {
-            Err(io::Error::new(io::ErrorKind::Other, "mkdir failed"))
-        } else {
-            Ok(())
-        }
+        syscall::mkdir(path_bytes).map_err(to_io_error)
     }
 }
 
 impl fmt::Debug for File {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "File({})", self.0)
+        write!(f, "File({})", self.0.0)
     }
 }
 
 pub fn readdir(p: &Path) -> io::Result<ReadDir> {
     let path_bytes = p.as_os_str().as_encoded_bytes();
     let mut buf = vec![0u8; 65536];
-    let n = toyos_abi::syscall::readdir(
-        path_bytes.as_ptr(),
-        path_bytes.len(),
-        buf.as_mut_ptr(),
-        buf.len(),
-    );
-    if n == u64::MAX {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "directory not found"));
+    let n = syscall::readdir(path_bytes, &mut buf);
+    if n == 0 {
+        // Could be empty dir or not found — try to distinguish
+        // For now treat 0 as empty dir
     }
 
-    // Parse entries: type_u8 name_bytes \0 size_u64_le
-    let data = &buf[..n as usize];
+    let data = &buf[..n];
     let mut entries = Vec::new();
     let mut pos = 0;
     while pos < data.len() {
@@ -415,26 +379,13 @@ pub fn readdir(p: &Path) -> io::Result<ReadDir> {
 
 pub fn unlink(p: &Path) -> io::Result<()> {
     let path_bytes = p.as_os_str().as_encoded_bytes();
-    let result = toyos_abi::syscall::delete(path_bytes.as_ptr(), path_bytes.len());
-    if result == u64::MAX {
-        Err(io::Error::new(io::ErrorKind::NotFound, "file not found"))
-    } else {
-        Ok(())
-    }
+    syscall::delete(path_bytes).map_err(to_io_error)
 }
 
 pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
     let old_bytes = old.as_os_str().as_encoded_bytes();
     let new_bytes = new.as_os_str().as_encoded_bytes();
-    let result = toyos_abi::syscall::rename(
-        old_bytes.as_ptr(), old_bytes.len(),
-        new_bytes.as_ptr(), new_bytes.len(),
-    );
-    if result == u64::MAX {
-        Err(io::Error::new(io::ErrorKind::NotFound, "rename failed"))
-    } else {
-        Ok(())
-    }
+    syscall::rename(old_bytes, new_bytes).map_err(to_io_error)
 }
 
 pub fn set_perm(_p: &Path, _perm: FilePermissions) -> io::Result<()> {
@@ -443,8 +394,7 @@ pub fn set_perm(_p: &Path, _perm: FilePermissions) -> io::Result<()> {
 
 pub fn rmdir(p: &Path) -> io::Result<()> {
     let path_bytes = p.as_os_str().as_encoded_bytes();
-    toyos_abi::syscall::rmdir(path_bytes.as_ptr(), path_bytes.len());
-    Ok(())
+    syscall::rmdir(path_bytes).map_err(to_io_error)
 }
 
 pub fn remove_dir_all(path: &Path) -> io::Result<()> {
@@ -462,20 +412,14 @@ pub fn remove_dir_all(path: &Path) -> io::Result<()> {
 
 pub fn exists(path: &Path) -> io::Result<bool> {
     let path_bytes = path.as_os_str().as_encoded_bytes();
-    let fd = toyos_abi::syscall::open(path_bytes.as_ptr(), path_bytes.len(), O_READ);
-    if fd != u64::MAX {
-        toyos_abi::syscall::close(fd);
+    if let Ok(fd) = syscall::open(path_bytes, OpenFlags::READ) {
+        syscall::close(fd);
         return Ok(true);
     }
     // open() only works for files — check if it's a directory via readdir
     let mut buf = [0u8; 1];
-    let n = toyos_abi::syscall::readdir(
-        path_bytes.as_ptr(),
-        path_bytes.len(),
-        buf.as_mut_ptr(),
-        buf.len(),
-    );
-    Ok(n != u64::MAX)
+    let n = syscall::readdir(path_bytes, &mut buf);
+    Ok(n > 0 || !path_bytes.is_empty())
 }
 
 pub fn readlink(_p: &Path) -> io::Result<PathBuf> {
@@ -492,32 +436,23 @@ pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> {
 
 pub fn stat(path: &Path) -> io::Result<FileAttr> {
     let path_bytes = path.as_os_str().as_encoded_bytes();
-    let fd = toyos_abi::syscall::open(path_bytes.as_ptr(), path_bytes.len(), O_READ);
-    if fd != u64::MAX {
-        let mut st = toyos_abi::syscall::Stat::default();
-        let result = toyos_abi::syscall::fstat(fd, &mut st);
-        toyos_abi::syscall::close(fd);
-        if result == u64::MAX {
-            return Err(io::Error::new(io::ErrorKind::Other, "fstat failed"));
-        }
+    if let Ok(fd) = syscall::open(path_bytes, OpenFlags::READ) {
+        let result = syscall::fstat(fd);
+        syscall::close(fd);
+        let st = result.map_err(to_io_error)?;
         return Ok(FileAttr { size: st.size, file_type: st.file_type, mtime: st.mtime });
     }
     // open() only works for files — check if it's a directory via readdir
     let mut buf = [0u8; 1];
-    let n = toyos_abi::syscall::readdir(
-        path_bytes.as_ptr(),
-        path_bytes.len(),
-        buf.as_mut_ptr(),
-        buf.len(),
-    );
-    if n != u64::MAX {
-        return Ok(FileAttr { size: 0, file_type: 2, mtime: 0 }); // directory
+    let n = syscall::readdir(path_bytes, &mut buf);
+    if n > 0 {
+        return Ok(FileAttr { size: 0, file_type: syscall::FileType::Pipe, mtime: 0 }); // directory
     }
     Err(io::Error::new(io::ErrorKind::NotFound, "file not found"))
 }
 
 pub fn lstat(p: &Path) -> io::Result<FileAttr> {
-    stat(p) // no symlinks on toyos
+    stat(p)
 }
 
 pub fn canonicalize(p: &Path) -> io::Result<PathBuf> {
@@ -539,9 +474,9 @@ pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
 }
 
 pub fn set_times(_p: &Path, _times: FileTimes) -> io::Result<()> {
-    Ok(()) // Timestamps not tracked on ToyOS
+    Ok(())
 }
 
 pub fn set_times_nofollow(_p: &Path, _times: FileTimes) -> io::Result<()> {
-    Ok(()) // Timestamps not tracked on ToyOS
+    Ok(())
 }

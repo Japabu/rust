@@ -1,6 +1,16 @@
 use crate::io::{self, IoSlice, IoSliceMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use toyos_abi::syscall::{self, Fd, FileType, SyscallError};
+
+const STDIN: Fd = Fd(0);
+const STDOUT: Fd = Fd(1);
+const STDERR: Fd = Fd(2);
+
+fn to_io_error(e: SyscallError) -> io::Error {
+    io::Error::from(io::ErrorKind::Other)
+}
+
 // ---------------------------------------------------------------------------
 // Stdin mode flag (canonical by default, raw when explicitly switched)
 // ---------------------------------------------------------------------------
@@ -29,10 +39,8 @@ static mut LINE_BUF: LineBuf = LineBuf { buf: [0; LINE_BUF_CAP], len: 0, pos: 0 
 
 fn read_one() -> io::Result<u8> {
     let mut byte = [0u8; 1];
-    let n = toyos_abi::syscall::read(0, byte.as_mut_ptr(), 1);
-    if n == u64::MAX {
-        Err(io::Error::new(io::ErrorKind::Other, "toyos io error"))
-    } else if n == 0 {
+    let n = syscall::read(STDIN, &mut byte).map_err(to_io_error)?;
+    if n == 0 {
         Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"))
     } else {
         Ok(byte[0])
@@ -40,7 +48,7 @@ fn read_one() -> io::Result<u8> {
 }
 
 fn echo(bytes: &[u8]) {
-    toyos_abi::syscall::write(1, bytes.as_ptr(), bytes.len());
+    let _ = syscall::write(STDOUT, bytes);
 }
 
 /// Canonical read: line editing with echo. Buffers a complete line, then
@@ -125,12 +133,10 @@ impl Stdin {
 
 impl io::Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut stat = toyos_abi::syscall::Stat::default();
-        toyos_abi::syscall::fstat(0, &mut stat);
-        let interactive = stat.file_type == 3 || stat.file_type == 6;
+        let stat = syscall::fstat(STDIN).ok();
+        let interactive = stat.is_some_and(|s| s.file_type == FileType::Keyboard || s.file_type == FileType::Tty);
         if STDIN_RAW.load(Ordering::Relaxed) || !interactive {
-            let n = toyos_abi::syscall::read(0, buf.as_mut_ptr(), buf.len());
-            if n == u64::MAX { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
+            syscall::read(STDIN, buf).map_err(to_io_error)
         } else {
             canonical_read(buf)
         }
@@ -157,8 +163,7 @@ impl Stdout {
 
 impl io::Write for Stdout {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = toyos_abi::syscall::write(1, buf.as_ptr(), buf.len());
-        if n == u64::MAX { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
+        syscall::write(STDOUT, buf).map_err(to_io_error)
     }
 
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
@@ -186,8 +191,7 @@ impl Stderr {
 
 impl io::Write for Stderr {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = toyos_abi::syscall::write(2, buf.as_ptr(), buf.len());
-        if n == u64::MAX { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
+        syscall::write(STDERR, buf).map_err(to_io_error)
     }
 
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
@@ -216,4 +220,3 @@ pub fn is_ebadf(_err: &io::Error) -> bool {
 pub fn panic_output() -> Option<Stderr> {
     Some(Stderr::new())
 }
-
