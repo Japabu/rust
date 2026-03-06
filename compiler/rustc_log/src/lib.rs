@@ -83,6 +83,12 @@ impl LoggerConfig {
 
 /// Initialize the logger with the given values for the filter, coloring, and other options env variables.
 pub fn init_logger(cfg: LoggerConfig) -> Result<(), Error> {
+    // ToyOS: skip tracing subscriber setup for now — the complex Layered<Box<dyn Layer>>
+    // subscriber triggers a null vtable crash during rebuild_interest, likely due to
+    // shared library relocation or struct layout issues.
+    if cfg!(target_os = "toyos") {
+        return Ok(());
+    }
     init_logger_with_additional_layer(cfg, Registry::default)
 }
 

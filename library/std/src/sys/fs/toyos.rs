@@ -463,12 +463,19 @@ pub fn remove_dir_all(path: &Path) -> io::Result<()> {
 pub fn exists(path: &Path) -> io::Result<bool> {
     let path_bytes = path.as_os_str().as_encoded_bytes();
     let fd = toyos_abi::syscall::open(path_bytes.as_ptr(), path_bytes.len(), O_READ);
-    if fd == u64::MAX {
-        Ok(false)
-    } else {
+    if fd != u64::MAX {
         toyos_abi::syscall::close(fd);
-        Ok(true)
+        return Ok(true);
     }
+    // open() only works for files — check if it's a directory via readdir
+    let mut buf = [0u8; 1];
+    let n = toyos_abi::syscall::readdir(
+        path_bytes.as_ptr(),
+        path_bytes.len(),
+        buf.as_mut_ptr(),
+        buf.len(),
+    );
+    Ok(n != u64::MAX)
 }
 
 pub fn readlink(_p: &Path) -> io::Result<PathBuf> {
@@ -486,16 +493,27 @@ pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> {
 pub fn stat(path: &Path) -> io::Result<FileAttr> {
     let path_bytes = path.as_os_str().as_encoded_bytes();
     let fd = toyos_abi::syscall::open(path_bytes.as_ptr(), path_bytes.len(), O_READ);
-    if fd == u64::MAX {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "file not found"));
+    if fd != u64::MAX {
+        let mut st = toyos_abi::syscall::Stat::default();
+        let result = toyos_abi::syscall::fstat(fd, &mut st);
+        toyos_abi::syscall::close(fd);
+        if result == u64::MAX {
+            return Err(io::Error::new(io::ErrorKind::Other, "fstat failed"));
+        }
+        return Ok(FileAttr { size: st.size, file_type: st.file_type, mtime: st.mtime });
     }
-    let mut st = toyos_abi::syscall::Stat::default();
-    let result = toyos_abi::syscall::fstat(fd, &mut st);
-    toyos_abi::syscall::close(fd);
-    if result == u64::MAX {
-        return Err(io::Error::new(io::ErrorKind::Other, "fstat failed"));
+    // open() only works for files — check if it's a directory via readdir
+    let mut buf = [0u8; 1];
+    let n = toyos_abi::syscall::readdir(
+        path_bytes.as_ptr(),
+        path_bytes.len(),
+        buf.as_mut_ptr(),
+        buf.len(),
+    );
+    if n != u64::MAX {
+        return Ok(FileAttr { size: 0, file_type: 2, mtime: 0 }); // directory
     }
-    Ok(FileAttr { size: st.size, file_type: st.file_type, mtime: st.mtime })
+    Err(io::Error::new(io::ErrorKind::NotFound, "file not found"))
 }
 
 pub fn lstat(p: &Path) -> io::Result<FileAttr> {

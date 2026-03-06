@@ -90,17 +90,32 @@ impl Message {
     }
 }
 
-/// Send a message to another process. Panics on failure.
-/// The kernel copies the payload bytes — the sender's allocation is freed after sending.
+/// Send a message to another process. Returns `Err` if the target process
+/// no longer exists. The sender's heap allocation is freed regardless.
 #[stable(feature = "toyos_ext", since = "1.0.0")]
-pub fn send(target_pid: u32, msg: Message) {
+pub fn send(target_pid: u32, msg: Message) -> Result<(), SendError> {
     let result = toyos_abi::syscall::send_msg(target_pid as u64, &msg as *const Message as u64);
-    // Free the sender's heap allocation — kernel has already copied the bytes
     if msg.data != 0 && msg.len != 0 {
         toyos_abi::syscall::free(core::ptr::with_exposed_provenance_mut(msg.data as usize), msg.len as usize, 1);
     }
     core::mem::forget(msg);
-    assert_eq!(result, 0, "failed to send message to pid {target_pid}");
+    if result == 0 { Ok(()) } else { Err(SendError { target_pid }) }
+}
+
+/// Error returned when a message cannot be delivered.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+#[derive(Debug)]
+pub struct SendError {
+    /// The PID that was unreachable.
+    #[stable(feature = "toyos_ext", since = "1.0.0")]
+    pub target_pid: u32,
+}
+
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+impl core::fmt::Display for SendError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "failed to send message to pid {}", self.target_pid)
+    }
 }
 
 /// Receive the next message from this process's queue. Blocks if empty.

@@ -186,7 +186,10 @@ fn current_dll_path() -> Result<PathBuf, String> {
 
 #[cfg(target_os = "toyos")]
 fn current_dll_path() -> Result<PathBuf, String> {
-    Err("current_dll_path is not supported on ToyOS".to_string())
+    // ToyOS doesn't have dladdr, so we can't discover the .so path at runtime.
+    // Return a synthetic path that causes `default_from_rustc_driver_dll` to
+    // compute the sysroot as /initrd/sysroot (the conventional location).
+    Ok(PathBuf::from("/initrd/sysroot/lib/librustc_driver.so"))
 }
 
 /// This function checks if sysroot is found using env::args().next(), and if it
