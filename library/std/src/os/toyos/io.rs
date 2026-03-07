@@ -7,6 +7,10 @@ use toyos_abi::syscall::{self, SyscallError};
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 pub use fd::*;
 
+/// Re-export the Fd newtype.
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub use toyos_abi::Fd;
+
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 impl AsRawFd for crate::fs::File {
     #[inline]
@@ -70,20 +74,20 @@ fn to_io_error(e: SyscallError) -> io::Error {
     io::Error::from(kind)
 }
 
-/// Non-blocking read from a raw file descriptor.
+/// Non-blocking read from a file descriptor.
 #[stable(feature = "toyos_ext", since = "1.0.0")]
-pub fn read_nonblock(raw_fd: i32, buf: &mut [u8]) -> io::Result<usize> {
-    syscall::read_nonblock(syscall::Fd(raw_fd), buf).map_err(to_io_error)
+pub fn read_nonblock(fd: Fd, buf: &mut [u8]) -> io::Result<usize> {
+    syscall::read_nonblock(fd, buf).map_err(to_io_error)
 }
 
-/// Non-blocking write to a raw file descriptor.
+/// Non-blocking write to a file descriptor.
 #[stable(feature = "toyos_ext", since = "1.0.0")]
-pub fn write_nonblock(raw_fd: i32, buf: &[u8]) -> io::Result<usize> {
-    syscall::write_nonblock(syscall::Fd(raw_fd), buf).map_err(to_io_error)
+pub fn write_nonblock(fd: Fd, buf: &[u8]) -> io::Result<usize> {
+    syscall::write_nonblock(fd, buf).map_err(to_io_error)
 }
 
-/// Close a raw file descriptor.
+/// Close a file descriptor.
 #[stable(feature = "toyos_ext", since = "1.0.0")]
-pub fn close(raw_fd: i32) {
-    syscall::close(syscall::Fd(raw_fd));
+pub fn close(fd: Fd) {
+    syscall::close(fd);
 }

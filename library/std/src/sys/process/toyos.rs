@@ -194,8 +194,8 @@ impl Command {
             Stdio::MakePipe | Stdio::MakeTtyPipe => {
                 let (r, w) = crate::sys::pipe::pipe()?;
                 if matches!(stdio, Stdio::MakeTtyPipe) {
-                    toyos_abi::syscall::mark_tty(toyos_abi::syscall::Fd(r.raw_fd()));
-                    toyos_abi::syscall::mark_tty(toyos_abi::syscall::Fd(w.raw_fd()));
+                    toyos_abi::syscall::mark_tty(toyos_abi::Fd(r.raw_fd()));
+                    toyos_abi::syscall::mark_tty(toyos_abi::Fd(w.raw_fd()));
                 }
                 if is_input {
                     fd_map.push([child_fd, r.raw_fd() as u32]);
@@ -387,7 +387,7 @@ impl Process {
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        let code = toyos_abi::syscall::waitpid(toyos_abi::syscall::Pid(self.pid));
+        let code = toyos_abi::syscall::waitpid(toyos_abi::Pid(self.pid));
         Ok(ExitStatus(code as i32))
     }
 

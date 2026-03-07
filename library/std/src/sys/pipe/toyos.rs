@@ -1,6 +1,7 @@
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 
-use toyos_abi::syscall::{self, Fd, SyscallError};
+use toyos_abi::Fd;
+use toyos_abi::syscall::{self, SyscallError};
 
 fn to_io_error(e: SyscallError) -> io::Error {
     let kind = match e {

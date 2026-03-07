@@ -1,7 +1,8 @@
 use crate::io::{self, IoSlice, IoSliceMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use toyos_abi::syscall::{self, Fd, FileType, SyscallError};
+use toyos_abi::Fd;
+use toyos_abi::syscall::{self, FileType, SyscallError};
 
 const STDIN: Fd = Fd(0);
 const STDOUT: Fd = Fd(1);

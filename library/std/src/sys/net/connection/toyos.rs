@@ -4,7 +4,8 @@ use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, ToSocke
 use crate::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use crate::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use crate::time::Duration;
-use toyos_abi::syscall::{self, Fd, SyscallError};
+use toyos_abi::Fd;
+use toyos_abi::syscall::{self, SyscallError};
 use toyos_net::{self, NetError};
 
 // --- Helpers ---

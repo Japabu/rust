@@ -3,9 +3,10 @@
 use crate::fs::File;
 use crate::io;
 use crate::sys::FromInner;
+use toyos_abi::Fd;
 use toyos_abi::syscall::{self, DeviceType, SyscallError};
 
-fn fd_to_file(fd: syscall::Fd) -> File {
+fn fd_to_file(fd: Fd) -> File {
     File::from_inner(crate::sys::fs::File::from_fd(fd))
 }
 

@@ -1,5 +1,6 @@
 //! Shared memory with RAII.
 
+use toyos_abi::Pid;
 use toyos_abi::syscall;
 
 /// A shared memory region with automatic cleanup.
@@ -52,7 +53,7 @@ impl SharedMemory {
     /// Grant another process permission to map this region.
     #[stable(feature = "toyos_ext", since = "1.0.0")]
     pub fn grant(&self, pid: u32) {
-        syscall::grant_shared(self.token, syscall::Pid(pid));
+        syscall::grant_shared(self.token, Pid(pid));
     }
 
     /// Raw pointer to the mapped memory.

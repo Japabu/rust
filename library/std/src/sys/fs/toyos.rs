@@ -7,7 +7,8 @@ use crate::path::{Path, PathBuf};
 pub use crate::sys::fs::common::Dir;
 use crate::sys::time::SystemTime;
 
-use toyos_abi::syscall::{self, Fd, OpenFlags, SyscallError};
+use toyos_abi::Fd;
+use toyos_abi::syscall::{self, OpenFlags, SyscallError};
 
 fn to_io_error(e: SyscallError) -> io::Error {
     let kind = match e {
