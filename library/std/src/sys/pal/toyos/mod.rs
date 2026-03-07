@@ -43,9 +43,9 @@ extern "C" fn start_rust(argc: usize, argv: *const *const u8) -> ! {
     }
 
     let code = unsafe { main(argc as i32, argv) };
-    toyos_abi::syscall::exit_group(code)
+    toyos_abi::syscall::exit(code)
 }
 
 pub fn abort_internal() -> ! {
-    toyos_abi::syscall::exit_group(128 + 6) // SIGABRT-like — kill entire process
+    toyos_abi::syscall::exit(128 + 6) // SIGABRT-like — kill entire process
 }

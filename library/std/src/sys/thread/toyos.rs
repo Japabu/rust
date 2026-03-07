@@ -56,7 +56,7 @@ extern "C" fn thread_trampoline(data: u64) {
     // The guard module is no-op on ToyOS, so we drive cleanup explicitly.
     unsafe { crate::sys::thread_local::destructors::run(); }
     crate::rt::thread_cleanup();
-    syscall::exit(0);
+    syscall::thread_exit(0);
 }
 
 pub fn available_parallelism() -> io::Result<NonZero<usize>> {

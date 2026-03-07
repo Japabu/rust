@@ -95,7 +95,7 @@ pub fn home_dir() -> Option<PathBuf> {
 }
 
 pub fn exit(code: i32) -> ! {
-    toyos_abi::syscall::exit_group(code)
+    toyos_abi::syscall::exit(code)
 }
 
 pub fn getpid() -> u32 {
