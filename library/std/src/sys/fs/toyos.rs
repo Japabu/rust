@@ -208,7 +208,15 @@ impl OpenOptions {
 }
 
 impl File {
-    pub fn raw_fd(&self) -> u64 {
+    pub fn from_fd(fd: Fd) -> Self {
+        File(fd)
+    }
+
+    pub fn raw_fd(&self) -> i32 {
+        self.0.0
+    }
+
+    pub fn as_raw_fd(&self) -> i32 {
         self.0.0
     }
 

@@ -94,13 +94,31 @@ impl Command {
         self.cwd.as_ref().map(|cs| Path::new(cs))
     }
 
+    fn resolve_program(&self) -> io::Result<OsString> {
+        let prog = self.program.to_str().unwrap_or("");
+        if prog.contains('/') {
+            return Ok(self.program.clone());
+        }
+        // Search PATH for the executable
+        if let Some(path_var) = crate::env::var_os("PATH") {
+            for dir in crate::env::split_paths(&path_var) {
+                let candidate = dir.join(prog);
+                if candidate.exists() {
+                    return Ok(candidate.into_os_string());
+                }
+            }
+        }
+        Err(io::Error::from(io::ErrorKind::NotFound))
+    }
+
     pub fn spawn(
         &mut self,
         default: Stdio,
         _needs_stdin: bool,
     ) -> io::Result<(Process, StdioPipes)> {
+        let resolved = self.resolve_program()?;
         let mut argv_buf = Vec::new();
-        argv_buf.extend_from_slice(self.program.as_encoded_bytes());
+        argv_buf.extend_from_slice(resolved.as_encoded_bytes());
         for arg in &self.args[1..] {
             argv_buf.push(0);
             argv_buf.extend_from_slice(arg.as_encoded_bytes());
@@ -121,7 +139,26 @@ impl Command {
         Self::setup_fd(&mut fd_map, &mut child_pipes, &mut stdout_pipe, stdout, 1, false)?;
         Self::setup_fd(&mut fd_map, &mut child_pipes, &mut stderr_pipe, stderr, 2, false)?;
 
-        let pid = toyos_abi::syscall::spawn(&argv_buf, &fd_map);
+        // Build environment: serialize all env vars as KEY=VALUE\0KEY2=VALUE2\0...
+        let mut env_buf = Vec::new();
+        let capture = self.env.capture();
+        for (key, value) in capture.iter() {
+            env_buf.extend_from_slice(key.as_encoded_bytes());
+            env_buf.push(b'=');
+            env_buf.extend_from_slice(value.as_encoded_bytes());
+            env_buf.push(0);
+        }
+
+        let spawn_args = toyos_abi::syscall::SpawnArgs {
+            argv_ptr: argv_buf.as_ptr() as u64,
+            argv_len: argv_buf.len() as u64,
+            fd_map_ptr: fd_map.as_ptr() as u64,
+            fd_map_count: fd_map.len() as u64,
+            env_ptr: env_buf.as_ptr() as u64,
+            env_len: env_buf.len() as u64,
+        };
+        // SAFETY: spawn_args contains valid pointers to stack-local buffers that outlive the call.
+        let pid = unsafe { toyos_abi::syscall::spawn(&spawn_args) };
 
         // Close child-side pipe ends in the parent
         drop(child_pipes);

@@ -1,56 +1,26 @@
 use crate::fmt;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, ToSocketAddrs};
-use crate::os::toyos::message::{self, Message};
-use crate::sync::OnceLock;
+use crate::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use crate::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use crate::time::Duration;
-use toyos_abi::net::*;
-use toyos_abi::syscall;
+use toyos_abi::syscall::{self, Fd, SyscallError};
+use toyos_net::{self, NetError};
 
 // --- Helpers ---
 
-fn netd_pid() -> u32 {
-    static PID: OnceLock<u32> = OnceLock::new();
-    *PID.get_or_init(|| {
-        for _ in 0..100 {
-            if let Some(pid) = syscall::find_pid("netd") {
-                return pid.0;
-            }
-            syscall::poll_timeout(&[], Some(10_000_000)); // 10ms
-        }
-        panic!("netd not found");
-    })
-}
-
-fn request<T: Copy>(msg_type: u32, payload: T) -> Message {
-    message::send(netd_pid(), Message::new(msg_type, payload));
-    message::recv()
-}
-
-fn request_bytes(msg_type: u32, data: &[u8]) -> Message {
-    message::send(netd_pid(), Message::from_bytes(msg_type, data));
-    message::recv()
-}
-
-fn error_from_code(code: u32) -> io::Error {
-    let kind = match code {
-        ERR_CONNECTION_REFUSED => io::ErrorKind::ConnectionRefused,
-        ERR_CONNECTION_RESET => io::ErrorKind::ConnectionReset,
-        ERR_TIMED_OUT => io::ErrorKind::TimedOut,
-        ERR_ADDR_IN_USE => io::ErrorKind::AddrInUse,
-        ERR_NOT_CONNECTED => io::ErrorKind::NotConnected,
-        ERR_INVALID_INPUT => io::ErrorKind::InvalidInput,
+fn net_err_to_io(e: NetError) -> io::Error {
+    let kind = match e {
+        NetError::ConnectionRefused => io::ErrorKind::ConnectionRefused,
+        NetError::ConnectionReset => io::ErrorKind::ConnectionReset,
+        NetError::TimedOut => io::ErrorKind::TimedOut,
+        NetError::AddrInUse => io::ErrorKind::AddrInUse,
+        NetError::NotConnected => io::ErrorKind::NotConnected,
+        NetError::InvalidInput => io::ErrorKind::InvalidInput,
+        NetError::NetdNotFound => io::ErrorKind::NotConnected,
         _ => io::ErrorKind::Other,
     };
-    io::Error::from(kind)
-}
-
-fn check_response(msg: &Message) -> io::Result<()> {
-    if msg.msg_type() == MSG_ERROR {
-        return Err(io::Error::from(io::ErrorKind::Other));
-    }
-    Ok(())
+    io::Error::new(kind, "netd error")
 }
 
 fn addr_to_v4(addr: &SocketAddr) -> io::Result<([u8; 4], u16)> {
@@ -70,15 +40,34 @@ fn duration_to_ms(d: Option<Duration>) -> u32 {
     }
 }
 
+fn syscall_err(e: SyscallError) -> io::Error {
+    match e {
+        SyscallError::WouldBlock => io::ErrorKind::WouldBlock.into(),
+        _ => io::Error::new(io::ErrorKind::Other, "syscall error"),
+    }
+}
+
+/// Wrap raw rx/tx pipe fds into a single kernel socket fd.
+fn make_socket_fd(rx_fd: Fd, tx_fd: Fd) -> io::Result<OwnedFd> {
+    let rx_id = syscall::pipe_id(rx_fd).map_err(syscall_err)?;
+    let tx_id = syscall::pipe_id(tx_fd).map_err(syscall_err)?;
+    let socket_fd = syscall::socket_create(rx_id, tx_id).map_err(syscall_err)?;
+    syscall::close(rx_fd);
+    syscall::close(tx_fd);
+    Ok(unsafe { OwnedFd::from_raw_fd(socket_fd.0) })
+}
+
 // --- TcpStream ---
 
 pub struct TcpStream {
+    fd: OwnedFd,
     socket_id: u32,
     peer: SocketAddr,
     local_port: u16,
     read_timeout_ms: AtomicU32,
     write_timeout_ms: AtomicU32,
     nodelay: AtomicBool,
+    nonblocking: AtomicBool,
 }
 
 impl TcpStream {
@@ -91,25 +80,23 @@ impl TcpStream {
 
     pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
         let (ip, port) = addr_to_v4(addr)?;
-        let resp = request(MSG_TCP_CONNECT, TcpConnectRequest {
-            addr: ip,
-            port,
-            _pad: 0,
-            timeout_ms: duration_to_ms(Some(timeout)),
-        });
-        if resp.msg_type() == MSG_ERROR {
-            let err: ErrorResponse = resp.take_payload();
-            return Err(error_from_code(err.code));
-        }
-        let resp: TcpConnectResponse = resp.take_payload();
+        let conn = toyos_net::tcp_connect(ip, port, duration_to_ms(Some(timeout)))
+            .map_err(net_err_to_io)?;
+        let fd = make_socket_fd(conn.rx_fd, conn.tx_fd)?;
         Ok(TcpStream {
-            socket_id: resp.socket_id,
+            fd,
+            socket_id: conn.socket_id,
             peer: *addr,
-            local_port: resp.local_port,
+            local_port: conn.local_port,
             read_timeout_ms: AtomicU32::new(0),
             write_timeout_ms: AtomicU32::new(0),
             nodelay: AtomicBool::new(false),
+            nonblocking: AtomicBool::new(false),
         })
+    }
+
+    fn raw_fd(&self) -> Fd {
+        Fd(self.fd.as_raw_fd())
     }
 
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
@@ -140,18 +127,18 @@ impl TcpStream {
         if buf.is_empty() {
             return Ok(0);
         }
-        let resp = request(MSG_TCP_RECV, TcpRecvRequest {
-            socket_id: self.socket_id,
-            max_len: buf.len() as u32,
-        });
-        if resp.msg_type() == MSG_ERROR {
-            let err: ErrorResponse = resp.take_payload();
-            return Err(error_from_code(err.code));
+        if self.nonblocking.load(Relaxed) {
+            return syscall::read_nonblock(self.raw_fd(), buf).map_err(syscall_err);
         }
-        let data = resp.take_bytes();
-        let n = data.len().min(buf.len());
-        buf[..n].copy_from_slice(&data[..n]);
-        Ok(n)
+        let timeout_ms = self.read_timeout_ms.load(Relaxed);
+        if timeout_ms > 0 {
+            let poll_fd = self.fd.as_raw_fd() as u64 | syscall::POLL_READABLE;
+            let result = syscall::poll_timeout(&[poll_fd], Some(timeout_ms as u64 * 1_000_000));
+            if !result.fd(0) {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+        }
+        syscall::read(self.raw_fd(), buf).map_err(syscall_err)
     }
 
     pub fn read_buf(&self, mut buf: BorrowedCursor<'_>) -> io::Result<()> {
@@ -184,16 +171,18 @@ impl TcpStream {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut data = Vec::with_capacity(4 + buf.len());
-        data.extend_from_slice(&self.socket_id.to_le_bytes());
-        data.extend_from_slice(buf);
-        let resp = request_bytes(MSG_TCP_SEND, &data);
-        if resp.msg_type() == MSG_ERROR {
-            let err: ErrorResponse = resp.take_payload();
-            return Err(error_from_code(err.code));
+        if self.nonblocking.load(Relaxed) {
+            return syscall::write_nonblock(self.raw_fd(), buf).map_err(syscall_err);
         }
-        let sent: u32 = resp.take_payload();
-        Ok(sent as usize)
+        let timeout_ms = self.write_timeout_ms.load(Relaxed);
+        if timeout_ms > 0 {
+            let poll_fd = self.fd.as_raw_fd() as u64 | syscall::POLL_WRITABLE;
+            let result = syscall::poll_timeout(&[poll_fd], Some(timeout_ms as u64 * 1_000_000));
+            if !result.fd(0) {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+        }
+        syscall::write(self.raw_fd(), buf).map_err(syscall_err)
     }
 
     pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
@@ -232,27 +221,25 @@ impl TcpStream {
             Shutdown::Write => 1,
             Shutdown::Both => 2,
         };
-        let resp = request(MSG_TCP_SHUTDOWN, TcpShutdownRequest {
-            socket_id: self.socket_id,
-            how: how_val,
-        });
-        check_response(&resp)?;
-        Ok(())
+        toyos_net::tcp_shutdown(self.socket_id, how_val).map_err(net_err_to_io)
     }
 
     pub fn duplicate(&self) -> io::Result<TcpStream> {
+        let new_fd = syscall::dup(self.raw_fd()).map_err(syscall_err)?;
         Ok(TcpStream {
+            fd: unsafe { OwnedFd::from_raw_fd(new_fd.0) },
             socket_id: self.socket_id,
             peer: self.peer,
             local_port: self.local_port,
             read_timeout_ms: AtomicU32::new(self.read_timeout_ms.load(Relaxed)),
             write_timeout_ms: AtomicU32::new(self.write_timeout_ms.load(Relaxed)),
             nodelay: AtomicBool::new(self.nodelay.load(Relaxed)),
+            nonblocking: AtomicBool::new(self.nonblocking.load(Relaxed)),
         })
     }
 
     pub fn set_linger(&self, _linger: Option<Duration>) -> io::Result<()> {
-        Ok(()) // no-op
+        Ok(())
     }
 
     pub fn linger(&self) -> io::Result<Option<Duration>> {
@@ -260,12 +247,8 @@ impl TcpStream {
     }
 
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
-        let resp = request(MSG_TCP_SET_OPTION, SocketOptionRequest {
-            socket_id: self.socket_id,
-            option: OPT_NODELAY,
-            value: nodelay as u32,
-        });
-        check_response(&resp)?;
+        toyos_net::tcp_set_option(self.socket_id, toyos_net::OPT_NODELAY, nodelay as u32)
+            .map_err(net_err_to_io)?;
         self.nodelay.store(nodelay, Relaxed);
         Ok(())
     }
@@ -275,7 +258,7 @@ impl TcpStream {
     }
 
     pub fn set_ttl(&self, _ttl: u32) -> io::Result<()> {
-        Ok(()) // no-op
+        Ok(())
     }
 
     pub fn ttl(&self) -> io::Result<u32> {
@@ -286,28 +269,40 @@ impl TcpStream {
         Ok(None)
     }
 
-    pub fn set_nonblocking(&self, _nonblocking: bool) -> io::Result<()> {
-        Ok(()) // TODO: implement non-blocking mode
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.nonblocking.store(nonblocking, Relaxed);
+        Ok(())
+    }
+
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+
+    pub fn as_raw_fd(&self) -> i32 {
+        self.fd.as_raw_fd()
     }
 }
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let _ = request(MSG_TCP_CLOSE, TcpCloseRequest { socket_id: self.socket_id });
+        toyos_net::tcp_close(self.socket_id);
+        // OwnedFd drop closes the pipe-backed socket fd
     }
 }
 
 impl fmt::Debug for TcpStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "TcpStream(id={}, peer={})", self.socket_id, self.peer)
+        write!(f, "TcpStream(fd={}, peer={})", self.fd.as_raw_fd(), self.peer)
     }
 }
 
 // --- TcpListener ---
 
 pub struct TcpListener {
+    notify_fd: OwnedFd,
     socket_id: u32,
     local: SocketAddr,
+    nonblocking: AtomicBool,
 }
 
 impl TcpListener {
@@ -316,22 +311,12 @@ impl TcpListener {
             io::Error::new(io::ErrorKind::InvalidInput, "no addresses found")
         })?;
         let (ip, port) = addr_to_v4(&addr)?;
-        let resp = request(MSG_TCP_BIND, TcpBindRequest {
-            addr: ip,
-            port,
-            _pad: 0,
-        });
-        if resp.msg_type() == MSG_ERROR {
-            let err: ErrorResponse = resp.take_payload();
-            return Err(error_from_code(err.code));
-        }
-        let resp: TcpBindResponse = resp.take_payload();
+        let bound = toyos_net::tcp_bind(ip, port).map_err(net_err_to_io)?;
         Ok(TcpListener {
-            socket_id: resp.socket_id,
-            local: SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::from(ip),
-                resp.bound_port,
-            )),
+            notify_fd: unsafe { OwnedFd::from_raw_fd(bound.notify_fd.0) },
+            socket_id: bound.socket_id,
+            local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), bound.bound_port)),
+            nonblocking: AtomicBool::new(false),
         })
     }
 
@@ -340,35 +325,44 @@ impl TcpListener {
     }
 
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-        let resp = request(MSG_TCP_ACCEPT, TcpAcceptRequest {
-            socket_id: self.socket_id,
-        });
-        if resp.msg_type() == MSG_ERROR {
-            let err: ErrorResponse = resp.take_payload();
-            return Err(error_from_code(err.code));
+        // Wait for notification byte from netd
+        let mut byte = [0u8; 1];
+        let notify_fd = Fd(self.notify_fd.as_raw_fd());
+        if self.nonblocking.load(Relaxed) {
+            syscall::read_nonblock(notify_fd, &mut byte).map_err(syscall_err)?;
+        } else {
+            syscall::read(notify_fd, &mut byte).map_err(syscall_err)?;
         }
-        let resp: TcpAcceptResponse = resp.take_payload();
+
+        let accepted = toyos_net::tcp_accept(self.socket_id).map_err(net_err_to_io)?;
+        let fd = make_socket_fd(accepted.rx_fd, accepted.tx_fd)?;
+
         let peer = SocketAddr::V4(SocketAddrV4::new(
-            Ipv4Addr::from(resp.remote_addr),
-            resp.remote_port,
+            Ipv4Addr::from(accepted.remote_addr),
+            accepted.remote_port,
         ));
         Ok((
             TcpStream {
-                socket_id: resp.socket_id,
+                fd,
+                socket_id: accepted.socket_id,
                 peer,
-                local_port: resp.local_port,
+                local_port: accepted.local_port,
                 read_timeout_ms: AtomicU32::new(0),
                 write_timeout_ms: AtomicU32::new(0),
                 nodelay: AtomicBool::new(false),
+                nonblocking: AtomicBool::new(false),
             },
             peer,
         ))
     }
 
     pub fn duplicate(&self) -> io::Result<TcpListener> {
+        let new_fd = syscall::dup(Fd(self.notify_fd.as_raw_fd())).map_err(syscall_err)?;
         Ok(TcpListener {
+            notify_fd: unsafe { OwnedFd::from_raw_fd(new_fd.0) },
             socket_id: self.socket_id,
             local: self.local,
+            nonblocking: AtomicBool::new(self.nonblocking.load(Relaxed)),
         })
     }
 
@@ -392,20 +386,30 @@ impl TcpListener {
         Ok(None)
     }
 
-    pub fn set_nonblocking(&self, _nonblocking: bool) -> io::Result<()> {
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.nonblocking.store(nonblocking, Relaxed);
         Ok(())
+    }
+
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.notify_fd.as_fd()
+    }
+
+    pub fn as_raw_fd(&self) -> i32 {
+        self.notify_fd.as_raw_fd()
     }
 }
 
 impl Drop for TcpListener {
     fn drop(&mut self) {
-        let _ = request(MSG_TCP_CLOSE, TcpCloseRequest { socket_id: self.socket_id });
+        toyos_net::tcp_close(self.socket_id);
+        // OwnedFd drop closes the notify pipe fd
     }
 }
 
 impl fmt::Debug for TcpListener {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "TcpListener(id={}, local={})", self.socket_id, self.local)
+        write!(f, "TcpListener(fd={}, local={})", self.notify_fd.as_raw_fd(), self.local)
     }
 }
 
@@ -425,21 +429,12 @@ impl UdpSocket {
             io::Error::new(io::ErrorKind::InvalidInput, "no addresses found")
         })?;
         let (ip, port) = addr_to_v4(&addr)?;
-        let resp = request(MSG_UDP_BIND, UdpBindRequest {
-            addr: ip,
-            port,
-            _pad: 0,
-        });
-        if resp.msg_type() == MSG_ERROR {
-            let err: ErrorResponse = resp.take_payload();
-            return Err(error_from_code(err.code));
-        }
-        let resp: UdpBindResponse = resp.take_payload();
+        let bound = toyos_net::udp_bind(ip, port).map_err(net_err_to_io)?;
         Ok(UdpSocket {
-            socket_id: resp.socket_id,
+            socket_id: bound.socket_id,
             local: SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::from(ip),
-                resp.bound_port,
+                bound.bound_port,
             )),
             peer: crate::sync::Mutex::new(None),
             read_timeout_ms: AtomicU32::new(0),
@@ -458,15 +453,13 @@ impl UdpSocket {
     }
 
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let resp = request(MSG_UDP_RECV_FROM, UdpRecvFromRequest {
+        toyos_net::send_to_netd(toyos_net::MSG_UDP_RECV_FROM, &toyos_net::UdpRecvFromRequest {
             socket_id: self.socket_id,
             max_len: buf.len() as u32,
-        });
-        if resp.msg_type() == MSG_ERROR {
-            let err: ErrorResponse = resp.take_payload();
-            return Err(error_from_code(err.code));
-        }
-        let data = resp.take_bytes();
+        }).map_err(net_err_to_io)?;
+        let msg = toyos_net::recv_from_netd();
+        toyos_net::check_response(&msg).map_err(net_err_to_io)?;
+        let data = msg.bytes();
         if data.len() < 8 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed response"));
         }
@@ -484,19 +477,17 @@ impl UdpSocket {
 
     pub fn send_to(&self, buf: &[u8], addr: &SocketAddr) -> io::Result<usize> {
         let (ip, port) = addr_to_v4(addr)?;
-        // Format: [socket_id:4][addr:4][port:2][pad:2][data...]
         let mut data = Vec::with_capacity(12 + buf.len());
         data.extend_from_slice(&self.socket_id.to_le_bytes());
         data.extend_from_slice(&ip);
         data.extend_from_slice(&port.to_le_bytes());
         data.extend_from_slice(&[0, 0]);
         data.extend_from_slice(buf);
-        let resp = request_bytes(MSG_UDP_SEND_TO, &data);
-        if resp.msg_type() == MSG_ERROR {
-            let err: ErrorResponse = resp.take_payload();
-            return Err(error_from_code(err.code));
-        }
-        let sent: u32 = resp.take_payload();
+        toyos_net::send_bytes_to_netd(toyos_net::MSG_UDP_SEND_TO, &data)
+            .map_err(net_err_to_io)?;
+        let msg = toyos_net::recv_from_netd();
+        toyos_net::check_response(&msg).map_err(net_err_to_io)?;
+        let sent: u32 = msg.payload();
         Ok(sent as usize)
     }
 
@@ -621,7 +612,7 @@ impl UdpSocket {
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
-        let _ = request(MSG_UDP_CLOSE, TcpCloseRequest { socket_id: self.socket_id });
+        toyos_net::udp_close(self.socket_id);
     }
 }
 
@@ -652,7 +643,6 @@ impl Iterator for LookupHost {
 }
 
 pub fn lookup_host(host: &str, port: u16) -> io::Result<LookupHost> {
-    // Try parsing as IP literal first
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
         return Ok(LookupHost {
             addrs: vec![SocketAddr::V4(SocketAddrV4::new(ip, port))],
@@ -660,13 +650,14 @@ pub fn lookup_host(host: &str, port: u16) -> io::Result<LookupHost> {
         });
     }
 
-    // Send DNS query to netd
-    let resp = request_bytes(MSG_DNS_LOOKUP, host.as_bytes());
-    if resp.msg_type() == MSG_ERROR {
+    toyos_net::send_bytes_to_netd(toyos_net::MSG_DNS_LOOKUP, host.as_bytes())
+        .map_err(net_err_to_io)?;
+    let msg = toyos_net::recv_from_netd();
+    if msg.msg_type == toyos_net::MSG_ERROR {
         return Err(io::Error::new(io::ErrorKind::Other, "DNS lookup failed"));
     }
 
-    let data = resp.take_bytes();
+    let data = msg.bytes();
     if data.is_empty() {
         return Err(io::Error::new(io::ErrorKind::Other, "DNS lookup failed: empty response"));
     }

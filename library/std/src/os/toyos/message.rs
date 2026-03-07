@@ -66,7 +66,8 @@ impl Message {
         let bytes = unsafe {
             core::slice::from_raw_parts(core::ptr::with_exposed_provenance(self.data as usize), self.len as usize)
         }.to_vec();
-        toyos_abi::syscall::free(core::ptr::with_exposed_provenance_mut(self.data as usize), self.len as usize, 1);
+        // SAFETY: data pointer was allocated by the kernel for this message payload.
+        unsafe { toyos_abi::syscall::free(core::ptr::with_exposed_provenance_mut(self.data as usize), self.len as usize, 1); }
         core::mem::forget(self);
         bytes
     }
@@ -83,8 +84,8 @@ impl Message {
         );
         let ptr: *const T = core::ptr::with_exposed_provenance(self.data as usize);
         let value = unsafe { core::ptr::read(ptr) };
-        // Free the kernel-allocated buffer
-        toyos_abi::syscall::free(core::ptr::with_exposed_provenance_mut(self.data as usize), self.len as usize, 1);
+        // SAFETY: data pointer was allocated by the kernel for this message payload.
+        unsafe { toyos_abi::syscall::free(core::ptr::with_exposed_provenance_mut(self.data as usize), self.len as usize, 1); }
         core::mem::forget(self);
         value
     }
@@ -94,9 +95,11 @@ impl Message {
 /// no longer exists. The sender's heap allocation is freed regardless.
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 pub fn send(target_pid: u32, msg: Message) -> Result<(), SendError> {
-    let result = toyos_abi::syscall::send_msg(target_pid as u64, &msg as *const Message as u64);
+    // SAFETY: msg pointer is valid and points to a well-formed Message on the stack.
+    let result = unsafe { toyos_abi::syscall::send_msg(target_pid as u64, &msg as *const Message as u64) };
     if msg.data != 0 && msg.len != 0 {
-        toyos_abi::syscall::free(core::ptr::with_exposed_provenance_mut(msg.data as usize), msg.len as usize, 1);
+        // SAFETY: data pointer was heap-allocated for this message payload.
+        unsafe { toyos_abi::syscall::free(core::ptr::with_exposed_provenance_mut(msg.data as usize), msg.len as usize, 1); }
     }
     core::mem::forget(msg);
     if result == 0 { Ok(()) } else { Err(SendError { target_pid }) }
@@ -122,6 +125,7 @@ impl core::fmt::Display for SendError {
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 pub fn recv() -> Message {
     let mut msg = Message { sender: 0, msg_type: 0, data: 0, len: 0 };
-    toyos_abi::syscall::recv_msg(&mut msg as *mut Message as u64);
+    // SAFETY: msg is a valid mutable pointer to a Message on the stack.
+    unsafe { toyos_abi::syscall::recv_msg(&mut msg as *mut Message as u64); }
     msg
 }

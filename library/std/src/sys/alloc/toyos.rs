@@ -5,16 +5,19 @@ use toyos_abi::syscall;
 unsafe impl GlobalAlloc for System {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        syscall::alloc(layout.size(), layout.align())
+        // SAFETY: layout is valid per GlobalAlloc contract; syscall handles allocation.
+        unsafe { syscall::alloc(layout.size(), layout.align()) }
     }
 
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        syscall::free(ptr, layout.size(), layout.align())
+        // SAFETY: ptr was allocated with matching layout per GlobalAlloc contract.
+        unsafe { syscall::free(ptr, layout.size(), layout.align()) }
     }
 
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        syscall::realloc(ptr, layout.size(), layout.align(), new_size)
+        // SAFETY: ptr was allocated with matching layout per GlobalAlloc contract.
+        unsafe { syscall::realloc(ptr, layout.size(), layout.align(), new_size) }
     }
 }

@@ -23,7 +23,7 @@ pub fn pipe() -> io::Result<(Pipe, Pipe)> {
 }
 
 impl Pipe {
-    pub fn raw_fd(&self) -> u64 {
+    pub fn raw_fd(&self) -> i32 {
         self.fd.0
     }
 

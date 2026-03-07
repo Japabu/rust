@@ -7,7 +7,24 @@ use crate::sync::Mutex;
 static ENV: Mutex<Option<HashMap<OsString, OsString>>> = Mutex::new(None);
 
 pub fn init() {
-    *ENV.lock().unwrap() = Some(HashMap::new());
+    let mut map = HashMap::new();
+
+    // Read inherited environment from the kernel
+    let size = toyos_abi::syscall::get_env(&mut []);
+    if size > 0 {
+        let mut buf = vec![0u8; size];
+        toyos_abi::syscall::get_env(&mut buf);
+        for entry in buf.split(|&b| b == 0) {
+            if entry.is_empty() { continue; }
+            if let Some(eq) = entry.iter().position(|&b| b == b'=') {
+                let key = OsString::from(crate::str::from_utf8(&entry[..eq]).unwrap_or(""));
+                let val = OsString::from(crate::str::from_utf8(&entry[eq + 1..]).unwrap_or(""));
+                map.insert(key, val);
+            }
+        }
+    }
+
+    *ENV.lock().unwrap() = Some(map);
 }
 
 pub fn env() -> Env {

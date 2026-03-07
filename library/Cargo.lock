@@ -343,6 +343,7 @@ dependencies = [
  "rustc-demangle",
  "std_detect",
  "toyos-abi",
+ "toyos-net",
  "unwind",
  "vex-sdk",
  "wasi 0.11.1+wasi-snapshot-preview1",
@@ -384,6 +385,14 @@ name = "toyos-abi"
 version = "0.1.0"
 dependencies = [
  "rustc-std-workspace-core",
+]
+
+[[package]]
+name = "toyos-net"
+version = "0.1.0"
+dependencies = [
+ "rustc-std-workspace-core",
+ "toyos-abi",
 ]
 
 [[package]]
