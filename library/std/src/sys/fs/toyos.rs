@@ -416,10 +416,11 @@ pub fn exists(path: &Path) -> io::Result<bool> {
         syscall::close(fd);
         return Ok(true);
     }
-    // open() only works for files — check if it's a directory via readdir
-    let mut buf = [0u8; 1];
+    // open() only works for files — check if it's a directory via readdir.
+    // Buffer must be large enough to hold at least one entry.
+    let mut buf = [0u8; 512];
     let n = syscall::readdir(path_bytes, &mut buf);
-    Ok(n > 0 || !path_bytes.is_empty())
+    Ok(n > 0)
 }
 
 pub fn readlink(_p: &Path) -> io::Result<PathBuf> {
@@ -442,8 +443,9 @@ pub fn stat(path: &Path) -> io::Result<FileAttr> {
         let st = result.map_err(to_io_error)?;
         return Ok(FileAttr { size: st.size, file_type: st.file_type, mtime: st.mtime });
     }
-    // open() only works for files — check if it's a directory via readdir
-    let mut buf = [0u8; 1];
+    // open() only works for files — check if it's a directory via readdir.
+    // Buffer must be large enough to hold at least one entry (type + name + null + size).
+    let mut buf = [0u8; 512];
     let n = syscall::readdir(path_bytes, &mut buf);
     if n > 0 {
         return Ok(FileAttr { size: 0, file_type: syscall::FileType::Pipe, mtime: 0 }); // directory

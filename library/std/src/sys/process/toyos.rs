@@ -395,10 +395,22 @@ pub fn getpid() -> u32 {
 }
 
 pub fn read_output(
-    _out: ChildPipe,
-    _stdout: &mut Vec<u8>,
-    _err: ChildPipe,
-    _stderr: &mut Vec<u8>,
+    out: ChildPipe,
+    stdout: &mut Vec<u8>,
+    err: ChildPipe,
+    stderr: &mut Vec<u8>,
 ) -> io::Result<()> {
-    panic!("read_output not supported on ToyOS (stderr is never piped)");
+    // Read both pipes concurrently to avoid deadlock: if the child fills one
+    // pipe buffer while we're blocking on the other, both sides stall.
+    use crate::thread;
+    let err_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        err.read_to_end(&mut buf).map(|_| buf)
+    });
+    out.read_to_end(stdout)?;
+    match err_thread.join() {
+        Ok(Ok(buf)) => { *stderr = buf; Ok(()) }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(io::Error::new(io::ErrorKind::Other, "stderr reader thread panicked")),
+    }
 }

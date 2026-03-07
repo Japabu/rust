@@ -30,6 +30,7 @@ impl Thread {
             thread_trampoline as *const () as u64,
             stack_top,
             data.expose_provenance() as u64,
+            stack_base as u64,
         );
 
         if syscall::SyscallError::from_u64(tid).is_some() {
