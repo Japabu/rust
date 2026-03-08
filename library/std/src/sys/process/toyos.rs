@@ -21,6 +21,7 @@ pub struct Command {
     stdin: Option<Stdio>,
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
+    extra_fds: Vec<[u32; 2]>,
 }
 
 #[derive(Debug)]
@@ -45,6 +46,7 @@ impl Command {
             stdin: None,
             stdout: None,
             stderr: None,
+            extra_fds: Vec::new(),
         }
     }
 
@@ -94,6 +96,12 @@ impl Command {
         self.cwd.as_ref().map(|cs| Path::new(cs))
     }
 
+    /// Add an extra file descriptor mapping for the child process.
+    /// The child will see `child_fd` mapped to the parent's `parent_fd`.
+    pub fn inherit_fd(&mut self, child_fd: u32, parent_fd: u32) {
+        self.extra_fds.push([child_fd, parent_fd]);
+    }
+
     fn resolve_program(&self) -> io::Result<OsString> {
         let prog = self.program.to_str().unwrap_or("");
         if prog.contains('/') {
@@ -138,6 +146,9 @@ impl Command {
         Self::setup_fd(&mut fd_map, &mut child_pipes, &mut stdin_pipe, stdin, 0, true)?;
         Self::setup_fd(&mut fd_map, &mut child_pipes, &mut stdout_pipe, stdout, 1, false)?;
         Self::setup_fd(&mut fd_map, &mut child_pipes, &mut stderr_pipe, stderr, 2, false)?;
+
+        // Add extra fd mappings (e.g., for jobserver pipes)
+        fd_map.extend_from_slice(&self.extra_fds);
 
         // Build environment: serialize all env vars as KEY=VALUE\0KEY2=VALUE2\0...
         let mut env_buf = Vec::new();

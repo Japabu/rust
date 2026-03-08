@@ -188,8 +188,8 @@ fn current_dll_path() -> Result<PathBuf, String> {
 fn current_dll_path() -> Result<PathBuf, String> {
     // ToyOS doesn't have dladdr, so we can't discover the .so path at runtime.
     // Return a synthetic path that causes `default_from_rustc_driver_dll` to
-    // compute the sysroot as /initrd/sysroot (the conventional location).
-    Ok(PathBuf::from("/initrd/sysroot/lib/librustc_driver.so"))
+    // compute the sysroot as / (libs live at /lib/).
+    Ok(PathBuf::from("/lib/librustc_driver.so"))
 }
 
 /// This function checks if sysroot is found using env::args().next(), and if it

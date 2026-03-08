@@ -1,6 +1,6 @@
 use crate::io;
-use crate::os::fd::{self, AsRawFd, RawFd};
-use crate::sys::AsInner;
+use crate::os::fd as fd;
+use crate::sys::{AsInner, FromInner};
 use toyos_abi::syscall::{self, SyscallError};
 
 // Re-export standard fd traits
@@ -16,6 +16,22 @@ impl AsRawFd for crate::fs::File {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
         self.as_inner().as_raw_fd()
+    }
+}
+
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+impl FromRawFd for crate::fs::File {
+    #[inline]
+    unsafe fn from_raw_fd(fd: RawFd) -> crate::fs::File {
+        crate::fs::File::from_inner(crate::sys::fs::File::from_fd(toyos_abi::Fd(fd)))
+    }
+}
+
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+impl IntoRawFd for crate::fs::File {
+    #[inline]
+    fn into_raw_fd(self) -> RawFd {
+        self.as_inner().raw_fd()
     }
 }
 

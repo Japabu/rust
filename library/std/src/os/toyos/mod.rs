@@ -4,6 +4,12 @@
 pub mod audio;
 
 #[stable(feature = "toyos_ext", since = "1.0.0")]
+pub mod ffi;
+
+#[stable(feature = "toyos_ext", since = "1.0.0")]
+pub mod fs;
+
+#[stable(feature = "toyos_ext", since = "1.0.0")]
 pub mod device;
 
 #[stable(feature = "toyos_ext", since = "1.0.0")]

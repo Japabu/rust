@@ -87,7 +87,7 @@ pub fn current_exe() -> io::Result<PathBuf> {
 }
 
 pub fn temp_dir() -> PathBuf {
-    PathBuf::from("/nvme/tmp")
+    PathBuf::from("/tmp")
 }
 
 pub fn home_dir() -> Option<PathBuf> {

@@ -29,6 +29,7 @@ pub struct FileAttr {
     size: u64,
     file_type: syscall::FileType,
     mtime: u64,
+    is_symlink: bool,
 }
 
 pub struct ReadDir {
@@ -65,6 +66,7 @@ pub struct FilePermissions {
 pub struct FileType {
     is_file: bool,
     is_dir: bool,
+    is_symlink: bool,
 }
 
 #[derive(Debug)]
@@ -83,6 +85,7 @@ impl FileAttr {
         FileType {
             is_file: self.file_type == syscall::FileType::File,
             is_dir: self.file_type == syscall::FileType::Pipe, // directories use readdir path, not fstat
+            is_symlink: self.is_symlink,
         }
     }
 
@@ -124,7 +127,7 @@ impl FileType {
     }
 
     pub fn is_symlink(&self) -> bool {
-        false
+        self.is_symlink
     }
 }
 
@@ -168,6 +171,7 @@ impl DirEntry {
             size: self.size,
             file_type: if self.is_dir { syscall::FileType::Pipe } else { syscall::FileType::File },
             mtime: 0,
+            is_symlink: false,
         })
     }
 
@@ -175,6 +179,7 @@ impl DirEntry {
         Ok(FileType {
             is_file: !self.is_dir,
             is_dir: self.is_dir,
+            is_symlink: false,
         })
     }
 }
@@ -229,7 +234,7 @@ impl File {
 
     pub fn file_attr(&self) -> io::Result<FileAttr> {
         let stat = syscall::fstat(self.0).map_err(to_io_error)?;
-        Ok(FileAttr { size: stat.size, file_type: stat.file_type, mtime: stat.mtime })
+        Ok(FileAttr { size: stat.size, file_type: stat.file_type, mtime: stat.mtime, is_symlink: false })
     }
 
     pub fn fsync(&self) -> io::Result<()> {
@@ -432,12 +437,18 @@ pub fn exists(path: &Path) -> io::Result<bool> {
     Ok(n > 0)
 }
 
-pub fn readlink(_p: &Path) -> io::Result<PathBuf> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "no symlinks on ToyOS"))
+pub fn readlink(p: &Path) -> io::Result<PathBuf> {
+    let path_bytes = p.as_os_str().as_encoded_bytes();
+    let mut buf = [0u8; 4096];
+    let n = syscall::readlink(path_bytes, &mut buf).map_err(to_io_error)?;
+    // SAFETY: The kernel returns valid UTF-8 paths as raw bytes.
+    Ok(PathBuf::from(unsafe { OsString::from_encoded_bytes_unchecked(buf[..n].to_vec()) }))
 }
 
-pub fn symlink(_original: &Path, _link: &Path) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "no symlinks on ToyOS"))
+pub fn symlink(original: &Path, link: &Path) -> io::Result<()> {
+    let target_bytes = original.as_os_str().as_encoded_bytes();
+    let link_bytes = link.as_os_str().as_encoded_bytes();
+    syscall::symlink(target_bytes, link_bytes).map_err(to_io_error)
 }
 
 pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> {
@@ -450,20 +461,31 @@ pub fn stat(path: &Path) -> io::Result<FileAttr> {
         let result = syscall::fstat(fd);
         syscall::close(fd);
         let st = result.map_err(to_io_error)?;
-        return Ok(FileAttr { size: st.size, file_type: st.file_type, mtime: st.mtime });
+        return Ok(FileAttr { size: st.size, file_type: st.file_type, mtime: st.mtime, is_symlink: false });
     }
     // open() only works for files — check if it's a directory via readdir.
     // Buffer must be large enough to hold at least one entry (type + name + null + size).
     let mut buf = [0u8; 512];
     let n = syscall::readdir(path_bytes, &mut buf);
     if n > 0 {
-        return Ok(FileAttr { size: 0, file_type: syscall::FileType::Pipe, mtime: 0 }); // directory
+        return Ok(FileAttr { size: 0, file_type: syscall::FileType::Pipe, mtime: 0, is_symlink: false }); // directory
     }
     Err(io::Error::new(io::ErrorKind::NotFound, "file not found"))
 }
 
-pub fn lstat(p: &Path) -> io::Result<FileAttr> {
-    stat(p)
+pub fn lstat(path: &Path) -> io::Result<FileAttr> {
+    let path_bytes = path.as_os_str().as_encoded_bytes();
+    // Check if it's a symlink first (without following it).
+    let mut link_buf = [0u8; 4096];
+    if let Ok(n) = syscall::readlink(path_bytes, &mut link_buf) {
+        return Ok(FileAttr {
+            size: n as u64,
+            file_type: syscall::FileType::File,
+            mtime: 0,
+            is_symlink: true,
+        });
+    }
+    stat(path)
 }
 
 pub fn canonicalize(p: &Path) -> io::Result<PathBuf> {

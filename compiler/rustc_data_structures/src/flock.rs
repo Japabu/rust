@@ -13,6 +13,10 @@ cfg_select! {
         mod linux;
         use linux as imp;
     }
+    target_os = "toyos" => {
+        mod toyos;
+        use toyos as imp;
+    }
     unix => {
         mod unix;
         use unix as imp;

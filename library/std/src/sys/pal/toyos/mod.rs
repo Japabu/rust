@@ -38,8 +38,8 @@ extern "C" fn start_rust(argc: usize, argv: *const *const u8) -> ! {
     // Initialize environment variables and seed defaults
     crate::sys::env::init();
     unsafe {
-        crate::sys::env::setenv("HOME".as_ref(), "/".as_ref()).ok();
-        crate::sys::env::setenv("XDG_CONFIG_HOME".as_ref(), "/nvme/config".as_ref()).ok();
+        crate::sys::env::setenv("HOME".as_ref(), "/home/root".as_ref()).ok();
+        crate::sys::env::setenv("XDG_CONFIG_HOME".as_ref(), "/home/root/.config".as_ref()).ok();
     }
 
     let code = unsafe { main(argc as i32, argv) };
@@ -48,4 +48,68 @@ extern "C" fn start_rust(argc: usize, argv: *const *const u8) -> ! {
 
 pub fn abort_internal() -> ! {
     toyos_abi::syscall::exit(128 + 6) // SIGABRT-like — kill entire process
+}
+
+// C allocator shims — many crates (zlib-rs, etc.) call malloc/free/calloc
+// via extern "C". ToyOS's syscall-based allocator requires size on free,
+// so we prepend a size header to each allocation.
+mod c_allocator {
+    const HEADER: usize = 16; // alignment-safe header size
+    const ALIGN: usize = 16;
+
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
+        if size == 0 {
+            return core::ptr::null_mut();
+        }
+        let total = HEADER + size;
+        let ptr = toyos_abi::syscall::alloc(total, ALIGN);
+        if ptr.is_null() {
+            return ptr;
+        }
+        unsafe { *(ptr as *mut usize) = total };
+        unsafe { ptr.add(HEADER) }
+    }
+
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut u8 {
+        let total = count.saturating_mul(size);
+        let ptr = malloc(total);
+        if !ptr.is_null() && total > 0 {
+            unsafe { core::ptr::write_bytes(ptr, 0, total) };
+        }
+        ptr
+    }
+
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn free(ptr: *mut u8) {
+        if ptr.is_null() {
+            return;
+        }
+        let base = unsafe { ptr.sub(HEADER) };
+        let total = unsafe { *(base as *const usize) };
+        unsafe { toyos_abi::syscall::free(base, total, ALIGN) };
+    }
+
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
+        if ptr.is_null() {
+            return malloc(new_size);
+        }
+        if new_size == 0 {
+            free(ptr);
+            return core::ptr::null_mut();
+        }
+        let base = unsafe { ptr.sub(HEADER) };
+        let old_total = unsafe { *(base as *const usize) };
+        let new_total = HEADER + new_size;
+        let new_base = unsafe {
+            toyos_abi::syscall::realloc(base, old_total, ALIGN, new_total)
+        };
+        if new_base.is_null() {
+            return new_base;
+        }
+        unsafe { *(new_base as *mut usize) = new_total };
+        unsafe { new_base.add(HEADER) }
+    }
 }
