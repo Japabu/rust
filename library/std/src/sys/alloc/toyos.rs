@@ -1,139 +1,102 @@
 use crate::alloc::{GlobalAlloc, Layout, System};
+use crate::ptr;
+use crate::sync::atomic::{AtomicI32, Ordering};
+
+use core::cell::SyncUnsafeCell;
 use toyos_abi::syscall::{self, MmapFlags, MmapProt};
 
-use core::ptr;
-use core::sync::atomic::{AtomicU64, Ordering};
+/// dlmalloc backing allocator that provides memory via mmap/munmap syscalls.
+struct ToyOsAllocator;
 
-/// Chunk size for the arena allocator. Larger = fewer mmap syscalls.
-/// The kernel rounds mmap sizes up to 2MB pages, so this is the effective
-/// granularity. Using 64MB reduces syscall overhead for allocation-heavy
-/// programs like the Rust compiler.
-const ARENA_SIZE: usize = 64 * 1024 * 1024;
-
-/// Allocations larger than this go directly through mmap.
-const LARGE_THRESHOLD: usize = 32 * 1024 * 1024;
-
-/// Single-threaded bump arena for small allocations.
-/// Using atomics for interior mutability (GlobalAlloc requires &self).
-struct Arena {
-    /// Current bump pointer (0 = no arena allocated yet).
-    cursor: AtomicU64,
-    /// End of current arena chunk.
-    end: AtomicU64,
-}
-
-impl Arena {
-    const fn new() -> Self {
-        Self {
-            cursor: AtomicU64::new(0),
-            end: AtomicU64::new(0),
+unsafe impl dlmalloc::Allocator for ToyOsAllocator {
+    fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
+        let ptr = unsafe {
+            syscall::mmap(
+                ptr::null_mut(),
+                size,
+                MmapProt::READ | MmapProt::WRITE,
+                MmapFlags::ANONYMOUS,
+            )
+        };
+        if ptr.is_null() {
+            (ptr::null_mut(), 0, 0)
+        } else {
+            (ptr, size, 0)
         }
+    }
+
+    fn remap(&self, _ptr: *mut u8, _oldsize: usize, _newsize: usize, _can_move: bool) -> *mut u8 {
+        // No mremap equivalent
+        ptr::null_mut()
+    }
+
+    fn free_part(&self, _ptr: *mut u8, _oldsize: usize, _newsize: usize) -> bool {
+        false
+    }
+
+    fn free(&self, ptr: *mut u8, size: usize) -> bool {
+        unsafe { syscall::munmap(ptr, size).is_ok() }
+    }
+
+    fn can_release_part(&self, _flags: u32) -> bool {
+        false
+    }
+
+    fn allocates_zeros(&self) -> bool {
+        true // mmap returns zeroed pages
+    }
+
+    fn page_size(&self) -> usize {
+        0x1000
     }
 }
 
-static ARENA: Arena = Arena::new();
+struct SyncDlmalloc(dlmalloc::Dlmalloc<ToyOsAllocator>);
+unsafe impl Sync for SyncDlmalloc {}
 
-/// Bump-allocate from the arena. Returns null if mmap fails.
-fn arena_alloc(size: usize, align: usize) -> *mut u8 {
-    loop {
-        let cursor = ARENA.cursor.load(Ordering::Acquire);
-        let end = ARENA.end.load(Ordering::Acquire);
+static DLMALLOC: SyncUnsafeCell<SyncDlmalloc> =
+    SyncUnsafeCell::new(SyncDlmalloc(dlmalloc::Dlmalloc::new_with_allocator(ToyOsAllocator)));
 
-        if cursor == 0 || end == 0 {
-            let arena = unsafe { syscall::mmap(
-                ptr::null_mut(), ARENA_SIZE,
-                MmapProt::READ | MmapProt::WRITE, MmapFlags::ANONYMOUS,
-            ) };
-            if arena.is_null() { return ptr::null_mut(); }
-            let start = arena as u64;
-            ARENA.cursor.store(start, Ordering::Release);
-            ARENA.end.store(start + ARENA_SIZE as u64, Ordering::Release);
-            continue;
-        }
+static LOCKED: AtomicI32 = AtomicI32::new(0);
 
-        let aligned = (cursor as usize + align - 1) & !(align - 1);
-        let new_cursor = aligned + size;
+struct DropLock;
 
-        if new_cursor as u64 > end {
-            let arena = unsafe { syscall::mmap(
-                ptr::null_mut(), ARENA_SIZE,
-                MmapProt::READ | MmapProt::WRITE, MmapFlags::ANONYMOUS,
-            ) };
-            if arena.is_null() { return ptr::null_mut(); }
-            let start = arena as u64;
-            ARENA.cursor.store(start, Ordering::Release);
-            ARENA.end.store(start + ARENA_SIZE as u64, Ordering::Release);
-            continue;
-        }
+fn lock() -> DropLock {
+    while LOCKED.swap(1, Ordering::Acquire) != 0 {
+        core::hint::spin_loop();
+    }
+    DropLock
+}
 
-        match ARENA.cursor.compare_exchange_weak(
-            cursor, new_cursor as u64,
-            Ordering::AcqRel, Ordering::Relaxed,
-        ) {
-            Ok(_) => return ptr::with_exposed_provenance_mut(aligned),
-            Err(_) => continue,
-        }
+impl Drop for DropLock {
+    fn drop(&mut self) {
+        LOCKED.store(0, Ordering::Release);
     }
 }
 
 #[stable(feature = "alloc_system_type", since = "1.28.0")]
 unsafe impl GlobalAlloc for System {
+    #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let size = layout.size();
-        let align = layout.align();
-        let effective = size.max(align);
-
-        // Large allocations: direct mmap
-        if effective > LARGE_THRESHOLD {
-            return unsafe { syscall::mmap(
-                ptr::null_mut(), size,
-                MmapProt::READ | MmapProt::WRITE, MmapFlags::ANONYMOUS,
-            ) };
-        }
-
-        // Small allocations: bump allocate from arena (no syscall)
-        arena_alloc(effective.max(8), align.max(8))
+        let _lock = lock();
+        unsafe { (*DLMALLOC.get()).0.malloc(layout.size(), layout.align()) }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if ptr.is_null() { return; }
-        let size = layout.size();
-        let align = layout.align();
-        let effective = size.max(align);
-
-        // Large allocations: munmap
-        if effective > LARGE_THRESHOLD {
-            unsafe { syscall::munmap(ptr, size); }
-            return;
-        }
-
-        // Small allocations: leak (arena memory is never returned to OS)
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let old_size = layout.size();
-        let align = layout.align();
-        let old_effective = old_size.max(align);
-        let new_effective = new_size.max(align);
-
-        // Shrinking is always a no-op
-        if new_size <= old_size {
-            return ptr;
-        }
-
-        // Alloc new, copy, free old
-        let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, align) };
-        let new_ptr = unsafe { self.alloc(new_layout) };
-        if !new_ptr.is_null() {
-            let copy_size = old_size.min(new_size);
-            unsafe { ptr::copy_nonoverlapping(ptr, new_ptr, copy_size); }
-            unsafe { self.dealloc(ptr, layout); }
-        }
-        new_ptr
-    }
-
+    #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // Both arena and mmap return zeroed memory
-        unsafe { self.alloc(layout) }
+        let _lock = lock();
+        unsafe { (*DLMALLOC.get()).0.calloc(layout.size(), layout.align()) }
+    }
+
+    #[inline]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _lock = lock();
+        unsafe { (*DLMALLOC.get()).0.free(ptr, layout.size(), layout.align()) }
+    }
+
+    #[inline]
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let _lock = lock();
+        unsafe { (*DLMALLOC.get()).0.realloc(ptr, layout.size(), layout.align(), new_size) }
     }
 }
