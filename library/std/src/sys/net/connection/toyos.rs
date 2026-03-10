@@ -654,7 +654,7 @@ pub fn lookup_host(host: &str, port: u16) -> io::Result<LookupHost> {
     toyos_net::send_bytes_to_netd(toyos_net::MSG_DNS_LOOKUP, host.as_bytes())
         .map_err(net_err_to_io)?;
     let msg = toyos_net::recv_from_netd();
-    if msg.msg_type == toyos_net::MSG_ERROR {
+    if msg.msg_type() == toyos_net::MSG_ERROR {
         return Err(io::Error::new(io::ErrorKind::Other, "DNS lookup failed"));
     }
 

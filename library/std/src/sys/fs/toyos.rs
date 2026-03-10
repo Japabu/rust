@@ -207,6 +207,7 @@ impl OpenOptions {
         let mut flags = OpenFlags(0);
         if self.read { flags |= OpenFlags::READ; }
         if self.write || self.append { flags |= OpenFlags::WRITE; }
+        if self.append { flags |= OpenFlags::APPEND; }
         if self.create || self.create_new { flags |= OpenFlags::CREATE; }
         if self.truncate { flags |= OpenFlags::TRUNCATE; }
         flags

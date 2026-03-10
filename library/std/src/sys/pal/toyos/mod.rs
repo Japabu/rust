@@ -51,10 +51,12 @@ pub fn abort_internal() -> ! {
 }
 
 // C allocator shims — many crates (zlib-rs, etc.) call malloc/free/calloc
-// via extern "C". ToyOS's syscall-based allocator requires size on free,
-// so we prepend a size header to each allocation.
+// via extern "C". Route through the Rust global allocator (arena+slab)
+// to avoid per-allocation syscalls.
 mod c_allocator {
-    const HEADER: usize = 16; // alignment-safe header size
+    use crate::alloc::{GlobalAlloc, Layout, System};
+
+    const HEADER: usize = 16; // stores the allocation size for free/realloc
     const ALIGN: usize = 16;
 
     #[unsafe(no_mangle)]
@@ -63,11 +65,12 @@ mod c_allocator {
             return core::ptr::null_mut();
         }
         let total = HEADER + size;
-        let ptr = toyos_abi::syscall::alloc(total, ALIGN);
+        let layout = unsafe { Layout::from_size_align_unchecked(total, ALIGN) };
+        let ptr = unsafe { System.alloc(layout) };
         if ptr.is_null() {
             return ptr;
         }
-        unsafe { *(ptr as *mut usize) = total };
+        unsafe { (ptr as *mut usize).write(total) };
         unsafe { ptr.add(HEADER) }
     }
 
@@ -87,8 +90,9 @@ mod c_allocator {
             return;
         }
         let base = unsafe { ptr.sub(HEADER) };
-        let total = unsafe { *(base as *const usize) };
-        unsafe { toyos_abi::syscall::free(base, total, ALIGN) };
+        let total = unsafe { (base as *const usize).read() };
+        let layout = unsafe { Layout::from_size_align_unchecked(total, ALIGN) };
+        unsafe { System.dealloc(base, layout) };
     }
 
     #[unsafe(no_mangle)]
@@ -101,15 +105,14 @@ mod c_allocator {
             return core::ptr::null_mut();
         }
         let base = unsafe { ptr.sub(HEADER) };
-        let old_total = unsafe { *(base as *const usize) };
+        let old_total = unsafe { (base as *const usize).read() };
         let new_total = HEADER + new_size;
-        let new_base = unsafe {
-            toyos_abi::syscall::realloc(base, old_total, ALIGN, new_total)
-        };
+        let old_layout = unsafe { Layout::from_size_align_unchecked(old_total, ALIGN) };
+        let new_base = unsafe { System.realloc(base, old_layout, new_total) };
         if new_base.is_null() {
             return new_base;
         }
-        unsafe { *(new_base as *mut usize) = new_total };
+        unsafe { (new_base as *mut usize).write(new_total) };
         unsafe { new_base.add(HEADER) }
     }
 }

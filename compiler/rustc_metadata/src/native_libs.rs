@@ -71,6 +71,7 @@ pub fn walk_native_lib_search_dirs<R>(
     if sess.target.abi == Abi::Fortanix
         || sess.target.os == Os::Linux
         || sess.target.os == Os::Fuchsia
+        || sess.target.os == Os::ToyOs
         || sess.target.is_like_aix
         || sess.target.is_like_darwin && !sess.sanitizers().is_empty()
         || sess.target.os == Os::Windows

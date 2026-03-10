@@ -1,15 +1,9 @@
-use crate::io;
 use crate::os::fd as fd;
 use crate::sys::{AsInner, FromInner};
-use toyos_abi::syscall::{self, SyscallError};
 
 // Re-export standard fd traits
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 pub use fd::*;
-
-/// Re-export the Fd newtype.
-#[stable(feature = "toyos_ext", since = "1.0.0")]
-pub use toyos_abi::Fd;
 
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 impl AsRawFd for crate::fs::File {
@@ -79,31 +73,4 @@ impl AsRawFd for crate::process::ChildStderr {
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 pub fn set_stdin_raw(raw: bool) {
     crate::sys::stdio::set_stdin_raw(raw);
-}
-
-fn to_io_error(e: SyscallError) -> io::Error {
-    let kind = match e {
-        SyscallError::WouldBlock => io::ErrorKind::WouldBlock,
-        SyscallError::InvalidArgument => io::ErrorKind::InvalidInput,
-        _ => io::ErrorKind::Other,
-    };
-    io::Error::from(kind)
-}
-
-/// Non-blocking read from a file descriptor.
-#[stable(feature = "toyos_ext", since = "1.0.0")]
-pub fn read_nonblock(fd: Fd, buf: &mut [u8]) -> io::Result<usize> {
-    syscall::read_nonblock(fd, buf).map_err(to_io_error)
-}
-
-/// Non-blocking write to a file descriptor.
-#[stable(feature = "toyos_ext", since = "1.0.0")]
-pub fn write_nonblock(fd: Fd, buf: &[u8]) -> io::Result<usize> {
-    syscall::write_nonblock(fd, buf).map_err(to_io_error)
-}
-
-/// Close a file descriptor.
-#[stable(feature = "toyos_ext", since = "1.0.0")]
-pub fn close(fd: Fd) {
-    syscall::close(fd);
 }
