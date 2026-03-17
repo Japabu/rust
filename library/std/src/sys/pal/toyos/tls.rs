@@ -26,13 +26,13 @@
 const DTV_UNALLOCATED: u64 = !0u64;
 
 /// Slow path for __tls_get_addr: the DTV entry is unallocated.
-/// This means the TLS block for this module hasn't been allocated yet (dlopen'd module,
-/// first access from this thread). For now, panic — will be replaced with
-/// SYS_TLS_ALLOC_BLOCK syscall when dynamic TLS allocation is implemented.
+/// Calls SYS_TLS_ALLOC_BLOCK to allocate the TLS block on demand and stores it in the DTV.
 #[inline(never)]
 unsafe extern "C" fn __tls_get_addr_slow(module_id: u64, offset: u64) -> *mut u8 {
-    // TODO: implement SYS_TLS_ALLOC_BLOCK syscall
-    panic!("__tls_get_addr: DTV entry unallocated for module_id={}, offset={}", module_id, offset);
+    // Ask the kernel to allocate the TLS block and write it into our DTV.
+    // Returns the physical address of the block (same address space as DTV entries).
+    let block_phys = toyos_abi::syscall::tls_alloc_block(module_id);
+    core::ptr::without_provenance_mut((block_phys + offset) as usize)
 }
 
 /// Fast path: naked asm that avoids function prologue overhead.
@@ -45,6 +45,10 @@ pub unsafe extern "C" fn __tls_get_addr() {
         // Load module_id and offset from TlsIndex
         "mov rsi, [rdi + 8]",    // rsi = offset
         "mov rdi, [rdi]",        // rdi = module_id
+
+        // module_id must be >= 1 (1-based index)
+        "test rdi, rdi",
+        "jz 2f",
 
         // Load DTV pointer from TCB: fs:[8]
         "mov rax, fs:[8]",
