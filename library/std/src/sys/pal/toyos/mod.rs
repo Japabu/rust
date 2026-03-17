@@ -1,5 +1,6 @@
 pub mod futex;
 pub mod os;
+pub mod tls;
 
 #[expect(dead_code)]
 #[path = "../unsupported/common.rs"]
