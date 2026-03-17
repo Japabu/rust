@@ -458,18 +458,18 @@ impl UdpSocket {
             socket_id: self.socket_id,
             max_len: buf.len() as u32,
         }).map_err(net_err_to_io)?;
-        let msg = toyos_net::recv_from_netd();
-        toyos_net::check_response(&msg).map_err(net_err_to_io)?;
-        let data = msg.bytes();
-        if data.len() < 8 {
+        let header = toyos_net::recv_response_header().map_err(net_err_to_io)?;
+        let mut data = [0u8; 65536];
+        let n = toyos_net::recv_bytes(&header, &mut data);
+        if n < 8 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed response"));
         }
         let addr = Ipv4Addr::new(data[0], data[1], data[2], data[3]);
         let port = u16::from_le_bytes([data[4], data[5]]);
-        let payload = &data[8..];
-        let n = payload.len().min(buf.len());
-        buf[..n].copy_from_slice(&payload[..n]);
-        Ok((n, SocketAddr::V4(SocketAddrV4::new(addr, port))))
+        let payload = &data[8..n];
+        let copy_len = payload.len().min(buf.len());
+        buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+        Ok((copy_len, SocketAddr::V4(SocketAddrV4::new(addr, port))))
     }
 
     pub fn peek_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -486,9 +486,8 @@ impl UdpSocket {
         data.extend_from_slice(buf);
         toyos_net::send_bytes_to_netd(toyos_net::MSG_UDP_SEND_TO, &data)
             .map_err(net_err_to_io)?;
-        let msg = toyos_net::recv_from_netd();
-        toyos_net::check_response(&msg).map_err(net_err_to_io)?;
-        let sent: u32 = msg.payload();
+        let header = toyos_net::recv_response_header().map_err(net_err_to_io)?;
+        let sent: u32 = toyos_net::recv_payload(&header);
         Ok(sent as usize)
     }
 
@@ -653,15 +652,14 @@ pub fn lookup_host(host: &str, port: u16) -> io::Result<LookupHost> {
 
     toyos_net::send_bytes_to_netd(toyos_net::MSG_DNS_LOOKUP, host.as_bytes())
         .map_err(net_err_to_io)?;
-    let msg = toyos_net::recv_from_netd();
-    if msg.msg_type == toyos_net::MSG_ERROR {
-        return Err(io::Error::new(io::ErrorKind::Other, "DNS lookup failed"));
-    }
-
-    let data = msg.bytes();
-    if data.is_empty() {
+    let header = toyos_net::recv_response_header()
+        .map_err(net_err_to_io)?;
+    let mut data = [0u8; 256];
+    let data_len = toyos_net::recv_bytes(&header, &mut data);
+    if data_len == 0 {
         return Err(io::Error::new(io::ErrorKind::Other, "DNS lookup failed: empty response"));
     }
+    let data = &data[..data_len];
 
     let count = data[0] as usize;
     let mut addrs = Vec::with_capacity(count);
