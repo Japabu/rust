@@ -29,8 +29,6 @@ const DTV_UNALLOCATED: u64 = !0u64;
 /// Calls SYS_TLS_ALLOC_BLOCK to allocate the TLS block on demand and stores it in the DTV.
 #[inline(never)]
 unsafe extern "C" fn __tls_get_addr_slow(module_id: u64, offset: u64) -> *mut u8 {
-    // Ask the kernel to allocate the TLS block and write it into our DTV.
-    // Returns the physical address of the block (same address space as DTV entries).
     let block_phys = toyos_abi::syscall::tls_alloc_block(module_id);
     core::ptr::without_provenance_mut((block_phys + offset) as usize)
 }
