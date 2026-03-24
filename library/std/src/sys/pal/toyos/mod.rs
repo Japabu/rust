@@ -36,6 +36,9 @@ extern "C" fn start_rust(argc: usize, argv: *const *const u8) -> ! {
     ARGC.store(argc, Ordering::Relaxed);
     ARGV.store(argv as usize, Ordering::Relaxed);
 
+    // Register the EH frame finder for DWARF unwinding before anything can panic
+    eh_frame::init();
+
     // Initialize environment variables and seed defaults
     crate::sys::env::init();
     unsafe {
@@ -115,5 +118,91 @@ mod c_allocator {
         }
         unsafe { (new_base as *mut usize).write(new_total) };
         unsafe { new_base.add(HEADER) }
+    }
+}
+
+/// DWARF EH frame finder for the `unwinding` crate.
+/// Locates `.eh_frame_hdr` for a given PC via `SYS_QUERY_MODULES`.
+mod eh_frame {
+    use crate::sync::Mutex;
+    use toyos_abi::syscall::ModuleInfo;
+
+    struct Module {
+        base: usize,
+        end: usize,
+        eh_frame_hdr: usize,
+        eh_frame_hdr_size: usize,
+    }
+
+    static CACHE: Mutex<Vec<Module>> = Mutex::new(Vec::new());
+
+    fn load_modules() -> Vec<Module> {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            match toyos_abi::syscall::query_modules(&mut buf) {
+                Ok(count) => {
+                    let info_size = core::mem::size_of::<ModuleInfo>();
+                    let mut modules = Vec::with_capacity(count);
+                    for i in 0..count {
+                        let off = i * info_size;
+                        if off + info_size > buf.len() { break; }
+                        let info = unsafe { &*(buf.as_ptr().add(off) as *const ModuleInfo) };
+                        modules.push(Module {
+                            base: info.base as usize,
+                            end: info.text_end as usize,
+                            eh_frame_hdr: info.eh_frame_hdr as usize,
+                            eh_frame_hdr_size: info.eh_frame_hdr_size as usize,
+                        });
+                    }
+                    return modules;
+                }
+                Err(_) => {
+                    buf.resize(buf.len() * 2, 0);
+                    if buf.len() > 1024 * 1024 { return Vec::new(); }
+                }
+            }
+        }
+    }
+
+    struct ToyOsEhFrameFinder;
+    static FINDER: ToyOsEhFrameFinder = ToyOsEhFrameFinder;
+
+    unsafe impl unwind::EhFrameFinder for ToyOsEhFrameFinder {
+        fn find(&self, pc: usize) -> Option<unwind::FrameInfo> {
+            // Fast path: check cached modules
+            {
+                let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(m) = cache.iter().find(|m| pc >= m.base && pc < m.end) {
+                    if m.eh_frame_hdr != 0 {
+                        return Some(unwind::FrameInfo {
+                            text_base: Some(m.base),
+                            kind: unwind::FrameInfoKind::EhFrameHdr(m.eh_frame_hdr),
+                        });
+                    }
+                    return None;
+                }
+            }
+
+            // Cache miss — reload module list (handles dlopen)
+            let modules = load_modules();
+            let result = modules.iter().find(|m| pc >= m.base && pc < m.end).and_then(|m| {
+                if m.eh_frame_hdr != 0 {
+                    Some(unwind::FrameInfo {
+                        text_base: Some(m.base),
+                        kind: unwind::FrameInfoKind::EhFrameHdr(m.eh_frame_hdr),
+                    })
+                } else {
+                    None
+                }
+            });
+            *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = modules;
+            result
+        }
+    }
+
+    pub(super) fn init() {
+        let modules = load_modules();
+        *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = modules;
+        unwind::set_custom_eh_frame_finder(&FINDER).ok();
     }
 }

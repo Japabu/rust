@@ -32,6 +32,7 @@ cfg_select! {
         all(target_family = "windows", target_env = "gnu"),
         target_os = "psp",
         target_os = "xous",
+        target_os = "toyos",
         target_os = "solid_asp3",
         all(target_family = "unix", not(target_os = "espidf"), not(target_os = "l4re"), not(target_os = "nuttx")),
         all(target_vendor = "fortanix", target_env = "sgx"),

@@ -1,6 +1,5 @@
 use crate::spec::{
-    Cc, FramePointer, LinkerFlavor, Lld, Os, PanicStrategy, RelocModel, StackProbeType,
-    TargetOptions,
+    Cc, FramePointer, LinkerFlavor, Lld, Os, RelocModel, StackProbeType, TargetOptions,
 };
 
 pub(crate) fn opts() -> TargetOptions {
@@ -13,7 +12,7 @@ pub(crate) fn opts() -> TargetOptions {
         position_independent_executables: true,
         has_thread_local: true,
         main_needs_argc_argv: false,
-        panic_strategy: PanicStrategy::Abort,
+        default_uwtable: true,
         frame_pointer: FramePointer::Always,
         dynamic_linking: true,
         dll_prefix: "lib".into(),

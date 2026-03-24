@@ -37,7 +37,7 @@ cfg_select! {
         mod libunwind;
         pub use libunwind::*;
     }
-    target_os = "xous" => {
+    any(target_os = "xous", target_os = "toyos") => {
         mod unwinding;
         pub use unwinding::*;
     }
