@@ -29,6 +29,18 @@ unsafe extern "C" fn _start() -> ! {
     );
 }
 
+/// .init_array constructor: registers the EH frame finder for DWARF unwinding.
+/// For executables, this runs before `_start`. For cdylib .so files loaded via
+/// dlopen, the kernel returns the .init_array to userspace which calls it.
+/// This ensures panic unwinding works from code inside shared libraries.
+extern "C" fn init_eh_frame() {
+    eh_frame::init();
+}
+
+#[used]
+#[unsafe(link_section = ".init_array")]
+static INIT_EH_FRAME: extern "C" fn() = init_eh_frame;
+
 extern "C" fn start_rust(argc: usize, argv: *const *const u8) -> ! {
     unsafe extern "C" {
         fn main(argc: i32, argv: *const *const u8) -> i32;
@@ -36,7 +48,7 @@ extern "C" fn start_rust(argc: usize, argv: *const *const u8) -> ! {
     ARGC.store(argc, Ordering::Relaxed);
     ARGV.store(argv as usize, Ordering::Relaxed);
 
-    // Register the EH frame finder for DWARF unwinding before anything can panic
+    // Register EH frame finder (also in .init_array for cdylib, but exes don't run .init_array)
     eh_frame::init();
 
     // Initialize environment variables and seed defaults
