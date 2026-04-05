@@ -14,6 +14,8 @@ const MAX_NB_FRAMES: usize = 100;
 pub(crate) const FULL_BACKTRACE_DEFAULT: bool = cfg_select! {
     // Fuchsia components default to full backtrace.
     target_os = "fuchsia" => true,
+    // ToyOS always wants full backtraces
+    target_os = "toyos" => true,
     _ => false,
 };
 
