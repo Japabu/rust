@@ -78,8 +78,8 @@ pub fn yield_now() {
     core::hint::spin_loop();
 }
 
-pub fn set_name(_name: &CStr) {
-    // Thread naming not supported
+pub fn set_name(name: &CStr) {
+    syscall::set_thread_name(name.to_bytes());
 }
 
 pub fn sleep(dur: Duration) {
