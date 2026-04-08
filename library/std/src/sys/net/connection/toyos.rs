@@ -6,7 +6,7 @@ use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use crate::time::Duration;
 use toyos_abi::Fd;
-use toyos_abi::io_uring;
+use toyos::poller::{Poller, IORING_POLL_IN, IORING_POLL_OUT};
 use toyos_abi::syscall::{self, SyscallError};
 use toyos::net::{self, NetError, TcpSocketId, UdpSocketId};
 
@@ -50,13 +50,14 @@ fn syscall_err(e: SyscallError) -> io::Error {
     }
 }
 
-/// Wrap raw rx/tx pipe fds into a single kernel socket fd.
-fn make_socket_fd(rx_fd: Fd, tx_fd: Fd) -> io::Result<OwnedFd> {
-    let rx_id = syscall::pipe_id(rx_fd).map_err(syscall_err)?;
-    let tx_id = syscall::pipe_id(tx_fd).map_err(syscall_err)?;
+/// Wrap rx/tx pipes into a single kernel socket fd.
+fn make_socket_fd(rx: toyos::Pipe, tx: toyos::Pipe) -> io::Result<OwnedFd> {
+    let rx_id = rx.pipe_id().map_err(syscall_err)?;
+    let tx_id = tx.pipe_id().map_err(syscall_err)?;
     let socket_fd = syscall::socket_create(rx_id, tx_id).map_err(syscall_err)?;
-    syscall::close(rx_fd);
-    syscall::close(tx_fd);
+    // Pipes are consumed — drop closes the underlying fds
+    drop(rx);
+    drop(tx);
     Ok(unsafe { OwnedFd::from_raw_fd(socket_fd.0) })
 }
 
@@ -108,7 +109,7 @@ impl TcpStream {
         let (ip, port) = addr_to_v4(addr)?;
         let conn = toyos::net::tcp_connect(ip, port, duration_to_ms(Some(timeout)))
             .map_err(net_err_to_io)?;
-        let fd = make_socket_fd(conn.rx_fd, conn.tx_fd)?;
+        let fd = make_socket_fd(conn.rx, conn.tx)?;
         Ok(TcpStream {
             fd,
             socket: Arc::new(NetdSocket::Tcp(conn.socket_id)),
@@ -158,9 +159,11 @@ impl TcpStream {
         }
         let timeout_ms = self.read_timeout_ms.load(Relaxed);
         if timeout_ms > 0 {
-            let poll_fd = self.fd.as_raw_fd() as u64 | io_uring::POLL_READABLE;
-            let result = io_uring::poll_fds(&[poll_fd], Some(timeout_ms as u64 * 1_000_000));
-            if !result.fd(0) {
+            let poller = Poller::new(1);
+            poller.poll_add_fd(self.raw_fd(), IORING_POLL_IN, 0);
+            let mut ready = false;
+            poller.wait(1, timeout_ms as u64 * 1_000_000, |_| ready = true);
+            if !ready {
                 return Err(io::ErrorKind::TimedOut.into());
             }
         }
@@ -202,9 +205,11 @@ impl TcpStream {
         }
         let timeout_ms = self.write_timeout_ms.load(Relaxed);
         if timeout_ms > 0 {
-            let poll_fd = self.fd.as_raw_fd() as u64 | io_uring::POLL_WRITABLE;
-            let result = io_uring::poll_fds(&[poll_fd], Some(timeout_ms as u64 * 1_000_000));
-            if !result.fd(0) {
+            let poller = Poller::new(1);
+            poller.poll_add_fd(self.raw_fd(), IORING_POLL_OUT, 0);
+            let mut ready = false;
+            poller.wait(1, timeout_ms as u64 * 1_000_000, |_| ready = true);
+            if !ready {
                 return Err(io::ErrorKind::TimedOut.into());
             }
         }
@@ -342,7 +347,7 @@ impl TcpListener {
         let (ip, port) = addr_to_v4(&addr)?;
         let bound = toyos::net::tcp_bind(ip, port).map_err(net_err_to_io)?;
         Ok(TcpListener {
-            notify_fd: unsafe { OwnedFd::from_raw_fd(bound.notify_fd.0) },
+            notify_fd: unsafe { OwnedFd::from_raw_fd(bound.notify.into_fd().0) },
             socket: Arc::new(NetdSocket::Tcp(bound.socket_id)),
             local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), bound.bound_port)),
             nonblocking: AtomicBool::new(false),
@@ -363,7 +368,7 @@ impl TcpListener {
         }
 
         let accepted = toyos::net::tcp_accept(self.socket_id()).map_err(net_err_to_io)?;
-        let fd = make_socket_fd(accepted.rx_fd, accepted.tx_fd)?;
+        let fd = make_socket_fd(accepted.rx, accepted.tx)?;
 
         let peer = SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::from(accepted.remote_addr),
@@ -464,8 +469,8 @@ impl UdpSocket {
         let bound = toyos::net::udp_bind(ip, port).map_err(net_err_to_io)?;
         Ok(UdpSocket {
             socket: Arc::new(NetdSocket::Udp(bound.socket_id)),
-            tx_fd: unsafe { OwnedFd::from_raw_fd(bound.tx_fd.0) },
-            rx_fd: unsafe { OwnedFd::from_raw_fd(bound.rx_fd.0) },
+            tx_fd: unsafe { OwnedFd::from_raw_fd(bound.tx.into_fd().0) },
+            rx_fd: unsafe { OwnedFd::from_raw_fd(bound.rx.into_fd().0) },
             local: SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::from(ip),
                 bound.bound_port,
