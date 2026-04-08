@@ -8,7 +8,7 @@ use crate::time::Duration;
 use toyos_abi::Fd;
 use toyos_abi::io_uring;
 use toyos_abi::syscall::{self, SyscallError};
-use toyos_net::{self, NetError, TcpSocketId, UdpSocketId};
+use toyos::net::{self, NetError, TcpSocketId, UdpSocketId};
 
 // --- Helpers ---
 
@@ -70,8 +70,8 @@ enum NetdSocket {
 impl Drop for NetdSocket {
     fn drop(&mut self) {
         let _ = match self {
-            NetdSocket::Tcp(id) => toyos_net::tcp_close(*id),
-            NetdSocket::Udp(id) => toyos_net::udp_close(*id),
+            NetdSocket::Tcp(id) => toyos::net::tcp_close(*id),
+            NetdSocket::Udp(id) => toyos::net::udp_close(*id),
         };
     }
 }
@@ -106,7 +106,7 @@ impl TcpStream {
 
     pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
         let (ip, port) = addr_to_v4(addr)?;
-        let conn = toyos_net::tcp_connect(ip, port, duration_to_ms(Some(timeout)))
+        let conn = toyos::net::tcp_connect(ip, port, duration_to_ms(Some(timeout)))
             .map_err(net_err_to_io)?;
         let fd = make_socket_fd(conn.rx_fd, conn.tx_fd)?;
         Ok(TcpStream {
@@ -247,7 +247,7 @@ impl TcpStream {
             Shutdown::Write => 1,
             Shutdown::Both => 2,
         };
-        toyos_net::tcp_shutdown(self.socket_id(), how_val).map_err(net_err_to_io)
+        toyos::net::tcp_shutdown(self.socket_id(), how_val).map_err(net_err_to_io)
     }
 
     pub fn duplicate(&self) -> io::Result<TcpStream> {
@@ -273,7 +273,7 @@ impl TcpStream {
     }
 
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
-        toyos_net::tcp_set_option(self.socket_id(), toyos_net::OPT_NODELAY, nodelay as u32)
+        toyos::net::tcp_set_option(self.socket_id(), toyos::net::OPT_NODELAY, nodelay as u32)
             .map_err(net_err_to_io)?;
         self.nodelay.store(nodelay, Relaxed);
         Ok(())
@@ -340,7 +340,7 @@ impl TcpListener {
             io::Error::new(io::ErrorKind::InvalidInput, "no addresses found")
         })?;
         let (ip, port) = addr_to_v4(&addr)?;
-        let bound = toyos_net::tcp_bind(ip, port).map_err(net_err_to_io)?;
+        let bound = toyos::net::tcp_bind(ip, port).map_err(net_err_to_io)?;
         Ok(TcpListener {
             notify_fd: unsafe { OwnedFd::from_raw_fd(bound.notify_fd.0) },
             socket: Arc::new(NetdSocket::Tcp(bound.socket_id)),
@@ -362,7 +362,7 @@ impl TcpListener {
             syscall::read(notify_fd, &mut byte).map_err(syscall_err)?;
         }
 
-        let accepted = toyos_net::tcp_accept(self.socket_id()).map_err(net_err_to_io)?;
+        let accepted = toyos::net::tcp_accept(self.socket_id()).map_err(net_err_to_io)?;
         let fd = make_socket_fd(accepted.rx_fd, accepted.tx_fd)?;
 
         let peer = SocketAddr::V4(SocketAddrV4::new(
@@ -461,7 +461,7 @@ impl UdpSocket {
             io::Error::new(io::ErrorKind::InvalidInput, "no addresses found")
         })?;
         let (ip, port) = addr_to_v4(&addr)?;
-        let bound = toyos_net::udp_bind(ip, port).map_err(net_err_to_io)?;
+        let bound = toyos::net::udp_bind(ip, port).map_err(net_err_to_io)?;
         Ok(UdpSocket {
             socket: Arc::new(NetdSocket::Udp(bound.socket_id)),
             tx_fd: unsafe { OwnedFd::from_raw_fd(bound.tx_fd.0) },
@@ -487,7 +487,7 @@ impl UdpSocket {
     }
 
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let resp = toyos_net::udp_recv_from(self.socket_id(), buf.len() as u32)
+        let resp = toyos::net::udp_recv_from(self.socket_id(), buf.len() as u32)
             .map_err(net_err_to_io)?;
 
         let n = (resp.len as usize).min(buf.len());
@@ -513,7 +513,7 @@ impl UdpSocket {
             syscall::write(tx_fd, buf).map_err(syscall_err)?;
         }
 
-        let sent = toyos_net::udp_send_to(self.socket_id(), ip, port, buf.len() as u16)
+        let sent = toyos::net::udp_send_to(self.socket_id(), ip, port, buf.len() as u16)
             .map_err(net_err_to_io)?;
         Ok(sent as usize)
     }
@@ -679,7 +679,7 @@ pub fn lookup_host(host: &str, port: u16) -> io::Result<LookupHost> {
     }
 
     let mut results = [[0u8; 4]; 16];
-    let count = toyos_net::dns_lookup(host, &mut results).map_err(net_err_to_io)?;
+    let count = toyos::net::dns_lookup(host, &mut results).map_err(net_err_to_io)?;
 
     if count == 0 {
         return Err(io::Error::new(io::ErrorKind::Other, "DNS lookup failed: no results"));
