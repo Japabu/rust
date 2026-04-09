@@ -275,8 +275,8 @@ impl File {
     pub fn is_read_vectored(&self) -> bool { false }
 
     pub fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
-        let n = self.read(cursor.ensure_init().init_mut())?;
-        cursor.advance(n);
+        let n = self.read(cursor.ensure_init())?;
+        unsafe { cursor.advance(n) };
         Ok(())
     }
 

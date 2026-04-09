@@ -38,9 +38,9 @@ impl Pipe {
     }
 
     pub fn read_buf(&self, mut buf: BorrowedCursor<'_>) -> io::Result<()> {
-        let spare = buf.ensure_init().init_mut();
+        let spare = buf.ensure_init();
         let n = self.read(spare)?;
-        buf.advance(n);
+        unsafe { buf.advance(n) };
         Ok(())
     }
 

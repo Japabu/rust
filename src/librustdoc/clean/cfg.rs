@@ -521,6 +521,7 @@ fn human_readable_target_os(os: Symbol) -> Option<&'static str> {
         Solaris => "Solaris",
         SolidAsp3 => "SOLID ASP3",
         TeeOs => "TEEOS",
+        ToyOs => "ToyOS",
         Trusty => "Trusty",
         TvOs => "tvOS",
         Uefi => "UEFI",

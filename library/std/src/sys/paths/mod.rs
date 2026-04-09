@@ -47,6 +47,10 @@ cfg_select! {
         mod windows;
         use windows as imp;
     }
+    target_os = "toyos" => {
+        mod toyos;
+        use toyos as imp;
+    }
     _ => {
         mod unsupported;
         use unsupported as imp;
