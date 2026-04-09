@@ -3,7 +3,9 @@ use clippy_utils::res::MaybeResPath;
 use clippy_utils::source::{snippet_with_applicability, snippet_with_context};
 use clippy_utils::sugg::has_enclosing_paren;
 use clippy_utils::ty::{adjust_derefs_manually_drop, implements_trait, is_manually_drop, peel_and_count_ty_refs};
-use clippy_utils::{DefinedTy, ExprUseNode, expr_use_ctxt, get_parent_expr, is_block_like, is_from_proc_macro, is_lint_allowed, sym};
+use clippy_utils::{
+    DefinedTy, ExprUseNode, expr_use_ctxt, get_parent_expr, is_block_like, is_from_proc_macro, is_lint_allowed, sym,
+};
 use rustc_ast::util::parser::ExprPrecedence;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::Applicability;
@@ -19,6 +21,29 @@ use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt, TypeckResults};
 use rustc_session::impl_lint_pass;
 use rustc_span::{Span, Symbol};
 use std::borrow::Cow;
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for dereferencing expressions which would be covered by auto-deref.
+    ///
+    /// ### Why is this bad?
+    /// This unnecessarily complicates the code.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// let x = String::new();
+    /// let y: &str = &*x;
+    /// ```
+    /// Use instead:
+    /// ```no_run
+    /// let x = String::new();
+    /// let y: &str = &x;
+    /// ```
+    #[clippy::version = "1.64.0"]
+    pub EXPLICIT_AUTO_DEREF,
+    complexity,
+    "dereferencing when the compiler would automatically dereference"
+}
 
 declare_clippy_lint! {
     /// ### What it does
@@ -117,34 +142,11 @@ declare_clippy_lint! {
     "`ref` binding to a reference"
 }
 
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for dereferencing expressions which would be covered by auto-deref.
-    ///
-    /// ### Why is this bad?
-    /// This unnecessarily complicates the code.
-    ///
-    /// ### Example
-    /// ```no_run
-    /// let x = String::new();
-    /// let y: &str = &*x;
-    /// ```
-    /// Use instead:
-    /// ```no_run
-    /// let x = String::new();
-    /// let y: &str = &x;
-    /// ```
-    #[clippy::version = "1.64.0"]
-    pub EXPLICIT_AUTO_DEREF,
-    complexity,
-    "dereferencing when the compiler would automatically dereference"
-}
-
 impl_lint_pass!(Dereferencing<'_> => [
+    EXPLICIT_AUTO_DEREF,
     EXPLICIT_DEREF_METHODS,
     NEEDLESS_BORROW,
     REF_BINDING_TO_REFERENCE,
-    EXPLICIT_AUTO_DEREF,
 ]);
 
 #[derive(Default)]
@@ -883,12 +885,21 @@ impl TyCoercionStability {
                     continue;
                 },
                 ty::Param(_) if for_return => Self::Deref,
-                ty::Alias(ty::Free | ty::Inherent, _) => unreachable!("should have been normalized away above"),
-                ty::Alias(ty::Projection, _) if !for_return && ty.has_non_region_param() => Self::Reborrow,
+                ty::Alias(ty::AliasTy {
+                    kind: ty::Free { .. } | ty::Inherent { .. },
+                    ..
+                }) => unreachable!("should have been normalized away above"),
+                ty::Alias(ty::AliasTy {
+                    kind: ty::Projection { .. },
+                    ..
+                }) if !for_return && ty.has_non_region_param() => Self::Reborrow,
                 ty::Infer(_)
                 | ty::Error(_)
                 | ty::Bound(..)
-                | ty::Alias(ty::Opaque, ..)
+                | ty::Alias(ty::AliasTy {
+                    kind: ty::Opaque { .. },
+                    ..
+                })
                 | ty::Placeholder(_)
                 | ty::Dynamic(..)
                 | ty::Param(_) => Self::Reborrow,
@@ -919,7 +930,10 @@ impl TyCoercionStability {
                 | ty::CoroutineClosure(..)
                 | ty::Never
                 | ty::Tuple(_)
-                | ty::Alias(ty::Projection, _)
+                | ty::Alias(ty::AliasTy {
+                    kind: ty::Projection { .. },
+                    ..
+                })
                 | ty::UnsafeBinder(_) => Self::Deref,
             };
         }

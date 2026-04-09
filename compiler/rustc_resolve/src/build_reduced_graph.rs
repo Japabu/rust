@@ -357,6 +357,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             | Res::SelfTyParam { .. }
             | Res::SelfTyAlias { .. }
             | Res::SelfCtor(..)
+            | Res::OpenMod(..)
             | Res::Err => bug!("unexpected resolution: {:?}", res),
         }
     }
@@ -602,12 +603,15 @@ impl<'a, 'ra, 'tcx> BuildReducedGraphVisitor<'a, 'ra, 'tcx> {
         // so prefixes are prepended with crate root segment if necessary.
         // The root is prepended lazily, when the first non-empty prefix or terminating glob
         // appears, so imports in braced groups can have roots prepended independently.
-        let is_glob = matches!(use_tree.kind, ast::UseTreeKind::Glob);
         let crate_root = match prefix_iter.peek() {
             Some(seg) if !seg.ident.is_path_segment_keyword() && seg.ident.span.is_rust_2015() => {
                 Some(seg.ident.span.ctxt())
             }
-            None if is_glob && use_tree.span.is_rust_2015() => Some(use_tree.span.ctxt()),
+            None if let ast::UseTreeKind::Glob(span) = use_tree.kind
+                && span.is_rust_2015() =>
+            {
+                Some(span.ctxt())
+            }
             _ => None,
         }
         .map(|ctxt| {
@@ -695,7 +699,7 @@ impl<'a, 'ra, 'tcx> BuildReducedGraphVisitor<'a, 'ra, 'tcx> {
                     }
                     // Deny `use ::{self};` after edition 2015
                     kw::PathRoot if !self.r.path_root_is_crate_root(source.ident) => {
-                        self.r.dcx().span_err(use_tree.span, "extern prelude cannot be imported");
+                        self.r.dcx().span_err(use_tree.span(), "extern prelude cannot be imported");
                         return;
                     }
                     _ => {}
@@ -726,12 +730,12 @@ impl<'a, 'ra, 'tcx> BuildReducedGraphVisitor<'a, 'ra, 'tcx> {
                     id,
                 };
 
-                self.add_import(module_path, kind, use_tree.span, item, root_span, item.id, vis);
+                self.add_import(module_path, kind, use_tree.span(), item, root_span, item.id, vis);
             }
-            ast::UseTreeKind::Glob => {
+            ast::UseTreeKind::Glob(_) => {
                 if !ast::attr::contains_name(&item.attrs, sym::prelude_import) {
                     let kind = ImportKind::Glob { max_vis: CmCell::new(None), id };
-                    self.add_import(prefix, kind, use_tree.span, item, root_span, item.id, vis);
+                    self.add_import(prefix, kind, use_tree.span(), item, root_span, item.id, vis);
                 } else {
                     // Resolve the prelude import early.
                     let path_res =
@@ -739,7 +743,7 @@ impl<'a, 'ra, 'tcx> BuildReducedGraphVisitor<'a, 'ra, 'tcx> {
                     if let PathResult::Module(ModuleOrUniformRoot::Module(module)) = path_res {
                         self.r.prelude = Some(module);
                     } else {
-                        self.r.dcx().span_err(use_tree.span, "cannot resolve a prelude import");
+                        self.r.dcx().span_err(use_tree.span(), "cannot resolve a prelude import");
                     }
                 }
             }
@@ -763,7 +767,6 @@ impl<'a, 'ra, 'tcx> BuildReducedGraphVisitor<'a, 'ra, 'tcx> {
                     let tree = ast::UseTree {
                         prefix: ast::Path::from_ident(Ident::new(kw::SelfLower, new_span)),
                         kind: ast::UseTreeKind::Simple(Some(Ident::new(kw::Underscore, new_span))),
-                        span: use_tree.span,
                     };
                     self.build_reduced_graph_for_use_tree(
                         // This particular use tree
@@ -834,7 +837,7 @@ impl<'a, 'ra, 'tcx> BuildReducedGraphVisitor<'a, 'ra, 'tcx> {
                     // The whole `use` item
                     item,
                     vis,
-                    use_tree.span,
+                    use_tree.span(),
                 );
             }
 
@@ -898,7 +901,7 @@ impl<'a, 'ra, 'tcx> BuildReducedGraphVisitor<'a, 'ra, 'tcx> {
             }
 
             // These items live in both the type and value namespaces.
-            ItemKind::Struct(ident, _, ref vdata) => {
+            ItemKind::Struct(ident, ref generics, ref vdata) => {
                 self.build_reduced_graph_for_struct_variant(
                     vdata.fields(),
                     ident,
@@ -947,6 +950,7 @@ impl<'a, 'ra, 'tcx> BuildReducedGraphVisitor<'a, 'ra, 'tcx> {
                         .struct_constructors
                         .insert(local_def_id, (ctor_res, ctor_vis.to_def_id(), ret_fields));
                 }
+                self.r.struct_generics.insert(local_def_id, generics.clone());
             }
 
             ItemKind::Union(ident, _, ref vdata) => {
@@ -1474,7 +1478,9 @@ impl<'a, 'ra, 'tcx> Visitor<'a> for BuildReducedGraphVisitor<'a, 'ra, 'tcx> {
                 return;
             }
 
-            AssocItemKind::DelegationMac(..) => bug!(),
+            AssocItemKind::DelegationMac(..) => {
+                span_bug!(item.span, "delegation mac should already have been removed")
+            }
         };
         let vis = self.resolve_visibility(&item.vis);
         let feed = self.r.feed(item.id);

@@ -5,6 +5,7 @@
 use rustc_abi::ExternAbi;
 use rustc_ast::visit::{VisitorResult, walk_list};
 use rustc_data_structures::fingerprint::Fingerprint;
+use rustc_data_structures::fx::FxIndexSet;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_data_structures::svh::Svh;
 use rustc_data_structures::sync::{DynSend, DynSync, par_for_each_in, try_par_for_each_in};
@@ -310,16 +311,18 @@ impl<'tcx> TyCtxt<'tcx> {
     /// This should only be used for determining the context of a body, a return
     /// value of `Some` does not always suggest that the owner of the body is `const`,
     /// just that it has to be checked as if it were.
-    pub fn hir_body_const_context(self, def_id: LocalDefId) -> Option<ConstContext> {
-        let def_id = def_id.into();
+    pub fn hir_body_const_context(self, local_def_id: LocalDefId) -> Option<ConstContext> {
+        let def_id = local_def_id.into();
         let ccx = match self.hir_body_owner_kind(def_id) {
             BodyOwnerKind::Const { inline } => ConstContext::Const { inline },
             BodyOwnerKind::Static(mutability) => ConstContext::Static(mutability),
 
             BodyOwnerKind::Fn if self.is_constructor(def_id) => return None,
-            BodyOwnerKind::Fn | BodyOwnerKind::Closure if self.is_const_fn(def_id) => {
-                ConstContext::ConstFn
+            // Const closures use their parent's const context
+            BodyOwnerKind::Closure if self.is_const_fn(def_id) => {
+                return self.hir_body_const_context(self.local_parent(local_def_id));
             }
+            BodyOwnerKind::Fn if self.is_const_fn(def_id) => ConstContext::ConstFn,
             BodyOwnerKind::Fn | BodyOwnerKind::Closure | BodyOwnerKind::GlobalAsm => return None,
         };
 
@@ -1304,11 +1307,12 @@ struct ItemCollector<'tcx> {
     nested_bodies: Vec<LocalDefId>,
     delayed_lint_items: Vec<OwnerId>,
     eiis: Vec<LocalDefId>,
+    delayed_ids: Option<&'tcx FxIndexSet<LocalDefId>>,
 }
 
 impl<'tcx> ItemCollector<'tcx> {
     fn new(tcx: TyCtxt<'tcx>, crate_collector: bool) -> ItemCollector<'tcx> {
-        ItemCollector {
+        let mut collector = ItemCollector {
             crate_collector,
             tcx,
             submodules: Vec::default(),
@@ -1321,12 +1325,45 @@ impl<'tcx> ItemCollector<'tcx> {
             nested_bodies: Vec::default(),
             delayed_lint_items: Vec::default(),
             eiis: Vec::default(),
+            delayed_ids: None,
+        };
+
+        if crate_collector {
+            let krate = tcx.hir_crate(());
+            collector.delayed_ids = Some(&krate.delayed_ids);
+
+            let delayed_kinds =
+                krate.delayed_ids.iter().copied().map(|id| (id, krate.owners[id].expect_delayed()));
+
+            // FIXME(fn_delegation): need to add delayed lints, eiis
+            for (def_id, kind) in delayed_kinds {
+                let owner_id = OwnerId { def_id };
+
+                match kind {
+                    DelayedOwnerKind::Item => collector.items.push(ItemId { owner_id }),
+                    DelayedOwnerKind::ImplItem => {
+                        collector.impl_items.push(ImplItemId { owner_id })
+                    }
+                    DelayedOwnerKind::TraitItem => {
+                        collector.trait_items.push(TraitItemId { owner_id })
+                    }
+                };
+
+                collector.body_owners.push(def_id);
+            }
         }
+
+        collector
     }
 }
 
 impl<'hir> Visitor<'hir> for ItemCollector<'hir> {
     type NestedFilter = nested_filter::All;
+
+    #[inline]
+    fn visit_if_delayed(&self, def_id: LocalDefId) -> bool {
+        !self.crate_collector || self.delayed_ids.is_none_or(|ids| !ids.contains(&def_id))
+    }
 
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
         self.tcx

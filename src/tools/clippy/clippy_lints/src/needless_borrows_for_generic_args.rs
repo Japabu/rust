@@ -56,6 +56,10 @@ declare_clippy_lint! {
     "taking a reference that is going to be automatically dereferenced"
 }
 
+impl_lint_pass!(NeedlessBorrowsForGenericArgs<'_> => [
+    NEEDLESS_BORROWS_FOR_GENERIC_ARGS,
+]);
+
 pub struct NeedlessBorrowsForGenericArgs<'tcx> {
     /// Stack of (body owner, `PossibleBorrowerMap`) pairs. Used by
     /// [`needless_borrow_count`] to determine when a borrowed expression can instead
@@ -65,8 +69,6 @@ pub struct NeedlessBorrowsForGenericArgs<'tcx> {
     // `IntoIterator` for arrays requires Rust 1.53.
     msrv: Msrv,
 }
-impl_lint_pass!(NeedlessBorrowsForGenericArgs<'_> => [NEEDLESS_BORROWS_FOR_GENERIC_ARGS]);
-
 impl NeedlessBorrowsForGenericArgs<'_> {
     pub fn new(conf: &'static Conf) -> Self {
         Self {
@@ -329,7 +331,12 @@ fn is_mixed_projection_predicate<'tcx>(
         let mut projection_term = projection_predicate.projection_term;
         loop {
             match *projection_term.self_ty().kind() {
-                ty::Alias(ty::Projection, inner_projection_ty) => {
+                ty::Alias(
+                    inner_projection_ty @ ty::AliasTy {
+                        kind: ty::Projection { .. },
+                        ..
+                    },
+                ) => {
                     projection_term = inner_projection_ty.into();
                 },
                 ty::Param(param_ty) => {

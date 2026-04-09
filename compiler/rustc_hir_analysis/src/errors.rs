@@ -318,6 +318,14 @@ pub(crate) struct ConstParamTyImplOnNonAdt {
 }
 
 #[derive(Diagnostic)]
+#[diag("the trait `ConstParamTy` may not be implemented for this struct")]
+pub(crate) struct ConstParamTyFieldVisMismatch {
+    #[primary_span]
+    #[label("struct fields are less visible than the struct")]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag("at least one trait is required for an object type", code = E0224)]
 pub(crate) struct TraitObjectDeclaredWithNoTraits {
     #[primary_span]
@@ -733,14 +741,6 @@ pub(crate) enum CannotCaptureLateBound {
         def_span: Span,
         what: &'static str,
     },
-}
-
-#[derive(Diagnostic)]
-#[diag("{$variances}")]
-pub(crate) struct VariancesOf {
-    #[primary_span]
-    pub span: Span,
-    pub variances: String,
 }
 
 #[derive(Diagnostic)]
@@ -1815,6 +1815,13 @@ pub(crate) struct CmseImplTrait {
 pub(crate) struct BadReturnTypeNotation {
     #[primary_span]
     pub span: Span,
+    #[suggestion(
+        "furthermore, argument types not allowed with return type notation",
+        applicability = "maybe-incorrect",
+        code = "(..)",
+        style = "verbose"
+    )]
+    pub suggestion: Option<Span>,
 }
 
 #[derive(Diagnostic)]

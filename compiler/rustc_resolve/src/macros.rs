@@ -512,7 +512,7 @@ impl<'ra, 'tcx> ResolverExpand for Resolver<'ra, 'tcx> {
         cfg_span: Span,
     ) {
         self.stripped_cfg_items.push(StrippedCfgItem {
-            parent_module: parent_node,
+            parent_scope: parent_node,
             ident,
             cfg: (cfg, cfg_span),
         });
@@ -618,14 +618,20 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         }
 
         // Report errors for the resolved macro.
-        for segment in &path.segments {
+        for (idx, segment) in path.segments.iter().enumerate() {
             if let Some(args) = &segment.args {
                 self.dcx().emit_err(errors::GenericArgumentsInMacroPath { span: args.span() });
             }
             if kind == MacroKind::Attr && segment.ident.as_str().starts_with("rustc") {
-                self.dcx().emit_err(errors::AttributesStartingWithRustcAreReserved {
-                    span: segment.ident.span,
-                });
+                if idx == 0 {
+                    self.dcx().emit_err(errors::AttributesStartingWithRustcAreReserved {
+                        span: segment.ident.span,
+                    });
+                } else {
+                    self.dcx().emit_err(errors::AttributesContainingRustcAreReserved {
+                        span: segment.ident.span,
+                    });
+                }
             }
         }
 
@@ -707,7 +713,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         }
 
         const DIAG_ATTRS: &[Symbol] =
-            &[sym::on_unimplemented, sym::do_not_recommend, sym::on_const];
+            &[sym::on_unimplemented, sym::do_not_recommend, sym::on_const, sym::on_move];
 
         if res == Res::NonMacroAttr(NonMacroAttrKind::Tool)
             && let [namespace, attribute, ..] = &*path.segments
@@ -1064,8 +1070,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
     ) {
         let span = path.span;
         if let Some(stability) = &ext.stability
-            && let StabilityLevel::Unstable { reason, issue, is_soft, implied_by, .. } =
-                stability.level
+            && let StabilityLevel::Unstable { reason, issue, implied_by, .. } = stability.level
         {
             let feature = stability.feature;
 
@@ -1073,25 +1078,13 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 |feature| self.tcx.features().enabled(feature) || span.allows_unstable(feature);
             let allowed_by_implication = implied_by.is_some_and(|feature| is_allowed(feature));
             if !is_allowed(feature) && !allowed_by_implication {
-                let lint_buffer = &mut self.lint_buffer;
-                let soft_handler = |lint, span, msg: String| {
-                    lint_buffer.buffer_lint(
-                        lint,
-                        node_id,
-                        span,
-                        // FIXME make this translatable
-                        errors::UnstableFeature { msg: msg.into() },
-                    )
-                };
                 stability::report_unstable(
                     self.tcx.sess,
                     feature,
                     reason.to_opt_reason(),
                     issue,
                     None,
-                    is_soft,
                     span,
-                    soft_handler,
                     stability::UnstableKind::Regular,
                 );
             }

@@ -2,16 +2,18 @@ use std::ops::Deref;
 use std::{fmt, iter};
 
 use itertools::Itertools;
+use rustc_ast as ast;
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_errors::codes::*;
 use rustc_errors::{Applicability, Diag, ErrorGuaranteed, MultiSpan, a_or_an, listify, pluralize};
+use rustc_hir as hir;
 use rustc_hir::attrs::DivergingBlockBehavior;
 use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::Visitor;
-use rustc_hir::{Expr, ExprKind, HirId, LangItem, Node, QPath, is_range_literal};
+use rustc_hir::{Expr, ExprKind, FnRetTy, HirId, LangItem, Node, QPath, is_range_literal};
 use rustc_hir_analysis::check::potentially_plural_count;
-use rustc_hir_analysis::hir_ty_lowering::{HirTyLowerer, PermitVariants};
+use rustc_hir_analysis::hir_ty_lowering::{HirTyLowerer, ResolvedStructPath};
 use rustc_index::IndexVec;
 use rustc_infer::infer::{BoundRegionConversionTime, DefineOpaqueTypes, InferOk, TypeTrace};
 use rustc_middle::ty::adjustment::AllowTwoPhase;
@@ -25,7 +27,6 @@ use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::traits::{self, ObligationCauseCode, ObligationCtxt, SelectionContext};
 use smallvec::SmallVec;
 use tracing::debug;
-use {rustc_ast as ast, rustc_hir as hir};
 
 use crate::Expectation::*;
 use crate::TupleArgumentsFlag::*;
@@ -214,6 +215,29 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             self.check_place_expr_if_unsized(fn_input_ty, arg_expr);
         }
 
+        let formal_input_tys_ns;
+        let formal_input_tys = if self.next_trait_solver() {
+            // In the new solver, the normalizations are done lazily.
+            // Because of this, if we encounter unnormalized alias types inside this
+            // fudge scope, we might lose the relationships between them and other vars
+            // when fudging inference variables created here.
+            // So, we utilize generalization to normalize aliases by adding a new
+            // inference var and equating it with the type we want to pull out of the
+            // fudge scope.
+            formal_input_tys_ns = formal_input_tys
+                .iter()
+                .map(|&ty| {
+                    let generalized_ty = self.next_ty_var(call_span);
+                    self.demand_eqtype(call_span, ty, generalized_ty);
+                    generalized_ty
+                })
+                .collect_vec();
+
+            formal_input_tys_ns.as_slice()
+        } else {
+            formal_input_tys
+        };
+
         // First, let's unify the formal method signature with the expectation eagerly.
         // We use this to guide coercion inference; it's output is "fudged" which means
         // any remaining type variables are assigned to new, unrelated variables. This
@@ -237,37 +261,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     let origin = self.misc(call_span);
                     ocx.sup(&origin, self.param_env, expected_output, formal_output)?;
 
-                    let formal_input_tys_ns;
-                    let formal_input_tys = if self.next_trait_solver() {
-                        // In the new solver, the normalizations are done lazily.
-                        // Because of this, if we encounter unnormalized alias types inside this
-                        // fudge scope, we might lose the relationships between them and other vars
-                        // when fudging inference variables created here.
-                        // So, we utilize generalization to normalize aliases by adding a new
-                        // inference var and equating it with the type we want to pull out of the
-                        // fudge scope.
-                        formal_input_tys_ns = formal_input_tys
-                            .iter()
-                            .map(|&ty| {
-                                // If we replace a (unresolved) inference var with a new inference
-                                // var, it will be eventually resolved to itself and this will
-                                // weaken type inferences as the new inference var will be fudged
-                                // out and lose all relationships with other vars while the former
-                                // will not be fudged.
-                                if ty.is_ty_var() {
-                                    return ty;
-                                }
-
-                                let generalized_ty = self.next_ty_var(call_span);
-                                ocx.eq(&origin, self.param_env, ty, generalized_ty).unwrap();
-                                generalized_ty
-                            })
-                            .collect_vec();
-
-                        formal_input_tys_ns.as_slice()
-                    } else {
-                        formal_input_tys
-                    };
+                    // Check the well-formedness of expected input tys, as using ill-formed
+                    // expectation may cause type inference errors, see #150316.
+                    for &ty in formal_input_tys {
+                        ocx.register_obligation(traits::Obligation::new(
+                            self.tcx,
+                            self.misc(call_span),
+                            self.param_env,
+                            ty::ClauseKind::WellFormed(ty.into()),
+                        ));
+                    }
 
                     if !ocx.try_evaluate_obligations().is_empty() {
                         return Err(TypeError::Mismatch);
@@ -1264,38 +1267,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         path_span: Span,
         hir_id: HirId,
     ) -> (Res, LoweredTy<'tcx>) {
+        let ResolvedStructPath { res: result, ty } =
+            self.lowerer().lower_path_for_struct_expr(*qpath, path_span, hir_id);
         match *qpath {
-            QPath::Resolved(ref maybe_qself, path) => {
-                let self_ty = maybe_qself.as_ref().map(|qself| self.lower_ty(qself).raw);
-                let ty = self.lowerer().lower_resolved_ty_path(
-                    self_ty,
-                    path,
-                    hir_id,
-                    PermitVariants::Yes,
-                );
-                (path.res, LoweredTy::from_raw(self, path_span, ty))
-            }
-            QPath::TypeRelative(hir_self_ty, segment) => {
-                let self_ty = self.lower_ty(hir_self_ty);
-
-                let result = self.lowerer().lower_type_relative_ty_path(
-                    self_ty.raw,
-                    hir_self_ty,
-                    segment,
-                    hir_id,
-                    path_span,
-                    PermitVariants::Yes,
-                );
-                let ty = result
-                    .map(|(ty, _, _)| ty)
-                    .unwrap_or_else(|guar| Ty::new_error(self.tcx(), guar));
+            QPath::Resolved(_, path) => (path.res, LoweredTy::from_raw(self, path_span, ty)),
+            QPath::TypeRelative(_, _) => {
                 let ty = LoweredTy::from_raw(self, path_span, ty);
-                let result = result.map(|(_, kind, def_id)| (kind, def_id));
+                let resolution =
+                    result.map(|res: Res| (self.tcx().def_kind(res.def_id()), res.def_id()));
 
                 // Write back the new resolution.
-                self.write_resolution(hir_id, result);
+                self.write_resolution(hir_id, resolution);
 
-                (result.map_or(Res::Err, |(kind, def_id)| Res::Def(kind, def_id)), ty)
+                (result.unwrap_or(Res::Err), ty)
             }
         }
     }
@@ -1416,7 +1400,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         }
                     }
                 }
-                ty::Alias(ty::Opaque, ty::AliasTy { def_id: new_def_id, .. })
+                ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id: new_def_id }, .. })
                 | ty::Closure(new_def_id, _)
                 | ty::FnDef(new_def_id, _) => {
                     def_id = new_def_id;
@@ -1586,6 +1570,45 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 }
             }
             err.span_note(spans, format!("{} defined here", self.tcx.def_descr(def_id)));
+            if let DefKind::Fn | DefKind::AssocFn = self.tcx.def_kind(def_id)
+                && let ty::Param(_) =
+                    self.tcx.fn_sig(def_id).instantiate_identity().skip_binder().output().kind()
+                && let parent = self.tcx.hir_get_parent_item(call_expr.hir_id).def_id
+                && let Some((output, body_id)) = match self.tcx.hir_node_by_def_id(parent) {
+                    hir::Node::Item(hir::Item {
+                        kind: hir::ItemKind::Fn { sig, body, .. },
+                        ..
+                    })
+                    | hir::Node::TraitItem(hir::TraitItem {
+                        kind: hir::TraitItemKind::Fn(sig, hir::TraitFn::Provided(body)),
+                        ..
+                    })
+                    | hir::Node::ImplItem(hir::ImplItem {
+                        kind: hir::ImplItemKind::Fn(sig, body),
+                        ..
+                    }) => Some((sig.decl.output, body)),
+                    _ => None,
+                }
+                && let expr = self.tcx.hir_body(*body_id).value
+                && (expr.peel_blocks().span == call_expr.span
+                    || matches!(
+                        self.tcx.parent_hir_node(call_expr.hir_id),
+                        hir::Node::Expr(hir::Expr { kind: hir::ExprKind::Ret(_), .. })
+                    ))
+            {
+                err.span_label(
+                    output.span(),
+                    match output {
+                        FnRetTy::DefaultReturn(_) => format!(
+                            "this implicit `()` return type influences the call expression's return type"
+                        ),
+                        FnRetTy::Return(_) => {
+                            "this return type influences the call expression's return type"
+                                .to_string()
+                        }
+                    },
+                );
+            }
         } else if let Some(hir::Node::Expr(e)) = self.tcx.hir_get_if_local(def_id)
             && let hir::ExprKind::Closure(hir::Closure { body, .. }) = &e.kind
         {

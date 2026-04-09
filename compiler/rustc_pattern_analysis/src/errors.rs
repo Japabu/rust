@@ -1,5 +1,4 @@
-use rustc_errors::{Diag, EmissionGuarantee, Subdiagnostic};
-use rustc_macros::{Diagnostic, LintDiagnostic, Subdiagnostic};
+use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_middle::ty::Ty;
 use rustc_span::Span;
 
@@ -99,24 +98,15 @@ pub struct ExclusiveRangeMissingGap {
     pub gap_with: Vec<GappedRange>,
 }
 
+#[derive(Subdiagnostic)]
+#[label(
+    "this could appear to continue range `{$first_range}`, but `{$gap}` isn't matched by either of them"
+)]
 pub struct GappedRange {
+    #[primary_span]
     pub span: Span,
     pub gap: String,         // a printed pattern
     pub first_range: String, // a printed pattern
-}
-
-impl Subdiagnostic for GappedRange {
-    fn add_to_diag<G: EmissionGuarantee>(self, diag: &mut Diag<'_, G>) {
-        let GappedRange { span, gap, first_range } = self;
-
-        // FIXME(mejrs) unfortunately `#[derive(LintDiagnostic)]`
-        // does not support `#[subdiagnostic(eager)]`...
-        let message = format!(
-            "this could appear to continue range `{first_range}`, but `{gap}` isn't matched by \
-            either of them"
-        );
-        diag.span_label(span, message);
-    }
 }
 
 #[derive(Diagnostic)]
@@ -131,10 +121,12 @@ pub(crate) struct NonExhaustiveOmittedPattern<'tcx> {
     pub uncovered: Uncovered,
 }
 
-#[derive(LintDiagnostic)]
+#[derive(Diagnostic)]
 #[diag("the lint level must be set on the whole match")]
 #[help("it no longer has any effect to set the lint level on an individual match arm")]
 pub(crate) struct NonExhaustiveOmittedPatternLintOnArm {
+    #[primary_span]
+    pub span: Span,
     #[label("remove this attribute")]
     pub lint_span: Span,
     #[suggestion(

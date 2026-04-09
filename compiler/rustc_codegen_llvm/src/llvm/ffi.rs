@@ -293,6 +293,7 @@ pub(crate) enum AttributeKind {
     CapturesNone = 46,
     SanitizeRealtimeNonblocking = 47,
     SanitizeRealtimeBlocking = 48,
+    Convergent = 49,
 }
 
 /// LLVMIntPredicate
@@ -464,6 +465,8 @@ pub(crate) struct SanitizerOptions {
     pub sanitize_hwaddress_recover: bool,
     pub sanitize_kernel_address: bool,
     pub sanitize_kernel_address_recover: bool,
+    pub sanitize_kernel_hwaddress: bool,
+    pub sanitize_kernel_hwaddress_recover: bool,
 }
 
 /// LLVMRustRelocModel
@@ -2045,6 +2048,7 @@ unsafe extern "C" {
     pub(crate) fn LLVMRustSetFastMath(Instr: &Value);
     pub(crate) fn LLVMRustSetAlgebraicMath(Instr: &Value);
     pub(crate) fn LLVMRustSetAllowReassoc(Instr: &Value);
+    pub(crate) fn LLVMRustSetNoSignedZeros(Instr: &Value);
 
     // Miscellaneous instructions
     pub(crate) fn LLVMRustBuildMemCpy<'a>(
@@ -2298,6 +2302,23 @@ unsafe extern "C" {
         Elements: Option<&'a DIArray>,
         Params: Option<&'a DIArray>,
     );
+
+    pub(crate) fn LLVMRustDIGetOrCreateSubrange<'a>(
+        Builder: &DIBuilder<'a>,
+        CountNode: Option<&'a Metadata>,
+        LB: &'a Metadata,
+        UB: &'a Metadata,
+        Stride: Option<&'a Metadata>,
+    ) -> &'a Metadata;
+
+    pub(crate) fn LLVMRustDICreateVectorType<'a>(
+        Builder: &DIBuilder<'a>,
+        Size: u64,
+        AlignInBits: u32,
+        Type: &'a DIType,
+        Subscripts: &'a DIArray,
+        BitStride: Option<&'a Metadata>,
+    ) -> &'a Metadata;
 
     pub(crate) fn LLVMRustDILocationCloneWithBaseDiscriminator<'a>(
         Location: &'a DILocation,

@@ -6,6 +6,7 @@
 //! See [`rustc_hir_analysis::check`] for more context on type checking in general.
 
 use rustc_abi::{FIRST_VARIANT, FieldIdx};
+use rustc_ast as ast;
 use rustc_ast::util::parser::ExprPrecedence;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::stack::ensure_sufficient_stack;
@@ -18,7 +19,7 @@ use rustc_errors::{
 use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::lang_items::LangItem;
-use rustc_hir::{ExprKind, HirId, QPath, find_attr, is_range_literal};
+use rustc_hir::{self as hir, Attribute, ExprKind, HirId, QPath, find_attr, is_range_literal};
 use rustc_hir_analysis::NoVariantNamed;
 use rustc_hir_analysis::errors::NoFieldOnType;
 use rustc_hir_analysis::hir_ty_lowering::HirTyLowerer as _;
@@ -32,12 +33,10 @@ use rustc_session::errors::ExprParenthesesNeeded;
 use rustc_session::parse::feature_err;
 use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::hygiene::DesugaringKind;
-use rustc_span::source_map::Spanned;
-use rustc_span::{Ident, Span, Symbol, kw, sym};
+use rustc_span::{Ident, Span, Spanned, Symbol, kw, sym};
 use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::traits::{self, ObligationCauseCode, ObligationCtxt};
 use tracing::{debug, instrument, trace};
-use {rustc_ast as ast, rustc_hir as hir};
 
 use crate::Expectation::{self, ExpectCastableToType, ExpectHasType, NoExpectation};
 use crate::coercion::CoerceMany;
@@ -56,26 +55,21 @@ use crate::{
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub(crate) fn precedence(&self, expr: &hir::Expr<'_>) -> ExprPrecedence {
+        // For the purpose of rendering suggestions, disregard attributes
+        // that originate from desugaring of any kind. For example, `x?`
+        // desugars to `#[allow(unreachable_code)] match ...`. Failing to
+        // ignore the prefix attribute in the desugaring would cause this
+        // suggestion:
+        //
+        //     let y: u32 = x?.try_into().unwrap();
+        //                    ++++++++++++++++++++
+        //
+        // to be rendered as:
+        //
+        //     let y: u32 = (x?).try_into().unwrap();
+        //                  +  +++++++++++++++++++++
         let has_attr = |id: HirId| -> bool {
-            for attr in self.tcx.hir_attrs(id) {
-                // For the purpose of rendering suggestions, disregard attributes
-                // that originate from desugaring of any kind. For example, `x?`
-                // desugars to `#[allow(unreachable_code)] match ...`. Failing to
-                // ignore the prefix attribute in the desugaring would cause this
-                // suggestion:
-                //
-                //     let y: u32 = x?.try_into().unwrap();
-                //                    ++++++++++++++++++++
-                //
-                // to be rendered as:
-                //
-                //     let y: u32 = (x?).try_into().unwrap();
-                //                  +  +++++++++++++++++++++
-                if attr.span().desugaring_kind().is_none() {
-                    return true;
-                }
-            }
-            false
+            self.tcx.hir_attrs(id).iter().any(Attribute::has_span_without_desugaring_kind)
         };
 
         // Special case: range expressions are desugared to struct literals in HIR,
@@ -1660,14 +1654,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expr: &'tcx hir::Expr<'tcx>,
     ) -> Ty<'tcx> {
         let element_ty = if !args.is_empty() {
-            // This shouldn't happen unless there's another error
-            // (e.g., never patterns in inappropriate contexts).
-            if self.diverges.get() != Diverges::Maybe {
-                self.dcx()
-                    .struct_span_err(expr.span, "unexpected divergence state in checking array")
-                    .delay_as_bug();
-            }
-
             let coerce_to = expected
                 .to_option(self)
                 .and_then(|uty| {
@@ -1791,27 +1777,24 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     fn check_expr_tuple(
         &self,
-        elts: &'tcx [hir::Expr<'tcx>],
+        elements: &'tcx [hir::Expr<'tcx>],
         expected: Expectation<'tcx>,
         expr: &'tcx hir::Expr<'tcx>,
     ) -> Ty<'tcx> {
-        let flds = expected.only_has_type(self).and_then(|ty| {
-            let ty = self.try_structurally_resolve_type(expr.span, ty);
-            match ty.kind() {
-                ty::Tuple(flds) => Some(&flds[..]),
-                _ => None,
-            }
+        let mut expectations = expected
+            .only_has_type(self)
+            .and_then(|ty| self.try_structurally_resolve_type(expr.span, ty).opt_tuple_fields())
+            .unwrap_or_default()
+            .iter();
+
+        let elements = elements.iter().map(|e| {
+            let ty = expectations.next().unwrap_or_else(|| self.next_ty_var(e.span));
+            self.check_expr_coercible_to_type(e, ty, None);
+            ty
         });
 
-        let elt_ts_iter = elts.iter().enumerate().map(|(i, e)| match flds {
-            Some(fs) if i < fs.len() => {
-                let ety = fs[i];
-                self.check_expr_coercible_to_type(e, ety, None);
-                ety
-            }
-            _ => self.check_expr_with_expectation(e, NoExpectation),
-        });
-        let tuple = Ty::new_tup_from_iter(self.tcx, elt_ts_iter);
+        let tuple = Ty::new_tup_from_iter(self.tcx, elements);
+
         if let Err(guar) = tuple.error_reported() {
             Ty::new_error(self.tcx, guar)
         } else {
@@ -2203,7 +2186,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 };
                 self.typeck_results.borrow_mut().fru_field_types_mut().insert(expr.hir_id, fru_tys);
             }
-            rustc_hir::StructTailExpr::NoneWithError(ErrorGuaranteed { .. }) => {
+            rustc_hir::StructTailExpr::NoneWithError(guaranteed) => {
                 // If parsing the struct recovered from a syntax error, do not report missing
                 // fields. This prevents spurious errors when a field is intended to be present
                 // but a preceding syntax error caused it not to be parsed. For example, if a
@@ -2211,6 +2194,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 //     StructName { foo(), bar: 2 }
                 // will not successfully parse a field `foo`, but we will not mention that,
                 // since the syntax error has already been reported.
+
+                // Signal that type checking has failed, even though we haven’t emitted a diagnostic
+                // about it ourselves.
+                self.infcx.set_tainted_by_errors(guaranteed);
             }
             rustc_hir::StructTailExpr::None => {
                 if adt_kind != AdtKind::Union
@@ -2452,25 +2439,28 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             })
             .partition(|field| field.2);
         err.span_labels(used_private_fields.iter().map(|(_, span, _)| *span), "private field");
-        if !remaining_private_fields.is_empty() {
-            let names = if remaining_private_fields.len() > 6 {
-                String::new()
-            } else {
-                format!(
-                    "{} ",
-                    listify(&remaining_private_fields, |(name, _, _)| format!("`{name}`"))
-                        .expect("expected at least one private field to report")
-                )
-            };
-            err.note(format!(
-                "{}private field{s} {names}that {were} not provided",
-                if used_fields.is_empty() { "" } else { "...and other " },
-                s = pluralize!(remaining_private_fields.len()),
-                were = pluralize!("was", remaining_private_fields.len()),
-            ));
-        }
 
         if let ty::Adt(def, _) = adt_ty.kind() {
+            if (def.did().is_local() || !used_fields.is_empty())
+                && !remaining_private_fields.is_empty()
+            {
+                let names = if remaining_private_fields.len() > 6 {
+                    String::new()
+                } else {
+                    format!(
+                        "{} ",
+                        listify(&remaining_private_fields, |(name, _, _)| format!("`{name}`"))
+                            .expect("expected at least one private field to report")
+                    )
+                };
+                err.note(format!(
+                    "{}private field{s} {names}that {were} not provided",
+                    if used_fields.is_empty() { "" } else { "...and other " },
+                    s = pluralize!(remaining_private_fields.len()),
+                    were = pluralize!("was", remaining_private_fields.len()),
+                ));
+            }
+
             let def_id = def.did();
             let mut items = self
                 .tcx
@@ -2991,7 +2981,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 err.span_label(ident.span, "unknown field");
                 self.point_at_param_definition(&mut err, param_ty);
             }
-            ty::Alias(ty::Opaque, _) => {
+            ty::Alias(ty::AliasTy { kind: ty::Opaque { .. }, .. }) => {
                 self.suggest_await_on_field_access(&mut err, ident, base, base_ty.peel_refs());
             }
             _ => {

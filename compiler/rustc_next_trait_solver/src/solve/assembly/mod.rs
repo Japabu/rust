@@ -11,7 +11,7 @@ use rustc_type_ir::lang_items::SolverTraitLangItem;
 use rustc_type_ir::search_graph::CandidateHeadUsages;
 use rustc_type_ir::solve::{AliasBoundKind, SizedTraitKind};
 use rustc_type_ir::{
-    self as ty, Interner, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable,
+    self as ty, AliasTy, Interner, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable,
     TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor, TypingMode, Upcast,
     elaborate,
 };
@@ -87,10 +87,26 @@ where
             let ty::Dynamic(bounds, _) = goal.predicate.self_ty().kind() else {
                 panic!("expected object type in `probe_and_consider_object_bound_candidate`");
             };
+
+            let trait_ref = assumption.kind().map_bound(|clause| match clause {
+                ty::ClauseKind::Trait(pred) => pred.trait_ref,
+                ty::ClauseKind::Projection(proj) => proj.projection_term.trait_ref(cx),
+
+                ty::ClauseKind::RegionOutlives(..)
+                | ty::ClauseKind::TypeOutlives(..)
+                | ty::ClauseKind::ConstArgHasType(..)
+                | ty::ClauseKind::WellFormed(..)
+                | ty::ClauseKind::ConstEvaluatable(..)
+                | ty::ClauseKind::HostEffect(..)
+                | ty::ClauseKind::UnstableFeature(..) => {
+                    unreachable!("expected trait or projection predicate as an assumption")
+                }
+            });
+
             match structural_traits::predicates_for_object_candidate(
                 ecx,
                 goal.param_env,
-                goal.predicate.trait_ref(cx),
+                trait_ref,
                 bounds,
             ) {
                 Ok(requirements) => {
@@ -138,8 +154,10 @@ where
             .enter_single_candidate(|ecx| {
                 Self::match_assumption(ecx, goal, assumption, |ecx| {
                     ecx.try_evaluate_added_goals()?;
-                    source.set(ecx.characterize_param_env_assumption(goal.param_env, assumption)?);
-                    ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+                    let (src, certainty) =
+                        ecx.characterize_param_env_assumption(goal.param_env, assumption)?;
+                    source.set(src);
+                    ecx.evaluate_added_goals_and_make_canonical_response(certainty)
                 })
             });
 
@@ -685,7 +703,7 @@ where
         candidates: &mut Vec<Candidate<I>>,
         consider_self_bounds: AliasBoundKind,
     ) {
-        let (kind, alias_ty) = match self_ty.kind() {
+        let alias_ty = match self_ty.kind() {
             ty::Bool
             | ty::Char
             | ty::Int(_)
@@ -733,8 +751,10 @@ where
                 return;
             }
 
-            ty::Alias(kind @ (ty::Projection | ty::Opaque), alias_ty) => (kind, alias_ty),
-            ty::Alias(ty::Inherent | ty::Free, _) => {
+            ty::Alias(
+                alias_ty @ AliasTy { kind: ty::Projection { .. } | ty::Opaque { .. }, .. },
+            ) => alias_ty,
+            ty::Alias(AliasTy { kind: ty::Inherent { .. } | ty::Free { .. }, .. }) => {
                 self.cx().delay_bug(format!("could not normalize {self_ty:?}, it is not WF"));
                 return;
             }
@@ -744,7 +764,7 @@ where
             AliasBoundKind::SelfBounds => {
                 for assumption in self
                     .cx()
-                    .item_self_bounds(alias_ty.def_id)
+                    .item_self_bounds(alias_ty.kind.def_id())
                     .iter_instantiated(self.cx(), alias_ty.args)
                 {
                     candidates.extend(G::probe_and_consider_implied_clause(
@@ -759,7 +779,7 @@ where
             AliasBoundKind::NonSelfBounds => {
                 for assumption in self
                     .cx()
-                    .item_non_self_bounds(alias_ty.def_id)
+                    .item_non_self_bounds(alias_ty.kind.def_id())
                     .iter_instantiated(self.cx(), alias_ty.args)
                 {
                     candidates.extend(G::probe_and_consider_implied_clause(
@@ -775,7 +795,7 @@ where
 
         candidates.extend(G::consider_additional_alias_assumptions(self, goal, alias_ty));
 
-        if kind != ty::Projection {
+        if !matches!(alias_ty.kind, ty::Projection { .. }) {
             return;
         }
 
@@ -1021,7 +1041,7 @@ where
                     self.cx
                 }
                 fn fold_ty(&mut self, ty: I::Ty) -> I::Ty {
-                    if let ty::Alias(ty::Opaque, alias_ty) = ty.kind() {
+                    if let ty::Alias(alias_ty) = ty.kind() {
                         if alias_ty == self.alias_ty {
                             return self.self_ty;
                         }
@@ -1039,7 +1059,7 @@ where
             // in a `?x: Trait<u32>` alias-bound candidate.
             for item_bound in self
                 .cx()
-                .item_self_bounds(alias_ty.def_id)
+                .item_self_bounds(alias_ty.kind.def_id())
                 .iter_instantiated(self.cx(), alias_ty.args)
             {
                 let assumption =
@@ -1228,21 +1248,26 @@ where
         &mut self,
         param_env: I::ParamEnv,
         assumption: I::Clause,
-    ) -> Result<CandidateSource<I>, NoSolution> {
+    ) -> Result<(CandidateSource<I>, Certainty), NoSolution> {
         // FIXME: This should be fixed, but it also requires changing the behavior
         // in the old solver which is currently relied on.
         if assumption.has_bound_vars() {
-            return Ok(CandidateSource::ParamEnv(ParamEnvSource::NonGlobal));
+            return Ok((CandidateSource::ParamEnv(ParamEnvSource::NonGlobal), Certainty::Yes));
         }
 
         match assumption.visit_with(&mut FindParamInClause {
             ecx: self,
             param_env,
             universes: vec![],
+            recursion_depth: 0,
         }) {
             ControlFlow::Break(Err(NoSolution)) => Err(NoSolution),
-            ControlFlow::Break(Ok(())) => Ok(CandidateSource::ParamEnv(ParamEnvSource::NonGlobal)),
-            ControlFlow::Continue(()) => Ok(CandidateSource::ParamEnv(ParamEnvSource::Global)),
+            ControlFlow::Break(Ok(certainty)) => {
+                Ok((CandidateSource::ParamEnv(ParamEnvSource::NonGlobal), certainty))
+            }
+            ControlFlow::Continue(()) => {
+                Ok((CandidateSource::ParamEnv(ParamEnvSource::Global), Certainty::Yes))
+            }
         }
     }
 }
@@ -1251,6 +1276,7 @@ struct FindParamInClause<'a, 'b, D: SolverDelegate<Interner = I>, I: Interner> {
     ecx: &'a mut EvalCtxt<'b, D>,
     param_env: I::ParamEnv,
     universes: Vec<Option<ty::UniverseIndex>>,
+    recursion_depth: usize,
 }
 
 impl<D, I> TypeVisitor<I> for FindParamInClause<'_, '_, D, I>
@@ -1258,7 +1284,11 @@ where
     D: SolverDelegate<Interner = I>,
     I: Interner,
 {
-    type Result = ControlFlow<Result<(), NoSolution>>;
+    // - `Continue(())`: no generic parameter was found, the type is global
+    // - `Break(Ok(Certainty::Yes))`: a generic parameter was found, the type is non-global
+    // - `Break(Ok(Certainty::Maybe(_)))`: the recursion limit reached, assume that the type is non-global
+    // - `Break(Err(NoSolution))`: normalization failed
+    type Result = ControlFlow<Result<Certainty, NoSolution>>;
 
     fn visit_binder<T: TypeVisitable<I>>(&mut self, t: &ty::Binder<I, T>) -> Self::Result {
         self.universes.push(None);
@@ -1273,16 +1303,34 @@ where
             return ControlFlow::Break(Err(NoSolution));
         };
 
-        if let ty::Placeholder(p) = ty.kind() {
-            if p.universe() == ty::UniverseIndex::ROOT {
-                ControlFlow::Break(Ok(()))
-            } else {
-                ControlFlow::Continue(())
+        match ty.kind() {
+            ty::Placeholder(p) => {
+                if p.universe() == ty::UniverseIndex::ROOT {
+                    ControlFlow::Break(Ok(Certainty::Yes))
+                } else {
+                    ControlFlow::Continue(())
+                }
             }
-        } else if ty.has_type_flags(TypeFlags::HAS_PLACEHOLDER | TypeFlags::HAS_RE_INFER) {
-            ty.super_visit_with(self)
-        } else {
-            ControlFlow::Continue(())
+            ty::Infer(_) => ControlFlow::Break(Ok(Certainty::AMBIGUOUS)),
+            _ if ty.has_type_flags(
+                TypeFlags::HAS_PLACEHOLDER | TypeFlags::HAS_INFER | TypeFlags::HAS_ALIAS,
+            ) =>
+            {
+                self.recursion_depth += 1;
+                if self.recursion_depth > self.ecx.cx().recursion_limit() {
+                    return ControlFlow::Break(Ok(Certainty::Maybe {
+                        cause: MaybeCause::Overflow {
+                            suggest_increasing_limit: true,
+                            keep_constraints: false,
+                        },
+                        opaque_types_jank: OpaqueTypesJank::AllGood,
+                    }));
+                }
+                let result = ty.super_visit_with(self);
+                self.recursion_depth -= 1;
+                result
+            }
+            _ => ControlFlow::Continue(()),
         }
     }
 
@@ -1292,16 +1340,23 @@ where
             return ControlFlow::Break(Err(NoSolution));
         };
 
-        if let ty::ConstKind::Placeholder(p) = ct.kind() {
-            if p.universe() == ty::UniverseIndex::ROOT {
-                ControlFlow::Break(Ok(()))
-            } else {
-                ControlFlow::Continue(())
+        match ct.kind() {
+            ty::ConstKind::Placeholder(p) => {
+                if p.universe() == ty::UniverseIndex::ROOT {
+                    ControlFlow::Break(Ok(Certainty::Yes))
+                } else {
+                    ControlFlow::Continue(())
+                }
             }
-        } else if ct.has_type_flags(TypeFlags::HAS_PLACEHOLDER | TypeFlags::HAS_RE_INFER) {
-            ct.super_visit_with(self)
-        } else {
-            ControlFlow::Continue(())
+            ty::ConstKind::Infer(_) => ControlFlow::Break(Ok(Certainty::AMBIGUOUS)),
+            _ if ct.has_type_flags(
+                TypeFlags::HAS_PLACEHOLDER | TypeFlags::HAS_INFER | TypeFlags::HAS_ALIAS,
+            ) =>
+            {
+                // FIXME(mgca): we should also check the recursion limit here
+                ct.super_visit_with(self)
+            }
+            _ => ControlFlow::Continue(()),
         }
     }
 
@@ -1310,12 +1365,12 @@ where
             ty::ReStatic | ty::ReError(_) | ty::ReBound(..) => ControlFlow::Continue(()),
             ty::RePlaceholder(p) => {
                 if p.universe() == ty::UniverseIndex::ROOT {
-                    ControlFlow::Break(Ok(()))
+                    ControlFlow::Break(Ok(Certainty::Yes))
                 } else {
                     ControlFlow::Continue(())
                 }
             }
-            ty::ReVar(_) => ControlFlow::Break(Ok(())),
+            ty::ReVar(_) => ControlFlow::Break(Ok(Certainty::Yes)),
             ty::ReErased | ty::ReEarlyParam(_) | ty::ReLateParam(_) => {
                 unreachable!("unexpected region in param-env clause")
             }

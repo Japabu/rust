@@ -867,7 +867,7 @@ impl<'a> State<'a> {
                     self.print_ident(rename);
                 }
             }
-            ast::UseTreeKind::Glob => {
+            ast::UseTreeKind::Glob(_) => {
                 if !tree.prefix.segments.is_empty() {
                     self.print_path(&tree.prefix, false, 0);
                     self.word("::");
@@ -881,7 +881,13 @@ impl<'a> State<'a> {
                 }
                 if items.is_empty() {
                     self.word("{}");
-                } else if let [(item, _)] = items.as_slice() {
+                } else if let [(item, _)] = items.as_slice()
+                    && !item
+                        .prefix
+                        .segments
+                        .first()
+                        .is_some_and(|seg| seg.ident.name == rustc_span::symbol::kw::SelfLower)
+                {
                     self.print_use_tree(item);
                 } else {
                     let cb = self.cbox(INDENT_UNIT);

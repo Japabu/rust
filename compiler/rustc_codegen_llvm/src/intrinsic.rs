@@ -1,9 +1,10 @@
 use std::cmp::Ordering;
 use std::ffi::c_uint;
-use std::ptr;
+use std::{assert_matches, ptr};
 
 use rustc_abi::{
-    Align, BackendRepr, ExternAbi, Float, HasDataLayout, Primitive, Size, WrappingRange,
+    Align, BackendRepr, ExternAbi, Float, HasDataLayout, NumScalableVectors, Primitive, Size,
+    WrappingRange,
 };
 use rustc_codegen_ssa::base::{compare_simd_types, wants_msvc_seh, wants_wasm_eh};
 use rustc_codegen_ssa::common::{IntPredicate, TypeKind};
@@ -11,7 +12,6 @@ use rustc_codegen_ssa::errors::{ExpectedPointerMutability, InvalidMonomorphizati
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
 use rustc_codegen_ssa::mir::place::{PlaceRef, PlaceValue};
 use rustc_codegen_ssa::traits::*;
-use rustc_data_structures::assert_matches;
 use rustc_hir as hir;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_hir::find_attr;
@@ -108,16 +108,6 @@ fn call_simple_intrinsic<'ll, 'tcx>(
         sym::fmuladdf64 => ("llvm.fmuladd", &[bx.type_f64()]),
         sym::fmuladdf128 => ("llvm.fmuladd", &[bx.type_f128()]),
 
-        sym::fabsf16 => ("llvm.fabs", &[bx.type_f16()]),
-        sym::fabsf32 => ("llvm.fabs", &[bx.type_f32()]),
-        sym::fabsf64 => ("llvm.fabs", &[bx.type_f64()]),
-        sym::fabsf128 => ("llvm.fabs", &[bx.type_f128()]),
-
-        sym::minnumf16 => ("llvm.minnum", &[bx.type_f16()]),
-        sym::minnumf32 => ("llvm.minnum", &[bx.type_f32()]),
-        sym::minnumf64 => ("llvm.minnum", &[bx.type_f64()]),
-        sym::minnumf128 => ("llvm.minnum", &[bx.type_f128()]),
-
         // FIXME: LLVM currently mis-compile those intrinsics, re-enable them
         // when llvm/llvm-project#{139380,139381,140445} are fixed.
         //sym::minimumf16 => ("llvm.minimum", &[bx.type_f16()]),
@@ -125,11 +115,6 @@ fn call_simple_intrinsic<'ll, 'tcx>(
         //sym::minimumf64 => ("llvm.minimum", &[bx.type_f64()]),
         //sym::minimumf128 => ("llvm.minimum", &[cx.type_f128()]),
         //
-        sym::maxnumf16 => ("llvm.maxnum", &[bx.type_f16()]),
-        sym::maxnumf32 => ("llvm.maxnum", &[bx.type_f32()]),
-        sym::maxnumf64 => ("llvm.maxnum", &[bx.type_f64()]),
-        sym::maxnumf128 => ("llvm.maxnum", &[bx.type_f128()]),
-
         // FIXME: LLVM currently mis-compile those intrinsics, re-enable them
         // when llvm/llvm-project#{139380,139381,140445} are fixed.
         //sym::maximumf16 => ("llvm.maximum", &[bx.type_f16()]),
@@ -196,6 +181,32 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         let simple = call_simple_intrinsic(self, name, args);
         let llval = match name {
             _ if simple.is_some() => simple.unwrap(),
+            sym::minimum_number_nsz_f16
+            | sym::minimum_number_nsz_f32
+            | sym::minimum_number_nsz_f64
+            | sym::minimum_number_nsz_f128
+            | sym::maximum_number_nsz_f16
+            | sym::maximum_number_nsz_f32
+            | sym::maximum_number_nsz_f64
+            | sym::maximum_number_nsz_f128
+                // Need at least LLVM 22 for `min/maximumnum` to not crash LLVM.
+                if crate::llvm_util::get_version() >= (22, 0, 0) =>
+            {
+                let intrinsic_name = if name.as_str().starts_with("min") {
+                    "llvm.minimumnum"
+                } else {
+                    "llvm.maximumnum"
+                };
+                let call = self.call_intrinsic(
+                    intrinsic_name,
+                    &[args[0].layout.immediate_llvm_type(self.cx)],
+                    &[args[0].immediate(), args[1].immediate()],
+                );
+                // `nsz` on minimumnum/maximumnum is special: its only effect is to make
+                // signed-zero ordering non-deterministic.
+                unsafe { llvm::LLVMRustSetNoSignedZeros(call) };
+                call
+            }
             sym::ptr_mask => {
                 let ptr = args[0].immediate();
                 self.call_intrinsic(
@@ -487,6 +498,20 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                 }
             }
 
+            sym::fabs => {
+                let ty = args[0].layout.ty;
+                let ty::Float(f) = ty.kind() else {
+                    span_bug!(span, "the `fabs` intrinsic requires a floating-point argument, got {:?}", ty);
+                };
+                let llty = self.type_float_from_ty(*f);
+                let llvm_name = "llvm.fabs";
+                self.call_intrinsic(
+                    llvm_name,
+                    &[llty],
+                    &args.iter().map(|arg| arg.immediate()).collect::<Vec<_>>(),
+                )
+            }
+
             sym::raw_eq => {
                 use BackendRepr::*;
                 let tp_ty = fn_args.type_at(0);
@@ -494,7 +519,7 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                 let use_integer_compare = match layout.backend_repr() {
                     Scalar(_) | ScalarPair(_, _) => true,
                     SimdVector { .. } => false,
-                    ScalableVector { .. } => {
+                    SimdScalableVector { .. } => {
                         tcx.dcx().emit_err(InvalidMonomorphization::NonScalableType {
                             span,
                             name: sym::raw_eq,
@@ -579,6 +604,136 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                 let val = self.call_intrinsic("llvm.amdgcn.dispatch.ptr", &[], &[]);
                 // Relying on `LLVMBuildPointerCast` to produce an addrspacecast
                 self.pointercast(val, self.type_ptr())
+            }
+
+            sym::sve_cast => {
+                let Some((in_cnt, in_elem, in_num_vecs)) =
+                    args[0].layout.ty.scalable_vector_parts(self.cx.tcx)
+                else {
+                    bug!("input parameter to `sve_cast` was not scalable vector");
+                };
+                let out_layout = self.layout_of(fn_args.type_at(1));
+                let Some((out_cnt, out_elem, out_num_vecs)) =
+                    out_layout.ty.scalable_vector_parts(self.cx.tcx)
+                else {
+                    bug!("output parameter to `sve_cast` was not scalable vector");
+                };
+                assert_eq!(in_cnt, out_cnt);
+                assert_eq!(in_num_vecs, out_num_vecs);
+                let out_llty = self.backend_type(out_layout);
+                match simd_cast(self, sym::simd_cast, args, out_llty, in_elem, out_elem) {
+                    Some(val) => val,
+                    _ => bug!("could not cast scalable vectors"),
+                }
+            }
+
+            sym::sve_tuple_create2 => {
+                assert_matches!(
+                    self.layout_of(fn_args.type_at(0)).backend_repr,
+                    BackendRepr::SimdScalableVector {
+                        number_of_vectors: NumScalableVectors(1),
+                        ..
+                    }
+                );
+                let tuple_ty = self.layout_of(fn_args.type_at(1));
+                assert_matches!(
+                    tuple_ty.backend_repr,
+                    BackendRepr::SimdScalableVector {
+                        number_of_vectors: NumScalableVectors(2),
+                        ..
+                    }
+                );
+                let ret = self.const_poison(self.backend_type(tuple_ty));
+                let ret = self.insert_value(ret, args[0].immediate(), 0);
+                self.insert_value(ret, args[1].immediate(), 1)
+            }
+
+            sym::sve_tuple_create3 => {
+                assert_matches!(
+                    self.layout_of(fn_args.type_at(0)).backend_repr,
+                    BackendRepr::SimdScalableVector {
+                        number_of_vectors: NumScalableVectors(1),
+                        ..
+                    }
+                );
+                let tuple_ty = self.layout_of(fn_args.type_at(1));
+                assert_matches!(
+                    tuple_ty.backend_repr,
+                    BackendRepr::SimdScalableVector {
+                        number_of_vectors: NumScalableVectors(3),
+                        ..
+                    }
+                );
+                let ret = self.const_poison(self.backend_type(tuple_ty));
+                let ret = self.insert_value(ret, args[0].immediate(), 0);
+                let ret = self.insert_value(ret, args[1].immediate(), 1);
+                self.insert_value(ret, args[2].immediate(), 2)
+            }
+
+            sym::sve_tuple_create4 => {
+                assert_matches!(
+                    self.layout_of(fn_args.type_at(0)).backend_repr,
+                    BackendRepr::SimdScalableVector {
+                        number_of_vectors: NumScalableVectors(1),
+                        ..
+                    }
+                );
+                let tuple_ty = self.layout_of(fn_args.type_at(1));
+                assert_matches!(
+                    tuple_ty.backend_repr,
+                    BackendRepr::SimdScalableVector {
+                        number_of_vectors: NumScalableVectors(4),
+                        ..
+                    }
+                );
+                let ret = self.const_poison(self.backend_type(tuple_ty));
+                let ret = self.insert_value(ret, args[0].immediate(), 0);
+                let ret = self.insert_value(ret, args[1].immediate(), 1);
+                let ret = self.insert_value(ret, args[2].immediate(), 2);
+                self.insert_value(ret, args[3].immediate(), 3)
+            }
+
+            sym::sve_tuple_get => {
+                assert_matches!(
+                    self.layout_of(fn_args.type_at(0)).backend_repr,
+                    BackendRepr::SimdScalableVector {
+                        number_of_vectors: NumScalableVectors(2 | 3 | 4 | 5 | 6 | 7 | 8),
+                        ..
+                    }
+                );
+                assert_matches!(
+                    self.layout_of(fn_args.type_at(1)).backend_repr,
+                    BackendRepr::SimdScalableVector {
+                        number_of_vectors: NumScalableVectors(1),
+                        ..
+                    }
+                );
+                self.extract_value(
+                    args[0].immediate(),
+                    fn_args.const_at(2).to_leaf().to_i32() as u64,
+                )
+            }
+
+            sym::sve_tuple_set => {
+                assert_matches!(
+                    self.layout_of(fn_args.type_at(0)).backend_repr,
+                    BackendRepr::SimdScalableVector {
+                        number_of_vectors: NumScalableVectors(2 | 3 | 4 | 5 | 6 | 7 | 8),
+                        ..
+                    }
+                );
+                assert_matches!(
+                    self.layout_of(fn_args.type_at(1)).backend_repr,
+                    BackendRepr::SimdScalableVector {
+                        number_of_vectors: NumScalableVectors(1),
+                        ..
+                    }
+                );
+                self.insert_value(
+                    args[0].immediate(),
+                    args[1].immediate(),
+                    fn_args.const_at(2).to_leaf().to_i32() as u64,
+                )
             }
 
             _ if name.as_str().starts_with("simd_") => {
@@ -1323,29 +1478,8 @@ fn codegen_autodiff<'ll, 'tcx>(
     let ret_ty = sig.output();
     let llret_ty = bx.layout_of(ret_ty).llvm_type(bx);
 
-    // Get source, diff, and attrs
-    let (source_id, source_args) = match fn_args.into_type_list(tcx)[0].kind() {
-        ty::FnDef(def_id, source_params) => (def_id, source_params),
-        _ => bug!("invalid autodiff intrinsic args"),
-    };
-
-    let fn_source = match Instance::try_resolve(tcx, bx.cx.typing_env(), *source_id, source_args) {
-        Ok(Some(instance)) => instance,
-        Ok(None) => bug!(
-            "could not resolve ({:?}, {:?}) to a specific autodiff instance",
-            source_id,
-            source_args
-        ),
-        Err(_) => {
-            // An error has already been emitted
-            return;
-        }
-    };
-
-    let source_symbol = symbol_name_for_instance_in_crate(tcx, fn_source.clone(), LOCAL_CRATE);
-    let Some(fn_to_diff) = bx.cx.get_function(&source_symbol) else {
-        bug!("could not find source function")
-    };
+    let source_fn_ptr_ty = fn_args.into_type_list(tcx)[0];
+    let fn_to_diff = args[0].immediate();
 
     let (diff_id, diff_args) = match fn_args.into_type_list(tcx)[1].kind() {
         ty::FnDef(def_id, diff_args) => (def_id, diff_args),
@@ -1376,13 +1510,12 @@ fn codegen_autodiff<'ll, 'tcx>(
 
     adjust_activity_to_abi(
         tcx,
-        fn_source,
+        source_fn_ptr_ty,
         TypingEnv::fully_monomorphized(),
         &mut diff_attrs.input_activity,
     );
 
-    let fnc_tree =
-        rustc_middle::ty::fnc_typetrees(tcx, fn_source.ty(tcx, TypingEnv::fully_monomorphized()));
+    let fnc_tree = rustc_middle::ty::fnc_typetrees(tcx, source_fn_ptr_ty);
 
     // Build body
     generate_enzyme_call(
@@ -1943,7 +2076,7 @@ fn generic_simd_intrinsic<'ll, 'tcx>(
         }
 
         let ty::Float(f) = in_elem.kind() else {
-            return_error!(InvalidMonomorphization::FloatingPointType { span, name, in_ty });
+            return_error!(InvalidMonomorphization::BasicFloatType { span, name, ty: in_ty });
         };
         let elem_ty = bx.cx.type_float_from_ty(*f);
 
@@ -2660,96 +2793,17 @@ fn generic_simd_intrinsic<'ll, 'tcx>(
                 out_len
             }
         );
-        // casting cares about nominal type, not just structural type
-        if in_elem == out_elem {
-            return Ok(args[0].immediate());
+        match simd_cast(bx, name, args, llret_ty, in_elem, out_elem) {
+            Some(val) => return Ok(val),
+            None => return_error!(InvalidMonomorphization::UnsupportedCast {
+                span,
+                name,
+                in_ty,
+                in_elem,
+                ret_ty,
+                out_elem
+            }),
         }
-
-        #[derive(Copy, Clone)]
-        enum Sign {
-            Unsigned,
-            Signed,
-        }
-        use Sign::*;
-
-        enum Style {
-            Float,
-            Int(Sign),
-            Unsupported,
-        }
-
-        let (in_style, in_width) = match in_elem.kind() {
-            // vectors of pointer-sized integers should've been
-            // disallowed before here, so this unwrap is safe.
-            ty::Int(i) => (
-                Style::Int(Signed),
-                i.normalize(bx.tcx().sess.target.pointer_width).bit_width().unwrap(),
-            ),
-            ty::Uint(u) => (
-                Style::Int(Unsigned),
-                u.normalize(bx.tcx().sess.target.pointer_width).bit_width().unwrap(),
-            ),
-            ty::Float(f) => (Style::Float, f.bit_width()),
-            _ => (Style::Unsupported, 0),
-        };
-        let (out_style, out_width) = match out_elem.kind() {
-            ty::Int(i) => (
-                Style::Int(Signed),
-                i.normalize(bx.tcx().sess.target.pointer_width).bit_width().unwrap(),
-            ),
-            ty::Uint(u) => (
-                Style::Int(Unsigned),
-                u.normalize(bx.tcx().sess.target.pointer_width).bit_width().unwrap(),
-            ),
-            ty::Float(f) => (Style::Float, f.bit_width()),
-            _ => (Style::Unsupported, 0),
-        };
-
-        match (in_style, out_style) {
-            (Style::Int(sign), Style::Int(_)) => {
-                return Ok(match in_width.cmp(&out_width) {
-                    Ordering::Greater => bx.trunc(args[0].immediate(), llret_ty),
-                    Ordering::Equal => args[0].immediate(),
-                    Ordering::Less => match sign {
-                        Sign::Signed => bx.sext(args[0].immediate(), llret_ty),
-                        Sign::Unsigned => bx.zext(args[0].immediate(), llret_ty),
-                    },
-                });
-            }
-            (Style::Int(Sign::Signed), Style::Float) => {
-                return Ok(bx.sitofp(args[0].immediate(), llret_ty));
-            }
-            (Style::Int(Sign::Unsigned), Style::Float) => {
-                return Ok(bx.uitofp(args[0].immediate(), llret_ty));
-            }
-            (Style::Float, Style::Int(sign)) => {
-                return Ok(match (sign, name == sym::simd_as) {
-                    (Sign::Unsigned, false) => bx.fptoui(args[0].immediate(), llret_ty),
-                    (Sign::Signed, false) => bx.fptosi(args[0].immediate(), llret_ty),
-                    (_, true) => bx.cast_float_to_int(
-                        matches!(sign, Sign::Signed),
-                        args[0].immediate(),
-                        llret_ty,
-                    ),
-                });
-            }
-            (Style::Float, Style::Float) => {
-                return Ok(match in_width.cmp(&out_width) {
-                    Ordering::Greater => bx.fptrunc(args[0].immediate(), llret_ty),
-                    Ordering::Equal => args[0].immediate(),
-                    Ordering::Less => bx.fpext(args[0].immediate(), llret_ty),
-                });
-            }
-            _ => { /* Unsupported. Fallthrough. */ }
-        }
-        return_error!(InvalidMonomorphization::UnsupportedCast {
-            span,
-            name,
-            in_ty,
-            in_elem,
-            ret_ty,
-            out_elem
-        });
     }
     macro_rules! arith_binary {
         ($($name: ident: $($($p: ident),* => $call: ident),*;)*) => {
@@ -2777,8 +2831,8 @@ fn generic_simd_intrinsic<'ll, 'tcx>(
         simd_and: Uint, Int => and;
         simd_or: Uint, Int => or;
         simd_xor: Uint, Int => xor;
-        simd_fmax: Float => maxnum;
-        simd_fmin: Float => minnum;
+        simd_maximum_number_nsz: Float => maximum_number_nsz;
+        simd_minimum_number_nsz: Float => minimum_number_nsz;
 
     }
     macro_rules! arith_unary {
@@ -2922,4 +2976,87 @@ fn generic_simd_intrinsic<'ll, 'tcx>(
     }
 
     span_bug!(span, "unknown SIMD intrinsic");
+}
+
+/// Implementation of `core::intrinsics::simd_cast`, re-used by `core::scalable::sve_cast`.
+fn simd_cast<'ll, 'tcx>(
+    bx: &mut Builder<'_, 'll, 'tcx>,
+    name: Symbol,
+    args: &[OperandRef<'tcx, &'ll Value>],
+    llret_ty: &'ll Type,
+    in_elem: Ty<'tcx>,
+    out_elem: Ty<'tcx>,
+) -> Option<&'ll Value> {
+    // Casting cares about nominal type, not just structural type
+    if in_elem == out_elem {
+        return Some(args[0].immediate());
+    }
+
+    #[derive(Copy, Clone)]
+    enum Sign {
+        Unsigned,
+        Signed,
+    }
+    use Sign::*;
+
+    enum Style {
+        Float,
+        Int(Sign),
+        Unsupported,
+    }
+
+    let (in_style, in_width) = match in_elem.kind() {
+        // vectors of pointer-sized integers should've been
+        // disallowed before here, so this unwrap is safe.
+        ty::Int(i) => (
+            Style::Int(Signed),
+            i.normalize(bx.tcx().sess.target.pointer_width).bit_width().unwrap(),
+        ),
+        ty::Uint(u) => (
+            Style::Int(Unsigned),
+            u.normalize(bx.tcx().sess.target.pointer_width).bit_width().unwrap(),
+        ),
+        ty::Float(f) => (Style::Float, f.bit_width()),
+        _ => (Style::Unsupported, 0),
+    };
+    let (out_style, out_width) = match out_elem.kind() {
+        ty::Int(i) => (
+            Style::Int(Signed),
+            i.normalize(bx.tcx().sess.target.pointer_width).bit_width().unwrap(),
+        ),
+        ty::Uint(u) => (
+            Style::Int(Unsigned),
+            u.normalize(bx.tcx().sess.target.pointer_width).bit_width().unwrap(),
+        ),
+        ty::Float(f) => (Style::Float, f.bit_width()),
+        _ => (Style::Unsupported, 0),
+    };
+
+    match (in_style, out_style) {
+        (Style::Int(sign), Style::Int(_)) => Some(match in_width.cmp(&out_width) {
+            Ordering::Greater => bx.trunc(args[0].immediate(), llret_ty),
+            Ordering::Equal => args[0].immediate(),
+            Ordering::Less => match sign {
+                Sign::Signed => bx.sext(args[0].immediate(), llret_ty),
+                Sign::Unsigned => bx.zext(args[0].immediate(), llret_ty),
+            },
+        }),
+        (Style::Int(Sign::Signed), Style::Float) => Some(bx.sitofp(args[0].immediate(), llret_ty)),
+        (Style::Int(Sign::Unsigned), Style::Float) => {
+            Some(bx.uitofp(args[0].immediate(), llret_ty))
+        }
+        (Style::Float, Style::Int(sign)) => Some(match (sign, name == sym::simd_as) {
+            (Sign::Unsigned, false) => bx.fptoui(args[0].immediate(), llret_ty),
+            (Sign::Signed, false) => bx.fptosi(args[0].immediate(), llret_ty),
+            (_, true) => {
+                bx.cast_float_to_int(matches!(sign, Sign::Signed), args[0].immediate(), llret_ty)
+            }
+        }),
+        (Style::Float, Style::Float) => Some(match in_width.cmp(&out_width) {
+            Ordering::Greater => bx.fptrunc(args[0].immediate(), llret_ty),
+            Ordering::Equal => args[0].immediate(),
+            Ordering::Less => bx.fpext(args[0].immediate(), llret_ty),
+        }),
+        _ => None,
+    }
 }

@@ -1,5 +1,6 @@
+use std::debug_assert_matches;
+
 use rustc_abi::IntegerType;
-use rustc_data_structures::debug_assert_matches;
 use rustc_data_structures::stable_hasher::StableHasher;
 use rustc_hashes::Hash128;
 use rustc_hir::def::DefKind;
@@ -116,7 +117,7 @@ impl<'tcx> AbiHashStable<'tcx> for Ty<'tcx> {
             | ty::CoroutineWitness(_, _)
             | ty::Never
             | ty::Tuple(_)
-            | ty::Alias(_, _)
+            | ty::Alias(_)
             | ty::Param(_)
             | ty::Bound(_, _)
             | ty::Placeholder(_)

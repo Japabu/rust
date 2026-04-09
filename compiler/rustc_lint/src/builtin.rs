@@ -39,8 +39,7 @@ pub use rustc_session::lint::builtin::*;
 use rustc_session::lint::fcw;
 use rustc_session::{declare_lint, declare_lint_pass, impl_lint_pass};
 use rustc_span::edition::Edition;
-use rustc_span::source_map::Spanned;
-use rustc_span::{DUMMY_SP, Ident, InnerSpan, Span, Symbol, kw, sym};
+use rustc_span::{DUMMY_SP, Ident, InnerSpan, Span, Spanned, Symbol, kw, sym};
 use rustc_target::asm::InlineAsmArch;
 use rustc_trait_selection::infer::{InferCtxtExt, TyCtxtInferExt};
 use rustc_trait_selection::traits;
@@ -1902,9 +1901,10 @@ impl KeywordIdents {
             return;
         }
 
-        cx.emit_span_lint(
+        cx.sess().psess.buffer_lint(
             lint,
             ident.span,
+            CRATE_NODE_ID,
             BuiltinKeywordIdents { kw: ident, next: edition, suggestion: ident.span, prefix },
         );
     }
@@ -2242,10 +2242,10 @@ impl<'tcx> LateLintPass<'tcx> for ExplicitOutlivesRequirements {
                     EXPLICIT_OUTLIVES_REQUIREMENTS,
                     lint_spans.clone(),
                     BuiltinExplicitOutlives {
-                        count: bound_count,
                         suggestion: BuiltinExplicitOutlivesSuggestion {
                             spans: lint_spans,
                             applicability,
+                            count: bound_count,
                         },
                     },
                 );

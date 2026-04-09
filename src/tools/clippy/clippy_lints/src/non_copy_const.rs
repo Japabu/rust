@@ -35,67 +35,12 @@ use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::mir::{ConstValue, UnevaluatedConst};
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, DerefAdjustKind};
 use rustc_middle::ty::{
-    self, AliasTyKind, EarlyBinder, GenericArgs, GenericArgsRef, Instance, Ty, TyCtxt, TypeFolder, TypeSuperFoldable,
-    TypeckResults, TypingEnv,
+    self, EarlyBinder, GenericArgs, GenericArgsRef, Instance, Ty, TyCtxt, TypeFolder, TypeSuperFoldable, TypeckResults,
+    TypingEnv,
 };
 use rustc_session::impl_lint_pass;
 use rustc_span::DUMMY_SP;
 use std::collections::hash_map::Entry;
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for the declaration of named constant which contain interior mutability.
-    ///
-    /// ### Why is this bad?
-    /// Named constants are copied at every use site which means any change to their value
-    /// will be lost after the newly created value is dropped. e.g.
-    ///
-    /// ```rust
-    /// use core::sync::atomic::{AtomicUsize, Ordering};
-    /// const ATOMIC: AtomicUsize = AtomicUsize::new(0);
-    /// fn add_one() -> usize {
-    ///     // This will always return `0` since `ATOMIC` is copied before it's used.
-    ///     ATOMIC.fetch_add(1, Ordering::AcqRel)
-    /// }
-    /// ```
-    ///
-    /// If shared modification of the value is desired, a `static` item is needed instead.
-    /// If that is not desired, a `const fn` constructor should be used to make it obvious
-    /// at the use site that a new value is created.
-    ///
-    /// ### Known problems
-    /// Prior to `const fn` stabilization this was the only way to provide a value which
-    /// could initialize a `static` item (e.g. the `std::sync::ONCE_INIT` constant). In
-    /// this case the use of `const` is required and this lint should be suppressed.
-    ///
-    /// There also exists types which contain private fields with interior mutability, but
-    /// no way to both create a value as a constant and modify any mutable field using the
-    /// type's public interface (e.g. `bytes::Bytes`). As there is no reasonable way to
-    /// scan a crate's interface to see if this is the case, all such types will be linted.
-    /// If this happens use the `ignore-interior-mutability` configuration option to allow
-    /// the type.
-    ///
-    /// ### Example
-    /// ```no_run
-    /// use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-    ///
-    /// const CONST_ATOM: AtomicUsize = AtomicUsize::new(12);
-    /// CONST_ATOM.store(6, SeqCst); // the content of the atomic is unchanged
-    /// assert_eq!(CONST_ATOM.load(SeqCst), 12); // because the CONST_ATOM in these lines are distinct
-    /// ```
-    ///
-    /// Use instead:
-    /// ```no_run
-    /// # use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-    /// static STATIC_ATOM: AtomicUsize = AtomicUsize::new(15);
-    /// STATIC_ATOM.store(9, SeqCst);
-    /// assert_eq!(STATIC_ATOM.load(SeqCst), 9); // use a `static` item to refer to the same instance
-    /// ```
-    #[clippy::version = "pre 1.29.0"]
-    pub DECLARE_INTERIOR_MUTABLE_CONST,
-    suspicious,
-    "declaring `const` with interior mutability"
-}
 
 declare_clippy_lint! {
     /// ### What it does
@@ -159,6 +104,66 @@ declare_clippy_lint! {
     style,
     "referencing `const` with interior mutability"
 }
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for the declaration of named constant which contain interior mutability.
+    ///
+    /// ### Why is this bad?
+    /// Named constants are copied at every use site which means any change to their value
+    /// will be lost after the newly created value is dropped. e.g.
+    ///
+    /// ```rust
+    /// use core::sync::atomic::{AtomicUsize, Ordering};
+    /// const ATOMIC: AtomicUsize = AtomicUsize::new(0);
+    /// fn add_one() -> usize {
+    ///     // This will always return `0` since `ATOMIC` is copied before it's used.
+    ///     ATOMIC.fetch_add(1, Ordering::AcqRel)
+    /// }
+    /// ```
+    ///
+    /// If shared modification of the value is desired, a `static` item is needed instead.
+    /// If that is not desired, a `const fn` constructor should be used to make it obvious
+    /// at the use site that a new value is created.
+    ///
+    /// ### Known problems
+    /// Prior to `const fn` stabilization this was the only way to provide a value which
+    /// could initialize a `static` item (e.g. the `std::sync::ONCE_INIT` constant). In
+    /// this case the use of `const` is required and this lint should be suppressed.
+    ///
+    /// There also exists types which contain private fields with interior mutability, but
+    /// no way to both create a value as a constant and modify any mutable field using the
+    /// type's public interface (e.g. `bytes::Bytes`). As there is no reasonable way to
+    /// scan a crate's interface to see if this is the case, all such types will be linted.
+    /// If this happens use the `ignore-interior-mutability` configuration option to allow
+    /// the type.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    ///
+    /// const CONST_ATOM: AtomicUsize = AtomicUsize::new(12);
+    /// CONST_ATOM.store(6, SeqCst); // the content of the atomic is unchanged
+    /// assert_eq!(CONST_ATOM.load(SeqCst), 12); // because the CONST_ATOM in these lines are distinct
+    /// ```
+    ///
+    /// Use instead:
+    /// ```no_run
+    /// # use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    /// static STATIC_ATOM: AtomicUsize = AtomicUsize::new(15);
+    /// STATIC_ATOM.store(9, SeqCst);
+    /// assert_eq!(STATIC_ATOM.load(SeqCst), 9); // use a `static` item to refer to the same instance
+    /// ```
+    #[clippy::version = "pre 1.29.0"]
+    pub DECLARE_INTERIOR_MUTABLE_CONST,
+    suspicious,
+    "declaring `const` with interior mutability"
+}
+
+impl_lint_pass!(NonCopyConst<'_> => [
+    BORROW_INTERIOR_MUTABLE_CONST,
+    DECLARE_INTERIOR_MUTABLE_CONST,
+]);
 
 #[derive(Clone, Copy)]
 enum IsFreeze {
@@ -256,8 +261,6 @@ pub struct NonCopyConst<'tcx> {
     // can be hit quite frequently.
     freeze_tys: FxHashMap<Ty<'tcx>, IsFreeze>,
 }
-
-impl_lint_pass!(NonCopyConst<'_> => [DECLARE_INTERIOR_MUTABLE_CONST, BORROW_INTERIOR_MUTABLE_CONST]);
 
 impl<'tcx> NonCopyConst<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>, conf: &'static Conf) -> Self {
@@ -881,7 +884,12 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReplaceAssocFolder<'tcx> {
     }
 
     fn fold_ty(&mut self, ty: Ty<'tcx>) -> Ty<'tcx> {
-        if let ty::Alias(AliasTyKind::Projection, ty) = ty.kind()
+        if let ty::Alias(
+            ty @ ty::AliasTy {
+                kind: ty::Projection { .. },
+                ..
+            },
+        ) = ty.kind()
             && ty.trait_def_id(self.tcx) == self.trait_id
             && ty.self_ty() == self.self_ty
         {

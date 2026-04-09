@@ -158,9 +158,9 @@ then runs the compiler for each revision, reusing the incremental results from p
 
 The revisions should start with:
 
-* `rpass` — the test should compile and run successfully
-* `rfail` — the test should compile successfully, but the executable should fail to run
 * `cfail` — the test should fail to compile
+* `cpass` — the test should compile successully
+* `rpass` — the test should compile and run successfully
 
 To make the revisions unique, you should add a suffix like `rpass1` and `rpass2`.
 
@@ -836,3 +836,20 @@ In CI, compare modes are only used in one Linux builder, and only with the follo
 Note that compare modes are separate to [revisions](#revisions).
 All revisions are tested when running `./x test tests/ui`, however compare-modes must be
 manually run individually via the `--compare-mode` flag.
+
+## Parallel frontend
+
+Compiletest can be run with the `--parallel-frontend-threads` flag to run the compiler in parallel mode.
+This can be used to check that the compiler produces the same output in parallel mode as in non-parallel mode, and to check for any issues that might arise in parallel mode.
+
+To run the tests in parallel mode, you need to pass the `--parallel-frontend-threads` CLI flag:
+
+```bash
+./x test tests/ui -- --parallel-frontend-threads=N --iteration-count=M
+```
+
+Where `N` is the number of threads to use for the parallel frontend, and `M` is the number of times to run each test in parallel mode (to increase the chances of catching any non-determinism).
+
+Also, when running with `--parallel-frontend-threads`, the `compare-output-by-lines` directive would be implied for all tests, since the output from the parallel frontend can be non-deterministic in terms of the order of lines.
+
+The parallel frontend is available in UI tests only at the moment, and is not currently supported in other test suites.

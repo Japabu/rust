@@ -15,14 +15,16 @@ use rustc_hir::LangItem;
 use rustc_macros::{Decodable, Encodable, HashStable_Generic, PrintAttribute};
 use rustc_span::def_id::DefId;
 use rustc_span::hygiene::Transparency;
-use rustc_span::{ErrorGuaranteed, Ident, Span, Symbol};
+use rustc_span::{ErrorGuaranteed, Ident, Span, Symbol, sym};
 pub use rustc_target::spec::SanitizerSet;
 use thin_vec::ThinVec;
 
 use crate::attrs::diagnostic::*;
 use crate::attrs::pretty_printing::PrintAttribute;
 use crate::limit::Limit;
-use crate::{DefaultBodyStability, PartialConstStability, RustcVersion, Stability};
+use crate::{
+    DefaultBodyStability, HashIgnoredAttrId, PartialConstStability, RustcVersion, Stability,
+};
 
 #[derive(Copy, Clone, Debug, HashStable_Generic, Encodable, Decodable, PrintAttribute)]
 pub enum EiiImplResolution {
@@ -277,15 +279,15 @@ impl Default for MacroUseArgs {
 }
 
 #[derive(Debug, Clone, Encodable, Decodable, HashStable_Generic)]
-pub struct StrippedCfgItem<ModId = DefId> {
-    pub parent_module: ModId,
+pub struct StrippedCfgItem<ScopeId = DefId> {
+    pub parent_scope: ScopeId,
     pub ident: Ident,
     pub cfg: (CfgEntry, Span),
 }
 
-impl<ModId> StrippedCfgItem<ModId> {
-    pub fn map_mod_id<New>(self, f: impl FnOnce(ModId) -> New) -> StrippedCfgItem<New> {
-        StrippedCfgItem { parent_module: f(self.parent_module), ident: self.ident, cfg: self.cfg }
+impl<ScopeId> StrippedCfgItem<ScopeId> {
+    pub fn map_scope_id<New>(self, f: impl FnOnce(ScopeId) -> New) -> StrippedCfgItem<New> {
+        StrippedCfgItem { parent_scope: f(self.parent_scope), ident: self.ident, cfg: self.cfg }
     }
 }
 
@@ -894,6 +896,143 @@ impl fmt::Display for AutoDiffItem {
     }
 }
 
+#[derive(Clone, Debug, HashStable_Generic, Encodable, Decodable, PrintAttribute)]
+pub struct LintAttribute {
+    /// See RFC #2383
+    pub reason: Option<Symbol>,
+    pub kind: LintAttributeKind,
+    pub attr_style: AttrStyle,
+    pub attr_span: Span,
+    /// Needed by `LintExpectationId` to track fulfilled expectations
+    pub attr_id: HashIgnoredAttrId,
+    pub lint_instances: ThinVec<LintInstance>,
+}
+
+#[derive(Debug, Clone, Encodable, Decodable, HashStable_Generic)]
+pub struct LintInstance {
+    /// The span of the `MetaItem` that produced this `LintInstance`
+    span: Span,
+    /// The fully resolved name of the lint
+    /// for renamed lints, this gets updated to match the new name
+    lint_name: Symbol,
+    /// The raw identifier for resolving this lint
+    /// if this is none, lint_name never diffed from the original
+    /// name after parsing, original_name.unwrap_or(self.lint_name)
+    original_name: Option<Symbol>,
+    /// Index of this lint, used to keep track of lint groups
+    lint_index: usize,
+    kind: LintAttrTool,
+}
+
+impl fmt::Display for LintInstance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.full_lint().fmt(f)
+    }
+}
+
+impl LintInstance {
+    pub fn new(
+        original_name: Symbol,
+        long_lint_name: String,
+        span: Span,
+        lint_index: usize,
+    ) -> Self {
+        let original_name = (original_name.as_str() != long_lint_name).then_some(original_name);
+        let mut tool_name = None;
+
+        let lint_name = match long_lint_name.split_once("::") {
+            Some((new_tool_name, lint_name)) => {
+                tool_name = Some(Symbol::intern(new_tool_name));
+                Symbol::intern(lint_name)
+            }
+            None => Symbol::intern(&long_lint_name),
+        };
+        let kind = match tool_name {
+            Some(tool_name) => {
+                let full_lint = Symbol::intern(&format!("{tool_name}::{lint_name}",));
+                LintAttrTool::Present { tool_name, full_lint }
+            }
+            None => LintAttrTool::NoTool,
+        };
+
+        Self { original_name, span, lint_index, lint_name, kind }
+    }
+
+    pub fn full_lint(&self) -> Symbol {
+        match self.kind {
+            LintAttrTool::Present { full_lint, .. } => full_lint,
+            LintAttrTool::NoTool => self.lint_name,
+        }
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
+    }
+
+    pub fn lint_index(&self) -> usize {
+        self.lint_index
+    }
+
+    pub fn lint_name(&self) -> Symbol {
+        self.lint_name
+    }
+
+    pub fn original_name_without_tool(&self) -> Symbol {
+        let full_original_lint_name = self.original_lint_name();
+        match self.kind {
+            LintAttrTool::Present { tool_name, .. } => Symbol::intern(
+                full_original_lint_name
+                    .as_str()
+                    .trim_start_matches(tool_name.as_str())
+                    .trim_start_matches("::"),
+            ),
+            LintAttrTool::NoTool => full_original_lint_name,
+        }
+    }
+
+    pub fn tool_name(&self) -> Option<Symbol> {
+        if let LintAttrTool::Present { tool_name, .. } = self.kind { Some(tool_name) } else { None }
+    }
+
+    pub fn tool_is_named(&self, other: Symbol) -> bool {
+        self.tool_name().is_some_and(|tool_name| tool_name == other)
+    }
+
+    pub fn original_lint_name(&self) -> Symbol {
+        match self.original_name {
+            Some(name) => name,
+            None => self.full_lint(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PrintAttribute, Encodable, Decodable, HashStable_Generic)]
+enum LintAttrTool {
+    Present { tool_name: Symbol, full_lint: Symbol },
+    NoTool,
+}
+
+#[derive(Clone, Copy, Debug, HashStable_Generic, Encodable, Decodable, PrintAttribute, PartialEq)]
+pub enum LintAttributeKind {
+    Allow,
+    Deny,
+    Expect,
+    Forbid,
+    Warn,
+}
+
+impl LintAttributeKind {
+    pub const fn symbol(&self) -> Symbol {
+        match self {
+            Self::Allow => sym::allow,
+            Self::Deny => sym::deny,
+            Self::Expect => sym::expect,
+            Self::Forbid => sym::forbid,
+            Self::Warn => sym::warn,
+        }
+    }
+}
+
 /// Represents parsed *built-in* inert attributes.
 ///
 /// ## Overview
@@ -1097,6 +1236,9 @@ pub enum AttributeKind {
     /// Represents `#[linkage]`.
     Linkage(Linkage, Span),
 
+    /// Represents `#[allow]`, `#[expect]`, `#[warn]`, `#[deny]`, `#[forbid]`
+    LintAttributes(ThinVec<LintAttribute>),
+
     /// Represents `#[loop_match]`.
     LoopMatch(Span),
 
@@ -1180,13 +1322,18 @@ pub enum AttributeKind {
         directive: Option<Box<Directive>>,
     },
 
+    /// Represents `#[diagnostic::on_move]`
+    OnMove {
+        span: Span,
+        directive: Option<Box<Directive>>,
+    },
+
     /// Represents `#[rustc_on_unimplemented]` and `#[diagnostic::on_unimplemented]`.
     OnUnimplemented {
         span: Span,
         /// None if the directive was malformed in some way.
         directive: Option<Box<Directive>>,
     },
-
     /// Represents `#[optimize(size|speed)]`
     Optimize(OptimizeAttr, Span),
 
@@ -1366,14 +1513,26 @@ pub enum AttributeKind {
     /// Represents `#[rustc_dump_def_parents]`
     RustcDumpDefParents,
 
+    /// Represents `#[rustc_dump_inferred_outlives]`
+    RustcDumpInferredOutlives,
+
     /// Represents `#[rustc_dump_item_bounds]`
     RustcDumpItemBounds,
+
+    /// Represents `#[rustc_dump_object_lifetime_defaults]`.
+    RustcDumpObjectLifetimeDefaults,
 
     /// Represents `#[rustc_dump_predicates]`
     RustcDumpPredicates,
 
     /// Represents `#[rustc_dump_user_args]`
     RustcDumpUserArgs,
+
+    /// Represents `#[rustc_dump_variances]`
+    RustcDumpVariances,
+
+    /// Represents `#[rustc_dump_variances_of_opaques]`
+    RustcDumpVariancesOfOpaques,
 
     /// Represents `#[rustc_dump_vtable]`
     RustcDumpVtable(Span),
@@ -1493,14 +1652,8 @@ pub enum AttributeKind {
         span: Span,
     },
 
-    /// Represents `#[rustc_object_lifetime_default]`.
-    RustcObjectLifetimeDefault,
-
     /// Represents `#[rustc_offload_kernel]`
     RustcOffloadKernel,
-
-    /// Represents `#[rustc_outlives]`
-    RustcOutlives,
 
     /// Represents `#[rustc_paren_sugar]`.
     RustcParenSugar(Span),
@@ -1573,12 +1726,6 @@ pub enum AttributeKind {
 
     /// Represents `#[rustc_unsafe_specialization_marker]`.
     RustcUnsafeSpecializationMarker(Span),
-
-    /// Represents `#[rustc_variance]`
-    RustcVariance,
-
-    /// Represents `#[rustc_variance_of_opaques]`
-    RustcVarianceOfOpaques,
 
     /// Represents `#[sanitize]`
     ///

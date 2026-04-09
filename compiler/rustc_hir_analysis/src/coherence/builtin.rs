@@ -184,6 +184,26 @@ fn visit_implementation_of_const_param_ty(checker: &Checker<'_>) -> Result<(), E
         return Ok(());
     }
 
+    if !tcx.features().adt_const_params() {
+        match *self_type.kind() {
+            ty::Adt(adt, _) if adt.is_struct() => {
+                let struct_vis = tcx.visibility(adt.did());
+                for variant in adt.variants() {
+                    for field in &variant.fields {
+                        if !field.vis.is_at_least(struct_vis, tcx) {
+                            let span = tcx.hir_expect_item(impl_did).expect_impl().self_ty.span;
+                            return Err(tcx
+                                .dcx()
+                                .emit_err(errors::ConstParamTyFieldVisMismatch { span }));
+                        }
+                    }
+                }
+            }
+
+            _ => {}
+        }
+    }
+
     let cause = traits::ObligationCause::misc(DUMMY_SP, impl_did);
     match type_allowed_to_implement_const_param_ty(tcx, param_env, self_type, cause) {
         Ok(()) => Ok(()),
@@ -226,7 +246,7 @@ fn visit_implementation_of_coerce_unsized(checker: &Checker<'_>) -> Result<(), E
     // Just compute this for the side-effects, in particular reporting
     // errors; other parts of the code may demand it for the info of
     // course.
-    tcx.ensure_ok().coerce_unsized_info(impl_did)
+    tcx.ensure_result().coerce_unsized_info(impl_did)
 }
 
 fn is_from_coerce_pointee_derive(tcx: TyCtxt<'_>, span: Span) -> bool {
@@ -259,7 +279,7 @@ fn visit_implementation_of_dispatch_from_dyn(checker: &Checker<'_>) -> Result<()
         tcx.require_lang_item(LangItem::CoerceUnsized, span),
         source,
         |impl_def_id| {
-            res = res.and(tcx.ensure_ok().coerce_unsized_info(impl_def_id));
+            res = res.and(tcx.ensure_result().coerce_unsized_info(impl_def_id));
         },
     );
     res?;

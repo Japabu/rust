@@ -539,7 +539,7 @@ impl<'tcx> Printer<'tcx> for V0SymbolMangler<'tcx> {
 
             // We may still encounter projections here due to the printing
             // logic sometimes passing identity-substituted impl headers.
-            ty::Alias(ty::Projection, ty::AliasTy { def_id, args, .. }) => {
+            ty::Alias(ty::AliasTy { kind: ty::Projection { def_id }, args, .. }) => {
                 self.print_def_path(def_id, args)?;
             }
 
@@ -841,7 +841,7 @@ impl<'tcx> Printer<'tcx> for V0SymbolMangler<'tcx> {
     fn print_crate_name(&mut self, cnum: CrateNum) -> Result<(), PrintError> {
         self.push("C");
         if !self.is_exportable {
-            let stable_crate_id = self.tcx.def_path_hash(cnum.as_def_id()).stable_crate_id();
+            let stable_crate_id = self.tcx.stable_crate_id(cnum);
             self.push_disambiguator(stable_crate_id.as_u64());
         }
         let name = self.tcx.crate_name(cnum);

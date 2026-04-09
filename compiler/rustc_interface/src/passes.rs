@@ -21,9 +21,12 @@ use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::{LOCAL_CRATE, StableCrateId, StableCrateIdMap};
 use rustc_hir::definitions::Definitions;
 use rustc_hir::limit::Limit;
-use rustc_hir::{Attribute, find_attr};
+use rustc_hir::lints::DelayedLint;
+use rustc_hir::{Attribute, MaybeOwner, Target, find_attr};
 use rustc_incremental::setup_dep_graph;
-use rustc_lint::{BufferedEarlyLint, EarlyCheckNode, LintStore, unerased_lint_store};
+use rustc_lint::{
+    BufferedEarlyLint, DecorateAttrLint, EarlyCheckNode, LintStore, unerased_lint_store,
+};
 use rustc_metadata::EncodedMetadata;
 use rustc_metadata::creader::CStore;
 use rustc_middle::arena::Arena;
@@ -116,11 +119,10 @@ impl LintStoreExpand for LintStoreExpandImpl<'_> {
         features: &Features,
         registered_tools: &RegisteredTools,
         node_id: ast::NodeId,
-        attrs: &[ast::Attribute],
         items: &[Box<ast::Item>],
         name: Symbol,
     ) {
-        pre_expansion_lint(sess, features, self.0, registered_tools, (node_id, attrs, items), name);
+        pre_expansion_lint(sess, features, self.0, registered_tools, (node_id, items), name);
     }
 }
 
@@ -495,7 +497,7 @@ fn env_var_os<'tcx>(tcx: TyCtxt<'tcx>, key: &'tcx OsStr) -> Option<&'tcx OsStr> 
     // NOTE: This only works for passes run before `write_dep_info`. See that
     // for extension points for configuring environment variables to be
     // properly change-tracked.
-    tcx.sess.psess.env_depinfo.borrow_mut().insert((
+    tcx.sess.env_depinfo.borrow_mut().insert((
         Symbol::intern(&key.to_string_lossy()),
         value.as_ref().and_then(|value| value.to_str()).map(|value| Symbol::intern(value)),
     ));
@@ -607,7 +609,7 @@ fn write_out_deps(tcx: TyCtxt<'_>, outputs: &OutputFilenames, out_filenames: &[P
 
         // Account for explicitly marked-to-track files
         // (e.g. accessed in proc macros).
-        let file_depinfo = sess.psess.file_depinfo.borrow();
+        let file_depinfo = sess.file_depinfo.borrow();
 
         let normalize_path = |path: PathBuf| escape_dep_filename(&path.to_string_lossy());
 
@@ -719,7 +721,7 @@ fn write_out_deps(tcx: TyCtxt<'_>, outputs: &OutputFilenames, out_filenames: &[P
             }
 
             // Emit special comments with information about accessed environment variables.
-            let env_depinfo = sess.psess.env_depinfo.borrow();
+            let env_depinfo = sess.env_depinfo.borrow();
             if !env_depinfo.is_empty() {
                 // We will soon sort, so the initial order does not matter.
                 #[allow(rustc::potential_query_instability)]
@@ -781,7 +783,7 @@ fn write_out_deps(tcx: TyCtxt<'_>, outputs: &OutputFilenames, out_filenames: &[P
 fn resolver_for_lowering_raw<'tcx>(
     tcx: TyCtxt<'tcx>,
     (): (),
-) -> (&'tcx Steal<(ty::ResolverAstLowering, Arc<ast::Crate>)>, &'tcx ty::ResolverGlobalCtxt) {
+) -> (&'tcx Steal<(ty::ResolverAstLowering<'tcx>, Arc<ast::Crate>)>, &'tcx ty::ResolverGlobalCtxt) {
     let arenas = Resolver::arenas();
     let _ = tcx.registered_tools(()); // Uses `crate_for_resolver`.
     let (krate, pre_configured_attrs) = tcx.crate_for_resolver(()).steal();
@@ -878,6 +880,10 @@ pub static DEFAULT_QUERY_PROVIDERS: LazyLock<Providers> = LazyLock::new(|| {
     let providers = &mut Providers::default();
     providers.queries.analysis = analysis;
     providers.queries.hir_crate = rustc_ast_lowering::lower_to_hir;
+    providers.queries.lower_delayed_owner = rustc_ast_lowering::lower_delayed_owner;
+    // `delayed_owner` is fed during `lower_delayed_owner`, by default it returns phantom,
+    // as if this query was not fed it means that `MaybeOwner` does not exist for provided LocalDefId.
+    providers.queries.delayed_owner = |_, _| MaybeOwner::Phantom;
     providers.queries.resolver_for_lowering_raw = resolver_for_lowering_raw;
     providers.queries.stripped_cfg_items = |tcx, _| &tcx.resolutions(()).stripped_cfg_items[..];
     providers.queries.resolutions = |tcx, ()| tcx.resolver_for_lowering_raw(()).1;
@@ -964,6 +970,17 @@ pub fn create_and_enter_global_ctxt<T, F: for<'tcx> FnOnce(TyCtxt<'tcx>) -> T>(
 
     let incremental = dep_graph.is_fully_enabled();
 
+    // Note: this function body is the origin point of the widely-used 'tcx lifetime.
+    //
+    // `gcx_cell` is defined here and `&gcx_cell` is passed to `create_global_ctxt`, which then
+    // actually creates the `GlobalCtxt` with a `gcx_cell.get_or_init(...)` call. This is done so
+    // that the resulting reference has the type `&'tcx GlobalCtxt<'tcx>`, which is what `TyCtxt`
+    // needs. If we defined and created the `GlobalCtxt` within `create_global_ctxt` then its type
+    // would be `&'a GlobalCtxt<'tcx>`, with two lifetimes.
+    //
+    // Similarly, by creating `arena` here and passing in `&arena`, that reference has the type
+    // `&'tcx WorkerLocal<Arena<'tcx>>`, also with one lifetime. And likewise for `hir_arena`.
+
     let gcx_cell = OnceLock::new();
     let arena = WorkerLocal::new(|_| Arena::default());
     let hir_arena = WorkerLocal::new(|_| rustc_hir::Arena::default());
@@ -1010,9 +1027,36 @@ pub fn create_and_enter_global_ctxt<T, F: for<'tcx> FnOnce(TyCtxt<'tcx>) -> T>(
     )
 }
 
+pub fn emit_delayed_lints(tcx: TyCtxt<'_>) {
+    for owner_id in tcx.hir_crate_items(()).delayed_lint_items() {
+        if let Some(delayed_lints) = tcx.opt_ast_lowering_delayed_lints(owner_id) {
+            for lint in &delayed_lints.lints {
+                match lint {
+                    DelayedLint::AttributeParsing(attribute_lint) => {
+                        tcx.emit_node_span_lint(
+                            attribute_lint.lint_id.lint,
+                            attribute_lint.id,
+                            attribute_lint.span,
+                            DecorateAttrLint {
+                                sess: tcx.sess,
+                                tcx: Some(tcx),
+                                diagnostic: &attribute_lint.kind,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Runs all analyses that we guarantee to run, even if errors were reported in earlier analyses.
 /// This function never fails.
 fn run_required_analyses(tcx: TyCtxt<'_>) {
+    // Forces all delayed owners to be lowered and drops AST crate after it.
+    // Also refetches hir_crate_items to prevent multiple threads from blocking on it later.
+    tcx.force_delayed_owners_lowering();
+
     if tcx.sess.opts.unstable_opts.input_stats {
         rustc_passes::input_stats::print_hir_stats(tcx);
     }
@@ -1020,11 +1064,6 @@ fn run_required_analyses(tcx: TyCtxt<'_>) {
     // is not defined. So we need to cfg it out.
     #[cfg(all(not(doc), debug_assertions))]
     rustc_passes::hir_id_validator::check_crate(tcx);
-
-    // Prefetch this to prevent multiple threads from blocking on it later.
-    // This is needed since the `hir_id_validator::check_crate` call above is not guaranteed
-    // to use `hir_crate_items`.
-    tcx.ensure_done().hir_crate_items(());
 
     let sess = tcx.sess;
     sess.time("misc_checking_1", || {
@@ -1057,6 +1096,32 @@ fn run_required_analyses(tcx: TyCtxt<'_>) {
                 tcx.ensure_ok().limits(());
             },
         ]);
+    });
+
+    sess.time("emit_ast_lowering_delayed_lints", || {
+        // Sanity check in debug mode that all lints are really noticed and we really will emit
+        // them all in the loop right below.
+        //
+        // During ast lowering, when creating items, foreign items, trait items and impl items,
+        // we store in them whether they have any lints in their owner node that should be
+        // picked up by `hir_crate_items`. However, theoretically code can run between that
+        // boolean being inserted into the item and the owner node being created. We don't want
+        // any new lints to be emitted there (you have to really try to manage that but still),
+        // but this check is there to catch that.
+        #[cfg(debug_assertions)]
+        {
+            let hir_items = tcx.hir_crate_items(());
+            for owner_id in hir_items.owners() {
+                if let Some(delayed_lints) = tcx.opt_ast_lowering_delayed_lints(owner_id) {
+                    if !delayed_lints.lints.is_empty() {
+                        // Assert that delayed_lint_items also picked up this item to have lints.
+                        assert!(hir_items.delayed_lint_items().any(|i| i == owner_id));
+                    }
+                }
+            }
+        }
+
+        emit_delayed_lints(tcx);
     });
 
     rustc_hir_analysis::check_crate(tcx);
@@ -1306,6 +1371,7 @@ pub(crate) fn parse_crate_name(
             sym::crate_name,
             DUMMY_SP,
             rustc_ast::node_id::CRATE_NODE_ID,
+            Target::Crate,
             None,
             emit_errors,
         )?
@@ -1355,6 +1421,7 @@ pub fn collect_crate_types(
                 sym::crate_type,
                 crate_span,
                 CRATE_NODE_ID,
+                Target::Crate,
                 None,
                 ShouldEmit::EarlyFatal { also_emit_lints: false },
             )
@@ -1411,6 +1478,7 @@ fn get_recursion_limit(krate_attrs: &[ast::Attribute], sess: &Session) -> Limit 
         sym::recursion_limit,
         DUMMY_SP,
         rustc_ast::node_id::CRATE_NODE_ID,
+        Target::Crate,
         None,
         // errors are fatal here, but lints aren't.
         // If things aren't fatal we continue, and will parse this again.
@@ -1418,5 +1486,5 @@ fn get_recursion_limit(krate_attrs: &[ast::Attribute], sess: &Session) -> Limit 
         // So, no lints here to avoid duplicates.
         ShouldEmit::EarlyFatal { also_emit_lints: false },
     );
-    crate::limits::get_recursion_limit(attr.as_slice())
+    crate::limits::get_recursion_limit(attr.as_slice(), sess)
 }

@@ -1,14 +1,15 @@
+#![attr = LintAttributes([LintAttribute {kind: Allow, attr_style: Inner,
+lint_instances: [incomplete_features]}])]
+#![attr = Feature([fn_delegation#0])]
+extern crate std;
+#[attr = PreludeImport]
+use std::prelude::rust_2021::*;
 //@ edition:2021
 //@ aux-crate:to_reuse_functions=to-reuse-functions.rs
 //@ pretty-mode:hir
 //@ pretty-compare-only
 //@ pp-exact:delegation-inherit-attributes.pp
 
-#![allow(incomplete_features)]
-#![attr = Feature([fn_delegation#0])]
-extern crate std;
-#[attr = PreludeImport]
-use std::prelude::rust_2021::*;
 
 extern crate to_reuse_functions;
 
@@ -117,7 +118,7 @@ mod recursive {
         fn foo<Self>(self: _, arg1: _) -> _ { <X as T>::foo(self + 1, arg1) }
         #[attr = MustUse {reason: "some reason"}]
         #[attr = Inline(Hint)]
-        fn bar(self: _, arg1: _) -> _ { foo(self + 1, arg1) }
+        fn bar<Self>(arg0: _, arg1: _) -> _ { foo(self + 1, arg1) }
     }
 }
 
