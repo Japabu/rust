@@ -982,6 +982,7 @@ dependencies = [
 [[package]]
 name = "ctrlc"
 version = "3.5.1"
+source = "git+https://github.com/Japabu/rust-ctrlc?branch=toyos#d43aea5072826331f81017a2bbbf9a85e9c03322"
 dependencies = [
  "dispatch2",
  "nix 0.31.2",
@@ -1568,23 +1569,23 @@ dependencies = [
 [[package]]
 name = "getrandom"
 version = "0.2.17"
-source = "git+https://github.com/Japabu/getrandom?branch=toyos-v0.2#c473bb1022335e22fb5e997f69d5c00c8ac0b2c5"
+source = "git+https://github.com/Japabu/getrandom?branch=toyos-0.2#465924141d49c57cf5df6ccb6e5fb780ee98e51e"
 dependencies = [
  "cfg-if",
  "libc",
- "toyos-abi 0.1.0 (git+https://github.com/Japabu/toyos-abi)",
+ "toyos-abi",
  "wasi 0.11.1+wasi-snapshot-preview1",
 ]
 
 [[package]]
 name = "getrandom"
 version = "0.3.4"
-source = "git+https://github.com/Japabu/getrandom?branch=toyos-v0.3#bb423bc0173b1548fff892e4fdb9843bebe1083f"
+source = "git+https://github.com/Japabu/getrandom?branch=toyos-0.3#d3045447861333fd6bef7faaa49d42030003dc51"
 dependencies = [
  "cfg-if",
  "libc",
  "r-efi",
- "toyos-abi 0.1.0 (git+https://github.com/Japabu/toyos-abi)",
+ "toyos-abi",
  "wasip2",
 ]
 
@@ -2223,9 +2224,10 @@ dependencies = [
 [[package]]
 name = "libloading"
 version = "0.8.9"
+source = "git+https://github.com/Japabu/rust_libloading?branch=toyos#2ca5f54b09bcadaa6ef72af94d94724e143b5820"
 dependencies = [
  "cfg-if",
- "toyos-abi 0.1.0",
+ "toyos-abi",
  "windows-link 0.2.1",
 ]
 
@@ -2422,6 +2424,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 [[package]]
 name = "memmap2"
 version = "0.2.1"
+source = "git+https://github.com/Japabu/memmap2-rs?branch=toyos#e5475d3864973ea1b9a1b411b0fa7c376cff2878"
 dependencies = [
  "libc",
 ]
@@ -3100,6 +3103,7 @@ dependencies = [
 [[package]]
 name = "psm"
 version = "0.1.30"
+source = "git+https://github.com/Japabu/stacker?branch=toyos#5a4818d87962752d4025e3acf550448587fc71cc"
 dependencies = [
  "ar_archive_writer",
  "cc",
@@ -5334,12 +5338,13 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stacker"
 version = "0.1.23"
+source = "git+https://github.com/Japabu/stacker?branch=toyos#5a4818d87962752d4025e3acf550448587fc71cc"
 dependencies = [
  "cc",
  "cfg-if",
  "libc",
  "psm",
- "toyos-abi 0.1.0",
+ "toyos-abi",
  "windows-sys 0.59.0",
 ]
 
@@ -5812,11 +5817,6 @@ checksum = "d282ade6016312faf3e41e57ebbba0c073e4056dab1232ab1cb624199648f8ed"
 [[package]]
 name = "toyos-abi"
 version = "0.1.0"
-
-[[package]]
-name = "toyos-abi"
-version = "0.1.0"
-source = "git+https://github.com/Japabu/toyos-abi#2fe0c57be9d7a9e8e4eff804eb92666edffd51e5"
 
 [[package]]
 name = "tracing"

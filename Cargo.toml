@@ -92,9 +92,10 @@ codegen-units = 1
 # If you want to use a crate with local modifications, you can set a path or git dependency here.
 # For git dependencies, also add your source to ALLOWED_SOURCES in src/tools/tidy/src/extdeps.rs.
 [patch.crates-io]
-libloading = { path = "../userland/libloading" }
-memmap2 = { path = "../userland/memmap2" }
-stacker = { path = "../userland/stacker" }
-getrandom = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.2", package = "getrandom" }
-getrandom03 = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.3", package = "getrandom" }
-ctrlc = { path = "../userland/ctrlc" }
+toyos-abi = { path = "../toyos-abi" }
+libloading = { git = "https://github.com/Japabu/rust_libloading", branch = "toyos" }
+memmap2 = { git = "https://github.com/Japabu/memmap2-rs", branch = "toyos" }
+stacker = { git = "https://github.com/Japabu/stacker", branch = "toyos" }
+getrandom = { git = "https://github.com/Japabu/getrandom", branch = "toyos-0.2", package = "getrandom" }
+getrandom03 = { git = "https://github.com/Japabu/getrandom", branch = "toyos-0.3", package = "getrandom" }
+ctrlc = { git = "https://github.com/Japabu/rust-ctrlc", branch = "toyos" }
