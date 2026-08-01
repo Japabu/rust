@@ -17,6 +17,7 @@ fn to_io_error(e: SyscallError) -> io::Error {
         SyscallError::AlreadyExists => io::ErrorKind::AlreadyExists,
         SyscallError::InvalidArgument => io::ErrorKind::InvalidInput,
         SyscallError::WouldBlock => io::ErrorKind::WouldBlock,
+        SyscallError::ResourceExhausted => io::ErrorKind::OutOfMemory,
         _ => io::ErrorKind::Other,
     };
     io::Error::from(kind)
@@ -356,13 +357,52 @@ impl fmt::Debug for File {
     }
 }
 
+/// Whether `path` names a directory, asked through `readdir`.
+///
+/// `open` only works for files, so this is the only way to tell. The buffer is
+/// deliberately tiny: the kernel reports the size the listing *needs* whether
+/// or not it fits, so the answer is in the return value and the bytes are not
+/// wanted. A directory too large to list is still a directory, which is why
+/// `ResourceExhausted` is a yes.
+fn is_dir(path_bytes: &[u8]) -> bool {
+    let mut buf = [0u8; 1];
+    match syscall::readdir(path_bytes, &mut buf) {
+        Ok(n) => n > 0,
+        Err(SyscallError::ResourceExhausted) => true,
+        Err(_) => false,
+    }
+}
+
 pub fn readdir(p: &Path) -> io::Result<ReadDir> {
     let path_bytes = p.as_os_str().as_encoded_bytes();
+
+    // The kernel writes the listing only if all of it fits and otherwise
+    // reports the size it needs, so a short buffer costs a second call and
+    // never a short answer. Bounded retries rather than the single one `cwd`
+    // does: only this process changes its own cwd, while any process can add
+    // a file to a directory between the sizing call and the reading one.
+    // Four is a bound rather than a tuned number — a directory that outgrows
+    // its own listing four times running is not going to be listed by waiting
+    // longer, and an unbounded loop here would be a livelock any process could
+    // drive.
+    const ATTEMPTS: usize = 4;
     let mut buf = vec![0u8; 65536];
-    let n = syscall::readdir(path_bytes, &mut buf);
-    if n == 0 {
-        // Could be empty dir or not found — try to distinguish
-        // For now treat 0 as empty dir
+    let mut n = 0;
+    let mut fits = false;
+    for _ in 0..ATTEMPTS {
+        n = syscall::readdir(path_bytes, &mut buf).map_err(to_io_error)?;
+        if n <= buf.len() {
+            fits = true;
+            break;
+        }
+        buf.clear();
+        buf.resize(n, 0);
+    }
+    if !fits {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "directory kept growing while it was being listed",
+        ));
     }
 
     let data = &buf[..n];
@@ -431,11 +471,7 @@ pub fn exists(path: &Path) -> io::Result<bool> {
         syscall::close(fd);
         return Ok(true);
     }
-    // open() only works for files — check if it's a directory via readdir.
-    // Buffer must be large enough to hold at least one entry.
-    let mut buf = [0u8; 512];
-    let n = syscall::readdir(path_bytes, &mut buf);
-    Ok(n > 0)
+    Ok(is_dir(path_bytes))
 }
 
 pub fn readlink(p: &Path) -> io::Result<PathBuf> {
@@ -464,12 +500,8 @@ pub fn stat(path: &Path) -> io::Result<FileAttr> {
         let st = result.map_err(to_io_error)?;
         return Ok(FileAttr { size: st.size, file_type: st.file_type, mtime: st.mtime, is_symlink: false });
     }
-    // open() only works for files — check if it's a directory via readdir.
-    // Buffer must be large enough to hold at least one entry (type + name + null + size).
-    let mut buf = [0u8; 512];
-    let n = syscall::readdir(path_bytes, &mut buf);
-    if n > 0 {
-        return Ok(FileAttr { size: 0, file_type: syscall::FileType::Pipe, mtime: 0, is_symlink: false }); // directory
+    if is_dir(path_bytes) {
+        return Ok(FileAttr { size: 0, file_type: syscall::FileType::Pipe, mtime: 0, is_symlink: false });
     }
     Err(io::Error::new(io::ErrorKind::NotFound, "file not found"))
 }
