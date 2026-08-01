@@ -4,12 +4,33 @@ use crate::path::{self, PathBuf};
 use crate::{fmt, io};
 
 pub fn getcwd() -> io::Result<PathBuf> {
+    // `getcwd` returns the length the path *needs*, so a return that exceeds
+    // the buffer means nothing was written and names the size to retry with.
+    // The fixed buffer alone was a silent-truncation bug: any cwd past 256
+    // bytes came back as a shorter, valid-looking path to a *different*
+    // directory, and every path derived from it pointed somewhere wrong.
     let mut buf = [0u8; 256];
     let n = toyos_abi::syscall::getcwd(&mut buf);
     if n == 0 {
         return Err(io::Error::new(io::ErrorKind::Other, "getcwd failed"));
     }
-    let s = core::str::from_utf8(&buf[..n])
+    if n <= buf.len() {
+        return path_from_utf8(&buf[..n]);
+    }
+
+    // Too long for the stack buffer: allocate exactly what it asked for. The
+    // kernel bounds cwd, so this retries once rather than looping.
+    let mut heap: crate::vec::Vec<u8> = crate::vec::Vec::new();
+    heap.resize(n, 0);
+    let got = toyos_abi::syscall::getcwd(&mut heap);
+    if got == 0 || got > heap.len() {
+        return Err(io::Error::new(io::ErrorKind::Other, "getcwd failed"));
+    }
+    path_from_utf8(&heap[..got])
+}
+
+fn path_from_utf8(bytes: &[u8]) -> io::Result<PathBuf> {
+    let s = core::str::from_utf8(bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "invalid utf-8 in cwd"))?;
     Ok(PathBuf::from(s))
 }
