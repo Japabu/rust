@@ -21,9 +21,9 @@ use rustc_infer::traits::solve::Goal;
 use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, PointerCoercion};
 use rustc_middle::ty::{
-    self, DefiningScopeKind, DefinitionSiteHiddenType, Ty, TyCtxt, TypeFoldable, TypeFolder,
+    self, DefiningScopeKind, DefinitionSiteHiddenType, Flags, Ty, TyCtxt, TypeFoldable, TypeFolder,
     TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
-    fold_regions,
+    Unnormalized, fold_regions,
 };
 use rustc_span::Span;
 use rustc_trait_selection::error_reporting::infer::need_type_info::TypeAnnotationNeeded;
@@ -76,6 +76,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         wbcx.visit_user_provided_sigs();
         wbcx.visit_coroutine_interior();
         wbcx.visit_transmutes();
+        wbcx.visit_offloads();
         wbcx.visit_offset_of_container_types();
         wbcx.visit_potentially_region_dependent_goals();
 
@@ -348,7 +349,7 @@ impl<'cx, 'tcx> Visitor<'tcx> for WritebackCx<'cx, 'tcx> {
     fn visit_ty(&mut self, hir_ty: &'tcx hir::Ty<'tcx, AmbigArg>) {
         intravisit::walk_ty(self, hir_ty);
         // If there are type checking errors, Type privacy pass will stop,
-        // so we may not get the type from hid_id, see #104513
+        // so we may not get the type from hir_id, see #104513
         if let Some(ty) = self.fcx.node_ty_opt(hir_ty.hir_id) {
             let ty = self.resolve(ty, &hir_ty.span);
             self.write_ty_to_typeck_results(hir_ty.hir_id, ty);
@@ -544,6 +545,21 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
         }
     }
 
+    fn visit_offloads(&mut self) {
+        let tcx = self.tcx();
+        let fcx_typeck_results = self.fcx.typeck_results.borrow();
+        assert_eq!(fcx_typeck_results.hir_owner, self.typeck_results.hir_owner);
+        for &(kernel_ty, args_ty, ret_ty, hir_id) in
+            self.fcx.deferred_offload_checks.borrow().iter()
+        {
+            let span = tcx.hir_span(hir_id);
+            let kernel_ty = self.resolve(kernel_ty, &span);
+            let args_ty = self.resolve(args_ty, &span);
+            let ret_ty = self.resolve(ret_ty, &span);
+            self.typeck_results.offloads_to_check.push((kernel_ty, args_ty, ret_ty, hir_id));
+        }
+    }
+
     fn visit_opaque_types_next(&mut self) {
         let mut fcx_typeck_results = self.fcx.typeck_results.borrow_mut();
         assert_eq!(fcx_typeck_results.hir_owner, self.typeck_results.hir_owner);
@@ -567,7 +583,7 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
         for (opaque_type_key, hidden_type) in opaque_types {
             let hidden_type = self.resolve(hidden_type, &hidden_type.span);
             let opaque_type_key = self.resolve(opaque_type_key, &hidden_type.span);
-            if let &ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) =
+            if let &ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) =
                 hidden_type.ty.kind()
                 && def_id == opaque_type_key.def_id.to_def_id()
                 && args == opaque_type_key.args
@@ -623,6 +639,7 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
                 hidden_ty
                     .ty
                     .instantiate_identity()
+                    .skip_norm_wip()
                     .visit_with(&mut HasRecursiveOpaque {
                         def_id,
                         seen: Default::default(),
@@ -660,6 +677,11 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
             self.fcx.typeck_results.borrow_mut().type_dependent_defs_mut().remove(hir_id)
         {
             self.typeck_results.type_dependent_defs_mut().insert(hir_id, def);
+        }
+
+        // Export splatted function call resolutions.
+        if let Some(def) = self.fcx.typeck_results.borrow_mut().splatted_defs_mut().remove(hir_id) {
+            self.typeck_results.splatted_defs_mut().insert(hir_id, def);
         }
 
         // Resolve any borrowings for the node with id `node_id`
@@ -932,7 +954,7 @@ impl<'cx, 'tcx> Resolver<'cx, 'tcx> {
     fn handle_term<T>(
         &mut self,
         value: T,
-        outer_exclusive_binder: impl FnOnce(T) -> ty::DebruijnIndex,
+        outer_exclusive_binder: impl FnOnce(&T) -> ty::DebruijnIndex,
         new_err: impl Fn(TyCtxt<'tcx>, ErrorGuaranteed) -> T,
     ) -> T
     where
@@ -942,12 +964,14 @@ impl<'cx, 'tcx> Resolver<'cx, 'tcx> {
         // We must deeply normalize in the new solver, since later lints expect
         // that types that show up in the typeck are fully normalized.
         let mut value = if self.should_normalize && self.fcx.next_trait_solver() {
-            let body_id = tcx.hir_body_owner_def_id(self.body.id());
-            let cause = ObligationCause::misc(self.span.to_span(tcx), body_id);
+            let body_def_id = tcx.hir_body_owner_def_id(self.body.id());
+            let cause = ObligationCause::misc(self.span.to_span(tcx), body_def_id);
             let at = self.fcx.at(&cause, self.fcx.param_env);
-            let universes = vec![None; outer_exclusive_binder(value).as_usize()];
+            let universes = vec![None; outer_exclusive_binder(&value).as_usize()];
             match solve::deeply_normalize_with_skipped_universes_and_ambiguous_coroutine_goals(
-                at, value, universes,
+                at,
+                Unnormalized::new_wip(value),
+                universes,
             ) {
                 Ok((value, goals)) => {
                     self.nested_goals.extend(goals);
@@ -1035,7 +1059,9 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for EagerlyNormalizeConsts<'tcx> {
     }
 
     fn fold_const(&mut self, ct: ty::Const<'tcx>) -> ty::Const<'tcx> {
-        self.tcx.try_normalize_erasing_regions(self.typing_env, ct).unwrap_or(ct)
+        self.tcx
+            .try_normalize_erasing_regions(self.typing_env, Unnormalized::new_wip(ct))
+            .unwrap_or(ct)
     }
 }
 
@@ -1050,7 +1076,7 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for HasRecursiveOpaque<'_, 'tcx> {
     type Result = ControlFlow<()>;
 
     fn visit_ty(&mut self, t: Ty<'tcx>) -> Self::Result {
-        if let ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) = *t.kind()
+        if let ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) = *t.kind()
             && let Some(def_id) = def_id.as_local()
         {
             if self.def_id == def_id {
@@ -1060,7 +1086,7 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for HasRecursiveOpaque<'_, 'tcx> {
             if self.seen.insert(def_id)
                 && let Some(hidden_ty) = self.opaques.get(&def_id)
             {
-                hidden_ty.ty.instantiate(self.tcx, args).visit_with(self)?;
+                hidden_ty.ty.instantiate(self.tcx, args).skip_norm_wip().visit_with(self)?;
             }
         }
 

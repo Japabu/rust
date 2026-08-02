@@ -1,6 +1,7 @@
 //@ normalize-stderr: "(the raw bytes of the constant) \(size: [0-9]*, align: [0-9]*\)" -> "$1 (size: $$SIZE, align: $$ALIGN)"
 //@ normalize-stderr: "( 0x[0-9a-f][0-9a-f] │)? ([0-9a-f][0-9a-f] |__ |╾─*ALLOC[0-9]+(\+[a-z0-9]+)?(<imm>)?─*╼ )+ *│.*" -> " HEX_DUMP"
 //@ normalize-stderr: "HEX_DUMP\s*\n\s*HEX_DUMP" -> "HEX_DUMP"
+//@ normalize-stderr: "╾ALLOC\$ID╼\s+│.*╾.*╼" -> "╾ALLOC$$ID╼ │ ╾─╼"
 //@ dont-require-annotations: NOTE
 
 use std::cell::UnsafeCell;
@@ -83,8 +84,8 @@ fn dangling() {
         // Undefined behaviour (integer as pointer), who doesn't love tests like this.
         Some(&mut *(42 as *mut i32))
     } }
-    const INT2PTR: Option<&mut i32> = helper_int2ptr(); //~ ERROR encountered a dangling reference
-    static INT2PTR_STATIC: Option<&mut i32> = helper_int2ptr(); //~ ERROR encountered a dangling reference
+    const INT2PTR: Option<&mut i32> = helper_int2ptr(); //~ ERROR reference not dereferenceable
+    static INT2PTR_STATIC: Option<&mut i32> = helper_int2ptr(); //~ ERROR reference not dereferenceable
 
     const fn helper_dangling() -> Option<&'static mut i32> { unsafe {
         // Undefined behaviour (dangling pointer), who doesn't love tests like this.

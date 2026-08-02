@@ -41,7 +41,7 @@ impl<'tcx> LateLintPass<'tcx> for ErrorImplError {
             ItemKind::TyAlias(ident, ..)
                 if ident.name == sym::Error
                     && is_visible_outside_module(cx, item.owner_id.def_id)
-                    && let ty = cx.tcx.type_of(item.owner_id).instantiate_identity()
+                    && let ty = cx.tcx.type_of(item.owner_id).instantiate_identity().skip_norm_wip()
                     && let Some(error_def_id) = cx.tcx.get_diagnostic_item(sym::Error)
                     && implements_trait(cx, ty, error_def_id, &[]) =>
             {
@@ -81,7 +81,7 @@ impl<'tcx> LateLintPass<'tcx> for ErrorImplError {
 /// which aren't reexported
 fn is_visible_outside_module(cx: &LateContext<'_>, def_id: LocalDefId) -> bool {
     !matches!(
-        cx.tcx.visibility(def_id),
-        Visibility::Restricted(mod_def_id) if cx.tcx.parent_module_from_def_id(def_id).to_def_id() == mod_def_id
+        cx.tcx.local_visibility(def_id),
+        Visibility::Restricted(mod_def_id) if cx.tcx.parent_module_from_def_id(def_id) == mod_def_id
     )
 }

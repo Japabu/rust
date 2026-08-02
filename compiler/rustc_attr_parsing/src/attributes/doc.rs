@@ -1,25 +1,35 @@
 use rustc_ast::ast::{AttrStyle, LitKind, MetaItemLit};
-use rustc_errors::msg;
-use rustc_feature::template;
+use rustc_data_structures::fx::{FxHashSet, FxIndexMap, IndexEntry};
+use rustc_errors::{Applicability, msg};
+use rustc_feature::AttributeStability;
 use rustc_hir::Target;
 use rustc_hir::attrs::{
-    AttributeKind, CfgEntry, CfgHideShow, CfgInfo, DocAttribute, DocInline, HideOrShow,
+    AttributeKind, CfgEntry, CfgHideShow, DocAttribute, DocCfgHideShow, DocCfgHideShowValue,
+    DocInline, HideOrShow,
 };
-use rustc_hir::lints::AttributeLintKind;
-use rustc_session::parse::feature_err;
+use rustc_session::diagnostics::feature_err;
 use rustc_span::{Span, Symbol, edition, sym};
-use thin_vec::ThinVec;
 
 use super::prelude::{ALL_TARGETS, AllowedTargets};
-use super::{AcceptMapping, AttributeParser};
-use crate::context::{AcceptContext, FinalizeContext, Stage};
-use crate::parser::{ArgParser, MetaItemOrLitParser, MetaItemParser, OwnedPathParser};
+use super::{AcceptMapping, AttributeParser, template};
+use crate::context::{AcceptContext, FinalizeContext};
+use crate::diagnostics::{
+    AttrCrateLevelOnly, DocAliasDuplicated, DocAutoCfgExpectsHideOrShow,
+    DocAutoCfgHideShowExpectsList, DocAutoCfgHideShowNoIdentBeforeValues,
+    DocAutoCfgHideShowUnexpectedItem, DocAutoCfgHideShowUnexpectedItemAfterValues,
+    DocAutoCfgHideShowValuesMix, DocAutoCfgWrongLiteral, DocTestLiteral, DocTestTakesList,
+    DocTestUnknown, DocUnknownAny, DocUnknownInclude, DocUnknownPasses, DocUnknownPlugins,
+    DocUnknownSpotlight, ExpectedNameValue, ExpectedNoArgs, IllFormedAttributeInput, MalformedDoc,
+};
+use crate::parser::{
+    ArgParser, MetaItemListParser, MetaItemOrLitParser, MetaItemParser, OwnedPathParser,
+};
 use crate::session_diagnostics::{
     DocAliasBadChar, DocAliasEmpty, DocAliasMalformed, DocAliasStartEnd, DocAttrNotCrateLevel,
-    DocAttributeNotAttribute, DocKeywordNotKeyword,
+    DocAttributeNotAttribute, DocKeywordNotKeyword, UnusedDuplicate,
 };
 
-fn check_keyword<S: Stage>(cx: &mut AcceptContext<'_, '_, S>, keyword: Symbol, span: Span) -> bool {
+fn check_keyword(cx: &mut AcceptContext<'_, '_>, keyword: Symbol, span: Span) -> bool {
     // FIXME: Once rustdoc can handle URL conflicts on case insensitive file systems, we
     // can remove the `SelfTy` case here, remove `sym::SelfTy`, and update the
     // `#[doc(keyword = "SelfTy")` attribute in `library/std/src/keyword_docs.rs`.
@@ -33,13 +43,9 @@ fn check_keyword<S: Stage>(cx: &mut AcceptContext<'_, '_, S>, keyword: Symbol, s
     false
 }
 
-fn check_attribute<S: Stage>(
-    cx: &mut AcceptContext<'_, '_, S>,
-    attribute: Symbol,
-    span: Span,
-) -> bool {
+fn check_attribute(cx: &mut AcceptContext<'_, '_>, attribute: Symbol, span: Span) -> bool {
     // FIXME: This should support attributes with namespace like `diagnostic::do_not_recommend`.
-    if rustc_feature::BUILTIN_ATTRIBUTE_MAP.contains_key(&attribute) {
+    if rustc_feature::BUILTIN_ATTRIBUTE_MAP.contains(&attribute) {
         return true;
     }
     cx.emit_err(DocAttributeNotAttribute { span, attribute });
@@ -47,8 +53,8 @@ fn check_attribute<S: Stage>(
 }
 
 /// Checks that an attribute is *not* used at the crate level. Returns `true` if valid.
-fn check_attr_not_crate_level<S: Stage>(
-    cx: &mut AcceptContext<'_, '_, S>,
+fn check_attr_not_crate_level(
+    cx: &mut AcceptContext<'_, '_>,
     span: Span,
     attr_name: Symbol,
 ) -> bool {
@@ -60,11 +66,11 @@ fn check_attr_not_crate_level<S: Stage>(
 }
 
 /// Checks that an attribute is used at the crate level. Returns `true` if valid.
-fn check_attr_crate_level<S: Stage>(cx: &mut AcceptContext<'_, '_, S>, span: Span) -> bool {
+fn check_attr_crate_level(cx: &mut AcceptContext<'_, '_>, span: Span) -> bool {
     if cx.shared.target != Target::Crate {
         cx.emit_lint(
             rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-            AttributeLintKind::AttrCrateLevelOnly,
+            AttrCrateLevelOnly,
             span,
         );
         return false;
@@ -73,49 +79,33 @@ fn check_attr_crate_level<S: Stage>(cx: &mut AcceptContext<'_, '_, S>, span: Spa
 }
 
 // FIXME: To be removed once merged and replace with `cx.expected_name_value(span, _name)`.
-fn expected_name_value<S: Stage>(
-    cx: &mut AcceptContext<'_, '_, S>,
-    span: Span,
-    _name: Option<Symbol>,
-) {
-    cx.emit_lint(
-        rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-        AttributeLintKind::ExpectedNameValue,
-        span,
-    );
+fn expected_name_value(cx: &mut AcceptContext<'_, '_>, span: Span, _name: Option<Symbol>) {
+    cx.emit_lint(rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES, ExpectedNameValue, span);
 }
 
 // FIXME: remove this method once merged and use `cx.expected_no_args(span)` instead.
-fn expected_no_args<S: Stage>(cx: &mut AcceptContext<'_, '_, S>, span: Span) {
-    cx.emit_lint(
-        rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-        AttributeLintKind::ExpectedNoArgs,
-        span,
-    );
+fn expected_no_args(cx: &mut AcceptContext<'_, '_>, span: Span) {
+    cx.emit_lint(rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES, ExpectedNoArgs, span);
 }
 
 // FIXME: remove this method once merged and use `cx.expected_no_args(span)` instead.
 // cx.expected_string_literal(span, _actual_literal);
-fn expected_string_literal<S: Stage>(
-    cx: &mut AcceptContext<'_, '_, S>,
+fn expected_string_literal(
+    cx: &mut AcceptContext<'_, '_>,
     span: Span,
     _actual_literal: Option<&MetaItemLit>,
 ) {
-    cx.emit_lint(
-        rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-        AttributeLintKind::MalformedDoc,
-        span,
-    );
+    cx.emit_lint(rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES, MalformedDoc, span);
 }
 
-fn parse_keyword_and_attribute<S: Stage>(
-    cx: &mut AcceptContext<'_, '_, S>,
+fn parse_keyword_and_attribute(
+    cx: &mut AcceptContext<'_, '_>,
     path: &OwnedPathParser,
     args: &ArgParser,
     attr_value: &mut Option<(Symbol, Span)>,
     attr_name: Symbol,
 ) {
-    let Some(nv) = args.name_value() else {
+    let Some(nv) = args.as_name_value() else {
         expected_name_value(cx, args.span().unwrap_or(path.span()), path.word_sym());
         return;
     };
@@ -154,9 +144,9 @@ pub(crate) struct DocParser {
 }
 
 impl DocParser {
-    fn parse_single_test_doc_attr_item<S: Stage>(
+    fn parse_single_test_doc_attr_item(
         &mut self,
-        cx: &mut AcceptContext<'_, '_, S>,
+        cx: &mut AcceptContext<'_, '_>,
         mip: &MetaItemParser,
     ) {
         let path = mip.path();
@@ -164,7 +154,7 @@ impl DocParser {
 
         match path.word_sym() {
             Some(sym::no_crate_inject) => {
-                if let Err(span) = args.no_args() {
+                if let Err(span) = args.as_no_args() {
                     expected_no_args(cx, span);
                     return;
                 }
@@ -173,11 +163,7 @@ impl DocParser {
                     let unused_span = path.span();
                     cx.emit_lint(
                         rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                        AttributeLintKind::UnusedDuplicate {
-                            this: unused_span,
-                            other: used_span,
-                            warning: true,
-                        },
+                        UnusedDuplicate { this: unused_span, other: used_span, warning: true },
                         unused_span,
                     );
                     return;
@@ -190,13 +176,13 @@ impl DocParser {
                 self.attribute.no_crate_inject = Some(path.span())
             }
             Some(sym::attr) => {
-                let Some(list) = args.list() else {
+                let Some(list) = args.as_list() else {
                     // FIXME: remove this method once merged and uncomment the line below instead.
                     // cx.expected_list(cx.attr_span, args);
                     let span = cx.attr_span;
                     cx.emit_lint(
                         rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                        AttributeLintKind::MalformedDoc,
+                        MalformedDoc,
                         span,
                     );
                     return;
@@ -204,32 +190,29 @@ impl DocParser {
 
                 // FIXME: convert list into a Vec of `AttributeKind` because current code is awful.
                 for attr in list.mixed() {
+                    // Arguments of `attr` are checked via the span, so can be safely ignored
+                    attr.ignore_args();
                     self.attribute.test_attrs.push(attr.span());
                 }
             }
             Some(name) => {
                 cx.emit_lint(
                     rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                    AttributeLintKind::DocTestUnknown { name },
+                    DocTestUnknown { name },
                     path.span(),
                 );
             }
             None => {
                 cx.emit_lint(
                     rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                    AttributeLintKind::DocTestLiteral,
+                    DocTestLiteral,
                     path.span(),
                 );
             }
         }
     }
 
-    fn add_alias<S: Stage>(
-        &mut self,
-        cx: &mut AcceptContext<'_, '_, S>,
-        alias: Symbol,
-        span: Span,
-    ) {
+    fn add_alias(&mut self, cx: &mut AcceptContext<'_, '_>, alias: Symbol, span: Span) {
         let attr_str = "`#[doc(alias = \"...\")]`";
         if alias == sym::empty {
             cx.emit_err(DocAliasEmpty { span, attr_str });
@@ -254,7 +237,7 @@ impl DocParser {
         if let Some(first_definition) = self.attribute.aliases.get(&alias).copied() {
             cx.emit_lint(
                 rustc_session::lint::builtin::UNUSED_ATTRIBUTES,
-                AttributeLintKind::DuplicateDocAlias { first_definition },
+                DocAliasDuplicated { first_definition },
                 span,
             );
         }
@@ -262,9 +245,9 @@ impl DocParser {
         self.attribute.aliases.insert(alias, span);
     }
 
-    fn parse_alias<S: Stage>(
+    fn parse_alias(
         &mut self,
-        cx: &mut AcceptContext<'_, '_, S>,
+        cx: &mut AcceptContext<'_, '_>,
         path: &OwnedPathParser,
         args: &ArgParser,
     ) {
@@ -274,8 +257,7 @@ impl DocParser {
             }
             ArgParser::List(list) => {
                 for i in list.mixed() {
-                    let Some(alias) = i.lit().and_then(|i| i.value_str()) else {
-                        cx.adcx().expected_string_literal(i.span(), i.lit());
+                    let Some(alias) = cx.expect_string_literal(i) else {
                         continue;
                     };
 
@@ -283,8 +265,7 @@ impl DocParser {
                 }
             }
             ArgParser::NameValue(nv) => {
-                let Some(alias) = nv.value_as_str() else {
-                    cx.adcx().expected_string_literal(nv.value_span, Some(nv.value_as_lit()));
+                let Some(alias) = cx.expect_string_literal(nv) else {
                     return;
                 };
                 self.add_alias(cx, alias, nv.value_span);
@@ -292,14 +273,14 @@ impl DocParser {
         }
     }
 
-    fn parse_inline<S: Stage>(
+    fn parse_inline(
         &mut self,
-        cx: &mut AcceptContext<'_, '_, S>,
+        cx: &mut AcceptContext<'_, '_>,
         path: &OwnedPathParser,
         args: &ArgParser,
         inline: DocInline,
     ) {
-        if let Err(span) = args.no_args() {
+        if let Err(span) = args.as_no_args() {
             expected_no_args(cx, span);
             return;
         }
@@ -307,7 +288,7 @@ impl DocParser {
         self.attribute.inline.push((inline, path.span()));
     }
 
-    fn parse_cfg<S: Stage>(&mut self, cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) {
+    fn parse_cfg(&mut self, cx: &mut AcceptContext<'_, '_>, args: &ArgParser) {
         // This function replaces cases like `cfg(all())` with `true`.
         fn simplify_cfg(cfg_entry: &mut CfgEntry) {
             match cfg_entry {
@@ -327,9 +308,85 @@ impl DocParser {
         }
     }
 
-    fn parse_auto_cfg<S: Stage>(
+    // Parses the `doc(auto_cfg(hide/show(..., values())))` attribute.
+    fn parse_auto_cfg_values(
+        &self,
+        cx: &mut AcceptContext<'_, '_>,
+        list: &MetaItemListParser,
+        values: &mut Option<DocCfgHideShow>,
+    ) {
+        let mut cfg_values = DocCfgHideShow::new();
+
+        let mut values_set = FxHashSet::default();
+        for item in list.mixed() {
+            match item {
+                // If it's a string literal, all good.
+                MetaItemOrLitParser::Lit(MetaItemLit {
+                    kind: LitKind::Str(symbol, _),
+                    span,
+                    ..
+                }) => match &mut cfg_values {
+                    DocCfgHideShow::Any(any_span) => {
+                        cx.emit_lint(
+                            rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
+                            DocAutoCfgHideShowValuesMix { value_span: *span },
+                            *any_span,
+                        );
+                    }
+                    DocCfgHideShow::List(symbols) => {
+                        if values_set.insert(symbol) {
+                            symbols.push(DocCfgHideShowValue::new(*symbol, *span));
+                        }
+                    }
+                },
+                // If it's any other kind of literal, then it's wrong and we emit a lint.
+                MetaItemOrLitParser::Lit(lit) => cx.emit_lint(
+                    rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
+                    DocAutoCfgHideShowUnexpectedItem { attr_name: lit.symbol },
+                    lit.span,
+                ),
+                // If it's a list, then only `any()` and `none()` are allowed and they must not
+                // contain any item.
+                MetaItemOrLitParser::MetaItemParser(sub_item) => {
+                    let Some(ident) = sub_item.ident() else {
+                        cx.adcx().expected_identifier(sub_item.path().span());
+                        continue;
+                    };
+                    if [sym::any, sym::none].contains(&ident.name)
+                        && let ArgParser::List(list) = sub_item.args()
+                        && list.mixed().count() == 0
+                    {
+                        if ident.name == sym::any {
+                            if let DocCfgHideShow::List(values) = &cfg_values
+                                && let Some(value) = values.first()
+                            {
+                                cx.emit_lint(
+                                    rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
+                                    DocAutoCfgHideShowValuesMix { value_span: value.span },
+                                    sub_item.span(),
+                                );
+                            } else {
+                                cfg_values.merge_with(&DocCfgHideShow::Any(sub_item.span()));
+                            }
+                        } else {
+                            cfg_values.push_none(sub_item.span());
+                        }
+                    } else {
+                        cx.emit_lint(
+                            rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
+                            DocAutoCfgHideShowUnexpectedItem { attr_name: ident.name },
+                            sub_item.span(),
+                        );
+                    }
+                }
+            }
+        }
+        *values = Some(cfg_values);
+    }
+
+    fn parse_auto_cfg(
         &mut self,
-        cx: &mut AcceptContext<'_, '_, S>,
+        cx: &mut AcceptContext<'_, '_>,
         path: &OwnedPathParser,
         args: &ArgParser,
     ) {
@@ -338,22 +395,24 @@ impl DocParser {
                 self.attribute.auto_cfg_change.push((true, path.span()));
             }
             ArgParser::List(list) => {
-                for meta in list.mixed() {
+                'main: for meta in list.mixed() {
                     let MetaItemOrLitParser::MetaItemParser(item) = meta else {
                         cx.emit_lint(
                             rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                            AttributeLintKind::DocAutoCfgExpectsHideOrShow,
+                            DocAutoCfgExpectsHideOrShow,
                             meta.span(),
                         );
                         continue;
                     };
+                    // Only `hide` and `show` are allowed in `auto_cfg` if it's a list, and both
+                    // must be a list.
                     let (kind, attr_name) = match item.path().word_sym() {
                         Some(sym::hide) => (HideOrShow::Hide, sym::hide),
                         Some(sym::show) => (HideOrShow::Show, sym::show),
                         _ => {
                             cx.emit_lint(
                                 rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                                AttributeLintKind::DocAutoCfgExpectsHideOrShow,
+                                DocAutoCfgExpectsHideOrShow,
                                 item.span(),
                             );
                             continue;
@@ -362,64 +421,77 @@ impl DocParser {
                     let ArgParser::List(list) = item.args() else {
                         cx.emit_lint(
                             rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                            AttributeLintKind::DocAutoCfgHideShowExpectsList { attr_name },
+                            DocAutoCfgHideShowExpectsList { attr_name },
                             item.span(),
                         );
                         continue;
                     };
 
-                    let mut cfg_hide_show = CfgHideShow { kind, values: ThinVec::new() };
+                    let mut cfg_hide_show = CfgHideShow { kind, values: FxIndexMap::default() };
 
+                    let mut cfg_names = FxHashSet::default();
+                    let mut values = None;
                     for item in list.mixed() {
                         let MetaItemOrLitParser::MetaItemParser(sub_item) = item else {
                             cx.emit_lint(
                                 rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                                AttributeLintKind::DocAutoCfgHideShowUnexpectedItem { attr_name },
+                                DocAutoCfgHideShowUnexpectedItem { attr_name },
                                 item.span(),
                             );
-                            continue;
+                            continue 'main;
                         };
                         match sub_item.args() {
-                            a @ (ArgParser::NoArgs | ArgParser::NameValue(_)) => {
+                            ArgParser::NoArgs if values.is_none() => {
                                 let Some(name) = sub_item.path().word_sym() else {
-                                    // FIXME: remove this method once merged and uncomment the line
-                                    // below instead.
-                                    // cx.expected_identifier(sub_item.path().span());
+                                    cx.adcx().expected_identifier(sub_item.path().span());
+                                    continue 'main;
+                                };
+                                cfg_names.insert(name);
+                            }
+                            // The only accepted list is `values()`.
+                            ArgParser::List(list) if values.is_none() => {
+                                let Some(sym::values) = sub_item.path().word_sym() else {
+                                    cx.adcx().expected_identifier(sub_item.path().span());
+                                    continue 'main;
+                                };
+                                if cfg_names.is_empty() {
                                     cx.emit_lint(
                                         rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                                        AttributeLintKind::MalformedDoc,
-                                        sub_item.path().span(),
-                                    );
-                                    continue;
-                                };
-                                if let Ok(CfgEntry::NameValue { name, value, .. }) =
-                                    super::cfg::parse_name_value(
-                                        name,
-                                        sub_item.path().span(),
-                                        a.name_value(),
+                                        DocAutoCfgHideShowNoIdentBeforeValues,
                                         sub_item.span(),
-                                        cx,
-                                    )
-                                {
-                                    cfg_hide_show.values.push(CfgInfo {
-                                        name,
-                                        name_span: sub_item.path().span(),
-                                        // If `value` is `Some`, `a.name_value()` will always return
-                                        // `Some` as well.
-                                        value: value
-                                            .map(|v| (v, a.name_value().unwrap().value_span)),
-                                    })
+                                    );
+                                    continue 'main;
                                 }
+                                self.parse_auto_cfg_values(cx, list, &mut values);
                             }
+                            // No `name = value` is allowed.
+                            ArgParser::NameValue(_) => {
+                                cx.emit_lint(
+                                    rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
+                                    DocAutoCfgHideShowUnexpectedItem { attr_name },
+                                    sub_item.span(),
+                                );
+                            }
+                            // If `values()` was already used, no item should come after it.
                             _ => {
                                 cx.emit_lint(
                                     rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                                    AttributeLintKind::DocAutoCfgHideShowUnexpectedItem {
-                                        attr_name,
-                                    },
+                                    DocAutoCfgHideShowUnexpectedItemAfterValues,
                                     sub_item.span(),
                                 );
-                                continue;
+                            }
+                        }
+                    }
+
+                    let values = values.unwrap_or(DocCfgHideShow::new_with_only_key(item.span()));
+                    #[allow(rustc::potential_query_instability)]
+                    for cfg_name in &cfg_names {
+                        match cfg_hide_show.values.entry(*cfg_name) {
+                            IndexEntry::Vacant(v) => {
+                                v.insert(values.clone());
+                            }
+                            IndexEntry::Occupied(mut o) => {
+                                o.get_mut().merge_with(&values);
                             }
                         }
                     }
@@ -431,7 +503,7 @@ impl DocParser {
                 else {
                     cx.emit_lint(
                         rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                        AttributeLintKind::DocAutoCfgWrongLiteral,
+                        DocAutoCfgWrongLiteral,
                         nv.value_span,
                     );
                     return;
@@ -441,17 +513,13 @@ impl DocParser {
         }
     }
 
-    fn parse_single_doc_attr_item<S: Stage>(
-        &mut self,
-        cx: &mut AcceptContext<'_, '_, S>,
-        mip: &MetaItemParser,
-    ) {
+    fn parse_single_doc_attr_item(&mut self, cx: &mut AcceptContext<'_, '_>, mip: &MetaItemParser) {
         let path = mip.path();
         let args = mip.args();
 
         macro_rules! no_args {
             ($ident: ident) => {{
-                if let Err(span) = args.no_args() {
+                if let Err(span) = args.as_no_args() {
                     expected_no_args(cx, span);
                     return;
                 }
@@ -470,7 +538,7 @@ impl DocParser {
         }
         macro_rules! no_args_and_not_crate_level {
             ($ident: ident) => {{
-                if let Err(span) = args.no_args() {
+                if let Err(span) = args.as_no_args() {
                     expected_no_args(cx, span);
                     return;
                 }
@@ -486,7 +554,7 @@ impl DocParser {
                 no_args_and_crate_level!($ident, |span| {});
             }};
             ($ident: ident, |$span:ident| $extra_validation:block) => {{
-                if let Err(span) = args.no_args() {
+                if let Err(span) = args.as_no_args() {
                     expected_no_args(cx, span);
                     return;
                 }
@@ -500,7 +568,7 @@ impl DocParser {
         }
         macro_rules! string_arg_and_crate_level {
             ($ident: ident) => {{
-                let Some(nv) = args.name_value() else {
+                let Some(nv) = args.as_name_value() else {
                     expected_name_value(cx, args.span().unwrap_or(path.span()), path.word_sym());
                     return;
                 };
@@ -572,10 +640,10 @@ impl DocParser {
             }),
             Some(sym::auto_cfg) => self.parse_auto_cfg(cx, path, args),
             Some(sym::test) => {
-                let Some(list) = args.list() else {
+                let Some(list) = args.as_list() else {
                     cx.emit_lint(
                         rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                        AttributeLintKind::DocTestTakesList,
+                        DocTestTakesList,
                         args.span().unwrap_or(path.span()),
                     );
                     return;
@@ -592,7 +660,7 @@ impl DocParser {
                             // cx.unexpected_literal(lit.span);
                             cx.emit_lint(
                                 rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                                AttributeLintKind::MalformedDoc,
+                                MalformedDoc,
                                 lit.span,
                             );
                         }
@@ -600,76 +668,70 @@ impl DocParser {
                 }
             }
             Some(sym::spotlight) => {
+                let span = path.span();
                 cx.emit_lint(
                     rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                    AttributeLintKind::DocUnknownSpotlight { span: path.span() },
-                    path.span(),
+                    DocUnknownSpotlight { sugg_span: span },
+                    span,
                 );
             }
-            Some(sym::include) if let Some(nv) = args.name_value() => {
+            Some(sym::include) if let Some(nv) = args.as_name_value() => {
                 let inner = match cx.attr_style {
                     AttrStyle::Outer => "",
                     AttrStyle::Inner => "!",
                 };
+                let value = nv.value_as_lit().symbol;
+                let span = path.span();
                 cx.emit_lint(
                     rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                    AttributeLintKind::DocUnknownInclude {
-                        inner,
-                        value: nv.value_as_lit().symbol,
-                        span: path.span(),
-                    },
-                    path.span(),
+                    DocUnknownInclude { inner, value, sugg: (span, Applicability::MaybeIncorrect) },
+                    span,
                 );
             }
             Some(name @ (sym::passes | sym::no_default_passes)) => {
+                let span = path.span();
                 cx.emit_lint(
                     rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                    AttributeLintKind::DocUnknownPasses { name, span: path.span() },
-                    path.span(),
+                    DocUnknownPasses { name, note_span: span },
+                    span,
                 );
             }
             Some(sym::plugins) => {
+                let span = path.span();
                 cx.emit_lint(
                     rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                    AttributeLintKind::DocUnknownPlugins { span: path.span() },
-                    path.span(),
+                    DocUnknownPlugins { label_span: span },
+                    span,
                 );
             }
             Some(name) => {
                 cx.emit_lint(
                     rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                    AttributeLintKind::DocUnknownAny { name },
+                    DocUnknownAny { name },
                     path.span(),
                 );
             }
             None => {
                 let full_name =
                     path.segments().map(|s| s.as_str()).intersperse("::").collect::<String>();
+                let name = Symbol::intern(&full_name);
                 cx.emit_lint(
                     rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                    AttributeLintKind::DocUnknownAny { name: Symbol::intern(&full_name) },
+                    DocUnknownAny { name },
                     path.span(),
                 );
             }
         }
     }
 
-    fn accept_single_doc_attr<S: Stage>(
-        &mut self,
-        cx: &mut AcceptContext<'_, '_, S>,
-        args: &ArgParser,
-    ) {
+    fn accept_single_doc_attr(&mut self, cx: &mut AcceptContext<'_, '_>, args: &ArgParser) {
         match args {
             ArgParser::NoArgs => {
                 let suggestions = cx.adcx().suggestions();
-                let span = cx.attr_span;
+                let span = cx.inner_span;
                 cx.emit_lint(
                     rustc_session::lint::builtin::INVALID_DOC_ATTRIBUTES,
-                    AttributeLintKind::IllFormedAttributeInput {
-                        suggestions,
-                        docs: None,
-                        help: None,
-                    },
+                    IllFormedAttributeInput::new(&suggestions, None, None),
                     span,
                 );
             }
@@ -677,6 +739,9 @@ impl DocParser {
                 for i in items.mixed() {
                     match i {
                         MetaItemOrLitParser::MetaItemParser(mip) => {
+                            if self.nb_doc_attrs == 0 {
+                                self.attribute.first_span = cx.attr_span;
+                            }
                             self.nb_doc_attrs += 1;
                             self.parse_single_doc_attr_item(cx, mip);
                         }
@@ -699,8 +764,8 @@ impl DocParser {
     }
 }
 
-impl<S: Stage> AttributeParser<S> for DocParser {
-    const ATTRIBUTES: AcceptMapping<Self, S> = &[(
+impl AttributeParser for DocParser {
+    const ATTRIBUTES: AcceptMapping<Self> = &[(
         &[sym::doc],
         template!(
             List: &[
@@ -732,13 +797,14 @@ impl<S: Stage> AttributeParser<S> for DocParser {
             ],
             NameValueStr: "string"
         ),
+        AttributeStability::Stable, // Some parts of the attribute are unstable, manually checked in parser
         |this, cx, args| {
             this.accept_single_doc_attr(cx, args);
         },
     )];
     // FIXME: Currently emitted from 2 different places, generating duplicated warnings.
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(ALL_TARGETS);
-    // const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowListWarnRest(&[
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(ALL_TARGETS);
+    // const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowListWarnRest(&[
     //     Allow(Target::ExternCrate),
     //     Allow(Target::Use),
     //     Allow(Target::Static),
@@ -770,7 +836,7 @@ impl<S: Stage> AttributeParser<S> for DocParser {
     //     Error(Target::WherePredicate),
     // ]);
 
-    fn finalize(self, _cx: &FinalizeContext<'_, '_, S>) -> Option<AttributeKind> {
+    fn finalize(self, _cx: &FinalizeContext<'_, '_>) -> Option<AttributeKind> {
         if self.nb_doc_attrs != 0 {
             Some(AttributeKind::Doc(Box::new(self.attribute)))
         } else {

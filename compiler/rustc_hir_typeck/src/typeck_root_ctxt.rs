@@ -1,12 +1,11 @@
 use std::cell::{Cell, RefCell};
 use std::ops::Deref;
 
-use rustc_data_structures::unord::UnordSet;
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::{self as hir, HirId, HirIdMap};
 use rustc_infer::infer::{InferCtxt, InferOk, OpaqueTypeStorageEntries, TyCtxtInferExt};
 use rustc_middle::span_bug;
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt, TypingMode};
+use rustc_middle::ty::{self, Ty, TyCtxt, TyVid, TypeVisitableExt, TypingMode};
 use rustc_span::Span;
 use rustc_span::def_id::LocalDefIdMap;
 use rustc_trait_selection::traits::{self, FulfillmentError, TraitEngine, TraitEngineExt as _};
@@ -58,6 +57,8 @@ pub(crate) struct TypeckRootCtxt<'tcx> {
 
     pub(super) deferred_transmute_checks: RefCell<Vec<(Ty<'tcx>, Ty<'tcx>, HirId)>>,
 
+    pub(super) deferred_offload_checks: RefCell<Vec<(Ty<'tcx>, Ty<'tcx>, Ty<'tcx>, HirId)>>,
+
     pub(super) deferred_asm_checks: RefCell<Vec<(&'tcx hir::InlineAsm<'tcx>, HirId)>>,
 
     pub(super) deferred_repeat_expr_checks:
@@ -66,7 +67,7 @@ pub(crate) struct TypeckRootCtxt<'tcx> {
     /// Whenever we introduce an adjustment from `!` into a type variable,
     /// we record that type variable here. This is later used to inform
     /// fallback. See the `fallback` module for details.
-    pub(super) diverging_type_vars: RefCell<UnordSet<Ty<'tcx>>>,
+    pub(super) diverging_type_vars: RefCell<Vec<TyVid>>,
 }
 
 impl<'tcx> Deref for TypeckRootCtxt<'tcx> {
@@ -98,6 +99,7 @@ impl<'tcx> TypeckRootCtxt<'tcx> {
             deferred_call_resolutions: RefCell::new(Default::default()),
             deferred_cast_checks: RefCell::new(Vec::new()),
             deferred_transmute_checks: RefCell::new(Vec::new()),
+            deferred_offload_checks: RefCell::new(Vec::new()),
             deferred_asm_checks: RefCell::new(Vec::new()),
             deferred_repeat_expr_checks: RefCell::new(Vec::new()),
             diverging_type_vars: RefCell::new(Default::default()),

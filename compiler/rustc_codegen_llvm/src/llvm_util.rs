@@ -14,14 +14,14 @@ use rustc_data_structures::small_c_str::SmallCStr;
 use rustc_fs_util::path_to_c_string;
 use rustc_middle::bug;
 use rustc_session::Session;
-use rustc_session::config::{PrintKind, PrintRequest};
+use rustc_session::config::{NATIVE_CPU, PrintKind, PrintRequest};
 use rustc_target::spec::{
     Arch, CfgAbi, Env, MergeFunctions, Os, PanicStrategy, SmallDataThresholdSupport,
 };
 use smallvec::{SmallVec, smallvec};
 
 use crate::back::write::create_informational_target_machine;
-use crate::{errors, llvm};
+use crate::{diagnostics, llvm};
 
 static INIT: Once = Once::new();
 
@@ -66,7 +66,10 @@ unsafe fn configure_llvm(sess: &Session) {
 
     let cg_opts = sess.opts.cg.llvm_args.iter().map(AsRef::as_ref);
     let tg_opts = sess.target.llvm_args.iter().map(AsRef::as_ref);
-    let sess_args = cg_opts.chain(tg_opts);
+    // Target-spec args are passed to LLVM before user `-Cllvm-args`. LLVM's
+    // `cl::opt` parser is last-wins, so this lets `-Cllvm-args=...` override
+    // a value already set in the target spec (e.g. `-wasm-use-legacy-eh`).
+    let sess_args = tg_opts.chain(cg_opts);
 
     let user_specified_args: FxHashSet<_> =
         sess_args.clone().map(|s| llvm_arg_to_arg_name(s)).filter(|s| !s.is_empty()).collect();
@@ -106,13 +109,6 @@ unsafe fn configure_llvm(sess: &Session) {
             add("-wasm-enable-eh", false);
         }
 
-        if sess.target.os == Os::Emscripten
-            && !sess.opts.unstable_opts.emscripten_wasm_eh
-            && sess.panic_strategy().unwinds()
-        {
-            add("-enable-emscripten-cxx-exceptions", false);
-        }
-
         // HACK(eddyb) LLVM inserts `llvm.assume` calls to preserve align attributes
         // during inlining. Unfortunately these may block other optimizations.
         add("-preserve-alignment-assumptions-during-inlining=false", false);
@@ -120,7 +116,7 @@ unsafe fn configure_llvm(sess: &Session) {
         // Use non-zero `import-instr-limit` multiplier for cold callsites.
         add("-import-cold-multiplier=0.1", false);
 
-        if sess.print_llvm_stats() {
+        if sess.print_llvm_stats() || sess.print_llvm_stats_json().is_some() {
             add("-stats", false);
         }
 
@@ -510,15 +506,20 @@ fn print_target_cpus(sess: &Session, tm: &llvm::TargetMachine, out: &mut String)
     };
     let mut cpus = cpu_names
         .lines()
+        .filter(|cpu_name| {
+            !sess.target.unsupported_cpus.contains(&std::borrow::Cow::Borrowed(*cpu_name))
+        })
         .map(|cpu_name| Cpu { cpu_name, remark: make_remark(cpu_name) })
         .collect::<VecDeque<_>>();
 
     // Only print the "native" entry when host and target are the same arch,
     // since otherwise it could be wrong or misleading.
-    if sess.host.arch == sess.target.arch {
+    // Also do not print it if `requires_consistent_cpu` is set, because in this case
+    // "native" would be rejected.
+    if sess.host.arch == sess.target.arch && !sess.target.requires_consistent_cpu {
         let host = get_host_cpu_name();
         cpus.push_front(Cpu {
-            cpu_name: "native",
+            cpu_name: NATIVE_CPU,
             remark: format!(" - Select the CPU of the current host (currently {host})."),
         });
     }
@@ -613,7 +614,7 @@ fn get_host_cpu_name() -> &'static str {
 /// LLVM. Otherwise, the string is returned as-is.
 fn handle_native(cpu_name: &str) -> &str {
     match cpu_name {
-        "native" => get_host_cpu_name(),
+        NATIVE_CPU => get_host_cpu_name(),
         _ => cpu_name,
     }
 }
@@ -630,11 +631,13 @@ fn llvm_features_by_flags(sess: &Session, features: &mut Vec<String>) {
     }
 
     target_features::retpoline_features_by_flags(sess, features);
+    target_features::sanitizer_features_by_flags(sess, features);
 
     // -Zfixed-x18
     if sess.opts.unstable_opts.fixed_x18 {
         if sess.target.arch != Arch::AArch64 {
-            sess.dcx().emit_fatal(errors::FixedX18InvalidArch { arch: sess.target.arch.desc() });
+            sess.dcx()
+                .emit_fatal(diagnostics::FixedX18InvalidArch { arch: sess.target.arch.desc() });
         } else {
             features.push("+reserve-x18".into());
         }
@@ -666,7 +669,7 @@ pub(crate) fn global_llvm_features(sess: &Session, only_base_features: bool) -> 
 
     // -Ctarget-cpu=native
     match sess.opts.cg.target_cpu {
-        Some(ref s) if s == "native" => {
+        Some(ref s) if s == NATIVE_CPU => {
             // We have already figured out the actual CPU name with `LLVMRustGetHostCPUName` and set
             // that for LLVM, so the features implied by that CPU name will be available everywhere.
             // However, that is not sufficient: e.g. `skylake` alone is not sufficient to tell if
@@ -736,4 +739,11 @@ pub(crate) fn global_llvm_features(sess: &Session, only_base_features: bool) -> 
 pub(crate) fn tune_cpu(sess: &Session) -> Option<&str> {
     let name = sess.opts.unstable_opts.tune_cpu.as_ref()?;
     Some(handle_native(name))
+}
+
+pub(crate) fn target_has_mnemonic(sess: &Session, mnemonic: &str) -> bool {
+    require_inited();
+    let tm = create_informational_target_machine(sess, false);
+    let cstr = SmallCStr::new(mnemonic);
+    unsafe { llvm::LLVMRustTargetHasMnemonic(tm.raw(), cstr.as_ptr()) }
 }

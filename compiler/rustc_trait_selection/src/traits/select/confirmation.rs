@@ -14,7 +14,9 @@ use rustc_hir::lang_items::LangItem;
 use rustc_infer::infer::{BoundRegionConversionTime, DefineOpaqueTypes, InferOk};
 use rustc_infer::traits::ObligationCauseCode;
 use rustc_middle::traits::{BuiltinImplSource, SignatureMismatchData};
-use rustc_middle::ty::{self, GenericArgsRef, Region, SizedTraitKind, Ty, TyCtxt, Upcast};
+use rustc_middle::ty::{
+    self, GenericArgsRef, Region, SizedTraitKind, Ty, TyCtxt, Unnormalized, Upcast,
+};
 use rustc_middle::{bug, span_bug};
 use rustc_span::def_id::DefId;
 use thin_vec::thin_vec;
@@ -136,6 +138,8 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             BikeshedGuaranteedNoDropCandidate => {
                 self.confirm_bikeshed_guaranteed_no_drop_candidate(obligation)
             }
+
+            TryAsDynCandidate => self.confirm_try_as_dyn_candidate(obligation),
         })
     }
 
@@ -180,7 +184,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             obligation.param_env,
             obligation.cause.clone(),
             obligation.recursion_depth + 1,
-            candidate,
+            ty::Unnormalized::new_wip(candidate),
             &mut obligations,
         );
 
@@ -414,7 +418,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                         obligation.param_env,
                         cause.clone(),
                         obligation.recursion_depth + 1,
-                        assumption,
+                        Unnormalized::new_wip(assumption),
                         &mut obligations,
                     );
                     self.infcx.register_region_assumption(assumption);
@@ -520,7 +524,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             obligation.param_env,
             obligation.cause.clone(),
             obligation.recursion_depth + 1,
-            upcast_trait_ref,
+            ty::Unnormalized::new_wip(upcast_trait_ref),
             &mut nested,
         );
 
@@ -534,9 +538,10 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
 
         // Check supertraits hold. This is so that their associated type bounds
         // will be checked in the code below.
-        for (supertrait, _) in tcx
-            .explicit_super_predicates_of(trait_predicate.def_id())
+        for supertrait in tcx
+            .explicit_super_clauses_of(trait_predicate.def_id())
             .iter_instantiated_copied(tcx, trait_predicate.trait_ref.args)
+            .map(|clause| clause.unzip().0)
         {
             let normalized_supertrait = normalize_with_depth_to(
                 self,
@@ -599,7 +604,9 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         let self_ty = self.infcx.shallow_resolve(placeholder_predicate.self_ty());
 
         let tcx = self.tcx();
-        let sig = self_ty.fn_sig(tcx);
+        let sig = self_ty.unnormalized_fn_sig(tcx);
+        let output_ty = sig.map(|sig| self.infcx.enter_forall_and_leak_universe(sig.output()));
+        let sig = sig.skip_norm_wip();
         let trait_ref = closure_trait_ref_and_return_type(
             tcx,
             obligation.predicate.def_id(),
@@ -614,7 +621,6 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         let cause = obligation.derived_cause(ObligationCauseCode::BuiltinDerived);
 
         // Confirm the `type Output: Sized;` bound that is present on `FnOnce`
-        let output_ty = self.infcx.enter_forall_and_leak_universe(sig.output());
         let output_ty = normalize_with_depth_to(
             self,
             obligation.param_env,
@@ -972,7 +978,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                     obligation.param_env,
                     obligation.cause.clone(),
                     obligation.recursion_depth + 1,
-                    (obligation.predicate.trait_ref, found_trait_ref),
+                    Unnormalized::new_wip((obligation.predicate.trait_ref, found_trait_ref)),
                 )
             });
 
@@ -1015,7 +1021,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
 
         let source_principal = a_data.principal().unwrap().with_self_ty(tcx, a_ty);
         let unnormalized_upcast_principal =
-            util::supertraits(tcx, source_principal).nth(idx).unwrap();
+            ty::Unnormalized::new_wip(util::supertraits(tcx, source_principal).nth(idx).unwrap());
 
         let nested = self
             .match_upcast_principal(
@@ -1309,6 +1315,37 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             }
         }
 
+        ImplSource::Builtin(BuiltinImplSource::Misc, obligations)
+    }
+
+    fn confirm_try_as_dyn_candidate(
+        &mut self,
+        obligation: &PolyTraitObligation<'tcx>,
+    ) -> ImplSource<'tcx, PredicateObligation<'tcx>> {
+        let tcx = self.tcx();
+
+        let mut obligations = PredicateObligations::new();
+
+        let self_ty = obligation.predicate.self_ty();
+        let ty_lifetime = obligation.predicate.map_bound(|p| p.trait_ref.args.region_at(1));
+
+        match *self_ty.skip_binder().kind() {
+            ty::Dynamic(_bounds, lifetime) => {
+                obligations.push(
+                    obligation.with(
+                        tcx,
+                        ty_lifetime
+                            .map_bound(|ty_lifetime| ty::OutlivesPredicate(ty_lifetime, lifetime)),
+                    ),
+                );
+            }
+
+            ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_)) => {
+                panic!("unexpected type `{self_ty:?}`")
+            }
+
+            _ => {}
+        }
         ImplSource::Builtin(BuiltinImplSource::Misc, obligations)
     }
 }

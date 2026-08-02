@@ -20,7 +20,7 @@ cfg_select! {
         pub use toyos::*;
     }
     any(
-        all(target_family = "unix", not(any(target_os = "espidf", target_os = "vita"))),
+        all(target_family = "unix", not(any(all(target_family = "wasm", target_os = "linux"), target_os = "espidf", target_os = "vita"))),
         target_os = "hermit",
     ) => {
         mod unix;
@@ -47,8 +47,12 @@ cfg_select! {
         pub use wasip1::*;
     }
     all(target_os = "wasi", any(target_env = "p2", target_env = "p3")) => {
-        mod wasip2;
-        pub use wasip2::*;
+        mod wasi;
+        pub use wasi::*;
+    }
+    all(target_family = "wasm", target_os = "linux") => {
+        mod wali;
+        pub use wali::*;
     }
     target_os = "xous" => {
         mod xous;

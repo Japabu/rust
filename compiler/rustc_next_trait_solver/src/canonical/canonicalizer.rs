@@ -3,9 +3,10 @@ use rustc_type_ir::inherent::*;
 use rustc_type_ir::solve::{Goal, QueryInput};
 use rustc_type_ir::{
     self as ty, Canonical, CanonicalParamEnvCacheEntry, CanonicalVarKind, Flags, InferCtxtLike,
-    Interner, PlaceholderConst, PlaceholderType, TypeFlags, TypeFoldable, TypeFolder,
+    Interner, PlaceholderConst, PlaceholderType, Region, TypeFlags, TypeFoldable, TypeFolder,
     TypeSuperFoldable, TypeVisitableExt,
 };
+use thin_vec::ThinVec;
 
 use crate::delegate::SolverDelegate;
 
@@ -65,7 +66,7 @@ pub(super) struct Canonicalizer<'a, D: SolverDelegate<Interner = I>, I: Interner
     canonicalize_mode: CanonicalizeMode,
 
     // Mutable fields.
-    variables: Vec<I::GenericArg>,
+    variables: ThinVec<I::GenericArg>,
     var_kinds: Vec<CanonicalVarKind<I>>,
     variable_lookup_table: HashMap<I::GenericArg, usize>,
     /// Maps each `sub_unification_table_root_var` to the index of the first
@@ -91,10 +92,10 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
             delegate,
             canonicalize_mode: CanonicalizeMode::Response { max_input_universe },
 
-            variables: Vec::new(),
+            variables: Default::default(),
             variable_lookup_table: Default::default(),
             sub_root_lookup_table: Default::default(),
-            var_kinds: Vec::new(),
+            var_kinds: Default::default(),
 
             cache: Default::default(),
         };
@@ -113,10 +114,14 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
     fn canonicalize_param_env(
         delegate: &'a D,
         param_env: I::ParamEnv,
-    ) -> (I::ParamEnv, Vec<I::GenericArg>, Vec<CanonicalVarKind<I>>, HashMap<I::GenericArg, usize>)
-    {
+    ) -> (
+        I::ParamEnv,
+        ThinVec<I::GenericArg>,
+        Vec<CanonicalVarKind<I>>,
+        HashMap<I::GenericArg, usize>,
+    ) {
         if !param_env.has_type_flags(NEEDS_CANONICAL) {
-            return (param_env, Vec::new(), Vec::new(), Default::default());
+            return (param_env, ThinVec::new(), Vec::new(), Default::default());
         }
 
         // Check whether we can use the global cache for this param_env. As we only use
@@ -134,10 +139,10 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
                         delegate,
                         canonicalize_mode: CanonicalizeMode::Input(CanonicalizeInputKind::ParamEnv),
 
-                        variables: Vec::new(),
+                        variables: Default::default(),
                         variable_lookup_table: Default::default(),
                         sub_root_lookup_table: Default::default(),
-                        var_kinds: Vec::new(),
+                        var_kinds: Default::default(),
 
                         cache: Default::default(),
                     };
@@ -159,7 +164,7 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
                     // FIXME(nnethercote): for reasons I don't understand, this `new`+`extend`
                     // combination is faster than `variables.clone()`, because it somehow avoids
                     // some allocations.
-                    let mut variables = Vec::new();
+                    let mut variables = ThinVec::new();
                     variables.extend(cache_variables.iter().copied());
                     (param_env, variables, var_kinds.clone(), variable_lookup_table.clone())
                 },
@@ -169,10 +174,10 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
                 delegate,
                 canonicalize_mode: CanonicalizeMode::Input(CanonicalizeInputKind::ParamEnv),
 
-                variables: Vec::new(),
+                variables: Default::default(),
                 variable_lookup_table: Default::default(),
                 sub_root_lookup_table: Default::default(),
-                var_kinds: Vec::new(),
+                var_kinds: Default::default(),
 
                 cache: Default::default(),
             };
@@ -198,7 +203,7 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
     pub(super) fn canonicalize_input<P: TypeFoldable<I>>(
         delegate: &'a D,
         input: QueryInput<I, P>,
-    ) -> (Vec<I::GenericArg>, ty::Canonical<I, QueryInput<I, P>>) {
+    ) -> (ThinVec<I::GenericArg>, ty::Canonical<I, QueryInput<I, P>>) {
         // First canonicalize the `param_env` while keeping `'static`
         let (param_env, variables, var_kinds, variable_lookup_table) =
             Canonicalizer::canonicalize_param_env(delegate, input.goal.param_env);
@@ -280,7 +285,7 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
         ty::BoundVar::from(idx)
     }
 
-    fn finalize(self) -> (ty::UniverseIndex, Vec<I::GenericArg>, I::CanonicalVarKinds) {
+    fn finalize(self) -> (ty::UniverseIndex, ThinVec<I::GenericArg>, I::CanonicalVarKinds) {
         let mut var_kinds = self.var_kinds;
         // See the rustc-dev-guide section about how we deal with universes
         // during canonicalization in the new solver.
@@ -391,7 +396,7 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
             | ty::CoroutineWitness(..)
             | ty::Never
             | ty::Tuple(_)
-            | ty::Alias(_)
+            | ty::Alias(_, _)
             | ty::Bound(_, _)
             | ty::Error(_) => {
                 return ensure_sufficient_stack(|| t.super_fold_with(self));
@@ -409,7 +414,12 @@ impl<D: SolverDelegate<Interner = I>, I: Interner> TypeFolder<I> for Canonicaliz
         self.delegate.cx()
     }
 
-    fn fold_region(&mut self, r: I::Region) -> I::Region {
+    fn fold_region(&mut self, r: Region<I>) -> Region<I> {
+        // We canonicalize free regions from the input into placeholder regions so that
+        // region constraints created in nested contexts can be propagated back to the
+        // caller, instead of unifying them.
+        // See the following Zulip discussion for details:
+        // https://rust-lang.zulipchat.com/#narrow/channel/364551-t-types.2Ftrait-system-refactor/topic/A.20question.20on.20.23251/near/579240238
         let kind = match r.kind() {
             ty::ReBound(..) => return r,
 
@@ -417,7 +427,10 @@ impl<D: SolverDelegate<Interner = I>, I: Interner> TypeFolder<I> for Canonicaliz
             // when checking whether a `ParamEnv` candidate is global.
             ty::ReStatic => match self.canonicalize_mode {
                 CanonicalizeMode::Input(CanonicalizeInputKind::Predicate) => {
-                    CanonicalVarKind::Region(ty::UniverseIndex::ROOT)
+                    CanonicalVarKind::PlaceholderRegion(ty::PlaceholderRegion::new_anon(
+                        ty::UniverseIndex::ROOT,
+                        self.variables.len().into(),
+                    ))
                 }
                 CanonicalizeMode::Input(CanonicalizeInputKind::ParamEnv)
                 | CanonicalizeMode::Response { .. } => return r,
@@ -431,24 +444,41 @@ impl<D: SolverDelegate<Interner = I>, I: Interner> TypeFolder<I> for Canonicaliz
             // `ReErased`. We may be able to short-circuit registering region
             // obligations if we encounter a `ReErased` on one side, for example.
             ty::ReErased | ty::ReError(_) => match self.canonicalize_mode {
-                CanonicalizeMode::Input(_) => CanonicalVarKind::Region(ty::UniverseIndex::ROOT),
+                CanonicalizeMode::Input(_) => {
+                    CanonicalVarKind::PlaceholderRegion(ty::PlaceholderRegion::new_anon(
+                        ty::UniverseIndex::ROOT,
+                        self.variables.len().into(),
+                    ))
+                }
                 CanonicalizeMode::Response { .. } => return r,
             },
 
             ty::ReEarlyParam(_) | ty::ReLateParam(_) => match self.canonicalize_mode {
-                CanonicalizeMode::Input(_) => CanonicalVarKind::Region(ty::UniverseIndex::ROOT),
+                CanonicalizeMode::Input(_) => {
+                    CanonicalVarKind::PlaceholderRegion(ty::PlaceholderRegion::new_anon(
+                        ty::UniverseIndex::ROOT,
+                        self.variables.len().into(),
+                    ))
+                }
                 CanonicalizeMode::Response { .. } => {
                     panic!("unexpected region in response: {r:?}")
                 }
             },
 
             ty::RePlaceholder(placeholder) => match self.canonicalize_mode {
-                // We canonicalize placeholder regions as existentials in query inputs.
-                CanonicalizeMode::Input(_) => CanonicalVarKind::Region(ty::UniverseIndex::ROOT),
+                CanonicalizeMode::Input(_) => {
+                    CanonicalVarKind::PlaceholderRegion(ty::PlaceholderRegion::new_anon(
+                        ty::UniverseIndex::ROOT,
+                        self.variables.len().into(),
+                    ))
+                }
                 CanonicalizeMode::Response { max_input_universe } => {
                     // If we have a placeholder region inside of a query, it must be from
-                    // a new universe.
-                    if max_input_universe.can_name(placeholder.universe()) {
+                    // a new universe, unless from the root universe, which is used for
+                    // canonicalization of any free region from the input.
+                    if placeholder.universe() != ty::UniverseIndex::ROOT
+                        && max_input_universe.can_name(placeholder.universe())
+                    {
                         panic!("new placeholder in universe {max_input_universe:?}: {r:?}");
                     }
                     CanonicalVarKind::PlaceholderRegion(placeholder)
@@ -462,7 +492,12 @@ impl<D: SolverDelegate<Interner = I>, I: Interner> TypeFolder<I> for Canonicaliz
                     "region vid should have been resolved fully before canonicalization"
                 );
                 match self.canonicalize_mode {
-                    CanonicalizeMode::Input(_) => CanonicalVarKind::Region(ty::UniverseIndex::ROOT),
+                    CanonicalizeMode::Input(_) => {
+                        CanonicalVarKind::PlaceholderRegion(ty::PlaceholderRegion::new_anon(
+                            ty::UniverseIndex::ROOT,
+                            self.variables.len().into(),
+                        ))
+                    }
                     CanonicalizeMode::Response { .. } => {
                         CanonicalVarKind::Region(self.delegate.universe_of_lt(vid).unwrap())
                     }
@@ -511,7 +546,7 @@ impl<D: SolverDelegate<Interner = I>, I: Interner> TypeFolder<I> for Canonicaliz
                         }
                     }
                 }
-                ty::InferConst::Fresh(_) => todo!(),
+                ty::InferConst::Fresh(_) => unimplemented!(),
             },
             ty::ConstKind::Placeholder(placeholder) => match self.canonicalize_mode {
                 CanonicalizeMode::Input { .. } => {
@@ -535,7 +570,7 @@ impl<D: SolverDelegate<Interner = I>, I: Interner> TypeFolder<I> for Canonicaliz
             },
             // FIXME: See comment above -- we could fold the region separately or something.
             ty::ConstKind::Bound(_, _)
-            | ty::ConstKind::Unevaluated(_)
+            | ty::ConstKind::Alias(_, _)
             | ty::ConstKind::Value(_)
             | ty::ConstKind::Error(_)
             | ty::ConstKind::Expr(_) => return c.super_fold_with(self),

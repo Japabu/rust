@@ -21,6 +21,8 @@ use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::ty::adjustment::PointerCoercion;
 
+use crate::PassPolicy;
+
 pub(super) struct CleanupPostBorrowck;
 
 impl<'tcx> crate::MirPass<'tcx> for CleanupPostBorrowck {
@@ -31,7 +33,7 @@ impl<'tcx> crate::MirPass<'tcx> for CleanupPostBorrowck {
             for statement in basic_block.statements.iter_mut() {
                 match statement.kind {
                     StatementKind::AscribeUserType(..)
-                    | StatementKind::Assign(box (_, Rvalue::Ref(_, BorrowKind::Fake(_), _)))
+                    | StatementKind::Assign((_, Rvalue::Ref(_, BorrowKind::Fake(_), _)))
                     | StatementKind::Coverage(
                         // These kinds of coverage statements are markers inserted during
                         // MIR building, and are not needed after InstrumentCoverage.
@@ -41,7 +43,7 @@ impl<'tcx> crate::MirPass<'tcx> for CleanupPostBorrowck {
                     | StatementKind::BackwardIncompatibleDropHint { .. } => {
                         statement.make_nop(true)
                     }
-                    StatementKind::Assign(box (
+                    StatementKind::Assign((
                         _,
                         Rvalue::Cast(
                             ref mut cast_kind @ CastKind::PointerCoercion(
@@ -85,7 +87,8 @@ impl<'tcx> crate::MirPass<'tcx> for CleanupPostBorrowck {
         }
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _sess: &rustc_session::Session) -> PassPolicy {
+        // Removes administrative MIR instructions that later passes must never see.
+        PassPolicy::Required
     }
 }

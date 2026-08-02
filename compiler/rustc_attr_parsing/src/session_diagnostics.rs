@@ -1,26 +1,50 @@
 use std::num::IntErrorKind;
 
-use rustc_ast as ast;
 use rustc_errors::codes::*;
 use rustc_errors::{
     Applicability, Diag, DiagArgValue, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level,
 };
-use rustc_feature::AttributeTemplate;
 use rustc_hir::AttrPath;
 use rustc_hir::attrs::{MirDialect, MirPhase};
 use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_span::{Span, Symbol};
 use rustc_target::spec::TargetTuple;
 
+use crate::AttributeTemplate;
 use crate::context::Suggestion;
 
 #[derive(Diagnostic)]
-#[diag("invalid predicate `{$predicate}`", code = E0537)]
-pub(crate) struct InvalidPredicate {
+#[diag("`#[rustc_force_inline]` and `#[inline]` cannot be used together")]
+pub(crate) struct InlineForceInlineConflict {
     #[primary_span]
-    pub span: Span,
+    pub force_inline_span: Span,
+    #[label("the inline attribute is specified here")]
+    pub inline_span: Span,
+}
 
-    pub predicate: String,
+#[derive(Diagnostic)]
+#[diag("`#[ffi_const]` function cannot be `#[ffi_pure]`", code = E0757)]
+pub(crate) struct BothFfiConstAndPure {
+    #[primary_span]
+    pub attr_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("attribute should be applied to `#[repr(transparent)]` types")]
+pub(crate) struct RustcPubTransparent {
+    #[primary_span]
+    pub attr_span: Span,
+    #[label("not a `#[repr(transparent)]` type")]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("attribute should be applied to a macro")]
+pub(crate) struct MacroOnlyAttribute {
+    #[primary_span]
+    pub attr_span: Span,
+    #[label("not a macro")]
+    pub span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -81,6 +105,46 @@ pub(crate) struct DocAttributeNotAttribute {
     #[primary_span]
     pub span: Span,
     pub attribute: Symbol,
+}
+
+#[derive(Diagnostic)]
+#[diag(
+    "`#[target_feature]` cannot be applied to a {$kind ->
+        [panic_handler] `#[panic_handler]`
+        *[other] lang item
+    } function"
+)]
+pub(crate) struct TargetFeatureOnLangItem {
+    #[primary_span]
+    pub attr_span: Span,
+    pub kind: Symbol,
+    #[label(
+        "{$kind ->
+            [panic_handler] `#[panic_handler]`
+            *[other] lang item
+        } function is not allowed to have `#[target_feature]`"
+    )]
+    pub item_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(
+    "{$name ->
+    [panic_impl] `#[panic_handler]`
+    *[other] `{$name}` lang item
+} function is not allowed to have `#[track_caller]`"
+)]
+pub(crate) struct TrackCallerOnLangItem {
+    #[primary_span]
+    pub attr_span: Span,
+    pub name: Symbol,
+    #[label(
+        "{$name ->
+            [panic_impl] `#[panic_handler]`
+            *[other] `{$name}` lang item
+        } function is not allowed to have `#[track_caller]`"
+    )]
+    pub sig_span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -183,134 +247,6 @@ pub(crate) struct MissingIssue {
     pub span: Span,
 }
 
-// FIXME: Why is this the same error code as `InvalidReprHintNoParen` and `InvalidReprHintNoValue`?
-// It is more similar to `IncorrectReprFormatGeneric`.
-#[derive(Diagnostic)]
-#[diag("incorrect `repr(packed)` attribute format: `packed` takes exactly one parenthesized argument, or no parentheses at all", code = E0552)]
-pub(crate) struct IncorrectReprFormatPackedOneOrZeroArg {
-    #[primary_span]
-    pub span: Span,
-}
-#[derive(Diagnostic)]
-#[diag("incorrect `repr(packed)` attribute format: `packed` expects a literal integer as argument", code = E0552)]
-pub(crate) struct IncorrectReprFormatPackedExpectInteger {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("invalid representation hint: `{$name}` does not take a parenthesized argument list", code = E0552)]
-pub(crate) struct InvalidReprHintNoParen {
-    #[primary_span]
-    pub span: Span,
-
-    pub name: Symbol,
-}
-
-#[derive(Diagnostic)]
-#[diag("invalid representation hint: `{$name}` does not take a value", code = E0552)]
-pub(crate) struct InvalidReprHintNoValue {
-    #[primary_span]
-    pub span: Span,
-
-    pub name: Symbol,
-}
-
-#[derive(Diagnostic)]
-#[diag("invalid `repr(align)` attribute: `align` needs an argument", code = E0589)]
-pub(crate) struct InvalidReprAlignNeedArg {
-    #[primary_span]
-    #[suggestion(
-        "supply an argument here",
-        code = "align(...)",
-        applicability = "has-placeholders"
-    )]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("invalid `repr({$repr_arg})` attribute: {$error_part}", code = E0589)]
-pub(crate) struct InvalidReprGeneric {
-    #[primary_span]
-    pub span: Span,
-
-    pub repr_arg: String,
-    pub error_part: String,
-}
-
-#[derive(Diagnostic)]
-#[diag("incorrect `repr(align)` attribute format: `align` takes exactly one argument in parentheses", code = E0693)]
-pub(crate) struct IncorrectReprFormatAlignOneArg {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("incorrect `repr(align)` attribute format: `align` expects a literal integer as argument", code = E0693)]
-pub(crate) struct IncorrectReprFormatExpectInteger {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("incorrect `repr({$repr_arg})` attribute format", code = E0693)]
-pub(crate) struct IncorrectReprFormatGeneric {
-    #[primary_span]
-    pub span: Span,
-
-    pub repr_arg: Symbol,
-
-    #[subdiagnostic]
-    pub cause: Option<IncorrectReprFormatGenericCause>,
-}
-
-#[derive(Subdiagnostic)]
-pub(crate) enum IncorrectReprFormatGenericCause {
-    #[suggestion(
-        "use parentheses instead",
-        code = "{name}({value})",
-        applicability = "machine-applicable"
-    )]
-    Int {
-        #[primary_span]
-        span: Span,
-
-        #[skip_arg]
-        name: Symbol,
-
-        #[skip_arg]
-        value: u128,
-    },
-
-    #[suggestion(
-        "use parentheses instead",
-        code = "{name}({value})",
-        applicability = "machine-applicable"
-    )]
-    Symbol {
-        #[primary_span]
-        span: Span,
-
-        #[skip_arg]
-        name: Symbol,
-
-        #[skip_arg]
-        value: Symbol,
-    },
-}
-
-impl IncorrectReprFormatGenericCause {
-    pub(crate) fn from_lit_kind(span: Span, kind: &ast::LitKind, name: Symbol) -> Option<Self> {
-        match *kind {
-            ast::LitKind::Int(value, ast::LitIntType::Unsuffixed) => {
-                Some(Self::Int { span, name, value: value.get() })
-            }
-            ast::LitKind::Str(value, _) => Some(Self::Symbol { span, name, value }),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Diagnostic)]
 #[diag("`rustc_promotable` attribute must be paired with either a `rustc_const_unstable` or a `rustc_const_stable` attribute", code = E0717)]
 pub(crate) struct RustcPromotablePairing {
@@ -397,6 +333,20 @@ pub(crate) struct UnusedMultiple {
 }
 
 #[derive(Diagnostic)]
+#[diag("`export_name` may not be empty")]
+pub(crate) struct EmptyExportName {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("`section` may not be empty")]
+pub(crate) struct EmptySection {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag("`export_name` may not contain null characters", code = E0648)]
 pub(crate) struct NullOnExport {
     #[primary_span]
@@ -406,6 +356,13 @@ pub(crate) struct NullOnExport {
 #[derive(Diagnostic)]
 #[diag("`link_section` may not contain null characters", code = E0648)]
 pub(crate) struct NullOnLinkSection {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("link name may not contain null characters", code = E0648)]
+pub(crate) struct NullOnLinkName {
     #[primary_span]
     pub span: Span,
 }
@@ -425,6 +382,13 @@ pub(crate) struct NullOnObjcSelector {
 }
 
 #[derive(Diagnostic)]
+#[diag("`section` may not contain null characters", code = E0648)]
+pub(crate) struct NullOnSection {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag("`objc::class!` expected a string literal")]
 pub(crate) struct ObjcClassExpectedStringLiteral {
     #[primary_span]
@@ -439,13 +403,6 @@ pub(crate) struct ObjcSelectorExpectedStringLiteral {
 }
 
 #[derive(Diagnostic)]
-#[diag("stability attributes may not be used outside of the standard library", code = E0734)]
-pub(crate) struct StabilityOutsideStd {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag("expected at least one confusable name")]
 pub(crate) struct EmptyConfusables {
     #[primary_span]
@@ -453,21 +410,53 @@ pub(crate) struct EmptyConfusables {
 }
 
 #[derive(Diagnostic)]
-#[help("`#[{$name}]` can {$only}be applied to {$applied}")]
-#[diag("`#[{$name}]` attribute cannot be used on {$target}")]
+#[help("the `{$name}{$attribute_args}` attribute can {$only}be applied to {$applied}")]
+#[diag("the `{$name}{$attribute_args}` attribute cannot be used on {$target}")]
 pub(crate) struct InvalidTarget {
     #[primary_span]
+    pub span: Span,
     #[suggestion(
         "remove the attribute",
         code = "",
         applicability = "machine-applicable",
         style = "tool-only"
     )]
-    pub span: Span,
+    pub attr_span: Span,
     pub name: AttrPath,
     pub target: &'static str,
     pub applied: DiagArgValue,
     pub only: &'static str,
+    pub attribute_args: String,
+    #[subdiagnostic]
+    pub help: Option<InvalidTargetHelp>,
+    #[warning(
+        "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!"
+    )]
+    pub previously_accepted: bool,
+    #[note(
+        "placing this attribute on a macro invocation does nothing even if the macro expands to what would be a valid target for the attribute"
+    )]
+    pub on_macro_call: bool,
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum InvalidTargetHelp {
+    #[multipart_suggestion(
+        "did you mean to use `#[export_name]`?",
+        applicability = "maybe-incorrect"
+    )]
+    UseExportName {
+        #[suggestion_part(code = "unsafe(")]
+        unsafe_open: Option<Span>,
+        #[suggestion_part(code = "export_name")]
+        name: Span,
+        #[suggestion_part(code = ")")]
+        unsafe_close: Option<Span>,
+    },
+    #[help("use `#[rustc_align(...)]` instead")]
+    UseRustcAlign,
+    #[help("use `#[rustc_align_static(...)]` instead")]
+    UseRustcAlignStatic,
 }
 
 #[derive(Diagnostic)]
@@ -476,26 +465,6 @@ pub(crate) struct InvalidAlignmentValue {
     #[primary_span]
     pub span: Span,
     pub error_part: String,
-}
-
-#[derive(Diagnostic)]
-#[diag("meta item in `repr` must be an identifier", code = E0565)]
-pub(crate) struct ReprIdent {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("unrecognized representation hint", code = E0552)]
-#[help(
-    "valid reprs are `Rust` (default), `C`, `align`, `packed`, `transparent`, `simd`, `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i64`, `u64`, `i128`, `u128`, `isize`, `usize`"
-)]
-#[note(
-    "for more information, visit <https://doc.rust-lang.org/reference/type-layout.html?highlight=repr#representations>"
-)]
-pub(crate) struct UnrecognizedReprHint {
-    #[primary_span]
-    pub span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -557,6 +526,7 @@ pub(crate) enum AttributeParseErrorReason<'a> {
         upper_bound: isize,
     },
     ExpectedAtLeastOneArgument,
+    ExpectedArgument,
     ExpectedSingleArgument,
     ExpectedList,
     ExpectedListOrNoArgs,
@@ -567,6 +537,7 @@ pub(crate) enum AttributeParseErrorReason<'a> {
     ExpectedNonEmptyStringLiteral,
     ExpectedNotLiteral,
     ExpectedNameValue(Option<Symbol>),
+    MissingNameValue(Symbol),
     DuplicateKey(Symbol),
     ExpectedSpecificArgument {
         possibilities: &'a [Symbol],
@@ -575,10 +546,6 @@ pub(crate) enum AttributeParseErrorReason<'a> {
         list: bool,
     },
     ExpectedIdentifier,
-    ExpectedNameValueAsLastArgument {
-        span: Span,
-        name_value_key: Symbol,
-    },
 }
 
 /// A description of a thing that can be parsed using an attribute parser.
@@ -592,7 +559,7 @@ pub enum ParsedDescription {
 
 pub(crate) struct AttributeParseError<'a> {
     pub(crate) span: Span,
-    pub(crate) attr_span: Span,
+    pub(crate) inner_span: Span,
     pub(crate) template: AttributeTemplate,
     pub(crate) path: AttrPath,
     pub(crate) description: ParsedDescription,
@@ -686,7 +653,7 @@ impl<'a> AttributeParseError<'a> {
         match &self.suggestions {
             AttributeParseErrorSuggestions::CreatedByTemplate(suggestions) => {
                 diag.span_suggestions(
-                        self.attr_span,
+                        self.inner_span,
                         if suggestions.len() == 1 {
                             "must be of the form".to_string()
                         } else {
@@ -703,8 +670,8 @@ impl<'a> AttributeParseError<'a> {
                 for Suggestion { msg, sp, code } in suggestions {
                     diag.span_suggestion_verbose(
                         *sp,
-                        msg.to_string(),
-                        code.to_string(),
+                        msg.clone(),
+                        code.clone(),
                         Applicability::MaybeIncorrect,
                     );
                 }
@@ -736,7 +703,7 @@ impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for AttributeParseError<'_> {
         let description = self.description();
 
         let mut diag = Diag::new(dcx, level, format!("malformed `{name}` {description} input"));
-        diag.span(self.attr_span);
+        diag.span(self.inner_span);
         diag.code(E0539);
         match &self.reason {
             AttributeParseErrorReason::ExpectedStringLiteral { byte_string } => {
@@ -752,9 +719,8 @@ impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for AttributeParseError<'_> {
                     // Avoid emitting an "attribute must be of the form" suggestion, as the
                     // attribute is likely to be well-formed already.
                     return diag;
-                } else {
-                    diag.span_label(self.span, "expected a string literal here");
                 }
+                diag.span_label(self.span, "expected a string literal here");
             }
             AttributeParseErrorReason::ExpectedFilenameLiteral => {
                 diag.span_label(self.span, "expected a filename string literal here");
@@ -775,6 +741,10 @@ impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for AttributeParseError<'_> {
             }
             AttributeParseErrorReason::ExpectedSingleArgument => {
                 diag.span_label(self.span, "expected a single argument here");
+                diag.code(E0805);
+            }
+            AttributeParseErrorReason::ExpectedArgument => {
+                diag.span_label(self.span, "expected an argument here");
                 diag.code(E0805);
             }
             AttributeParseErrorReason::ExpectedAtLeastOneArgument => {
@@ -808,12 +778,10 @@ impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for AttributeParseError<'_> {
                 diag.code(E0565);
             }
             AttributeParseErrorReason::ExpectedNameValue(None) => {
-                // If the span is the entire attribute, the suggestion we add below this match already contains enough information
-                if self.span != self.attr_span {
-                    diag.span_label(
-                        self.span,
-                        format!("expected this to be of the form `... = \"...\"`"),
-                    );
+                // If the span is the entire attribute inner, the suggestion we add below this
+                // match already contains enough information.
+                if self.span != self.inner_span {
+                    diag.span_label(self.span, "expected this to be of the form `... = \"...\"`");
                 }
             }
             AttributeParseErrorReason::ExpectedNameValue(Some(name)) => {
@@ -822,28 +790,26 @@ impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for AttributeParseError<'_> {
                     format!("expected this to be of the form `{name} = \"...\"`"),
                 );
             }
+            AttributeParseErrorReason::MissingNameValue(name) => {
+                diag.span_label(self.span, format!("missing argument `{name} = \"...\"`"));
+            }
             AttributeParseErrorReason::ExpectedSpecificArgument {
                 possibilities,
                 strings,
                 list: false,
             } => {
-                self.render_expected_specific_argument(&mut diag, *possibilities, *strings);
+                self.render_expected_specific_argument(&mut diag, possibilities, *strings);
             }
             AttributeParseErrorReason::ExpectedSpecificArgument {
                 possibilities,
                 strings,
                 list: true,
             } => {
-                self.render_expected_specific_argument_list(&mut diag, *possibilities, *strings);
+                self.render_expected_specific_argument_list(&mut diag, possibilities, *strings);
             }
             AttributeParseErrorReason::ExpectedIdentifier => {
                 diag.span_label(self.span, "expected a valid identifier here");
-            }
-            AttributeParseErrorReason::ExpectedNameValueAsLastArgument { span, name_value_key } => {
-                diag.span_label(
-                    *span,
-                    format!("expected {name_value_key} = \"...\" to be the last argument"),
-                );
+                diag.code(E0565);
             }
         }
 
@@ -982,13 +948,6 @@ pub(crate) struct IncompatibleWasmLink {
 pub(crate) struct LinkRequiresName {
     #[primary_span]
     #[label("missing `name` argument")]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("link name must not contain NUL characters if link kind is `raw-dylib`")]
-pub(crate) struct RawDylibNoNul {
-    #[primary_span]
     pub span: Span,
 }
 
@@ -1140,12 +1099,64 @@ pub(crate) struct UnstableAttrForAlreadyStableFeature {
 }
 
 #[derive(Diagnostic)]
-#[diag("unknown tool name `{$tool_name}` found in scoped lint: `{$full_lint_name}`", code = E0710)]
-pub(crate) struct UnknownToolInScopedLint {
+#[diag("invalid Mach-O section specifier")]
+pub(crate) struct InvalidMachoSection {
     #[primary_span]
-    pub span: Option<Span>,
-    pub tool_name: Symbol,
-    pub full_lint_name: Symbol,
-    #[help("add `#![register_tool({$tool_name})]` to the crate root")]
-    pub is_nightly_build: bool,
+    #[label("not a valid Mach-O section specifier")]
+    pub name_span: Span,
+    #[subdiagnostic]
+    pub reason: InvalidMachoSectionReason,
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum InvalidMachoSectionReason {
+    #[note("a Mach-O section specifier requires a segment and a section, separated by a comma")]
+    #[help("an example of a valid Mach-O section specifier is `__TEXT,__cstring`")]
+    MissingSection,
+    #[note("section name `{$section}` is longer than 16 bytes")]
+    SectionTooLong { section: String },
+}
+
+#[derive(Diagnostic)]
+#[diag("`#[sanitize({$field} = ...)]` attribute cannot be used on statics")]
+#[help("`#[sanitize]` can be used on statics if only the address is sanitized")]
+pub(crate) struct SanitizeInvalidStatic {
+    #[primary_span]
+    pub span: Span,
+    pub field: &'static str,
+}
+
+#[derive(Diagnostic)]
+#[diag("attribute items not separated with `,`")]
+pub(crate) struct ExpectedComma {
+    #[primary_span]
+    #[suggestion(
+        "try adding `,` here",
+        code = ",",
+        applicability = "maybe-incorrect",
+        style = "short"
+    )]
+    pub span: Span,
+    #[subdiagnostic]
+    pub additional: Vec<AdditionalCommaSuggestion>,
+}
+
+#[derive(Subdiagnostic)]
+#[suggestion("try adding `,` here", code = ",", applicability = "maybe-incorrect", style = "short")]
+pub(crate) struct AdditionalCommaSuggestion {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("unused attribute")]
+pub(crate) struct UnusedDuplicate {
+    #[suggestion("remove this attribute", code = "", applicability = "machine-applicable")]
+    pub this: Span,
+    #[note("attribute also specified here")]
+    pub other: Span,
+    #[warning(
+        "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!"
+    )]
+    pub warning: bool,
 }

@@ -209,7 +209,7 @@ to help make the perf comparison as fair as possible.
 >
 > 3. Run the prescribed try jobs with `@bors try`. As aforementioned, this
 >    requires the user to either (1) have `try` permissions or (2) be delegated
->    with `try` permissions by `@bors delegate=try` by someone who has `try`
+>    with `try` permissions by `@bors delegate try` by someone who has `try`
 >    permissions.
 >
 > Note that this is usually easier to do than manually edit [`jobs.yml`].
@@ -453,6 +453,23 @@ More information is available in the [toolstate documentation].
 
 [rust-toolstate]: https://rust-lang-nursery.github.io/rust-toolstate
 [toolstate documentation]: https://forge.rust-lang.org/infra/toolstate.html
+
+## Public CI dashboard
+
+To monitor the Rust CI, you can have a look at the [public dashboard] maintained by the infra team.
+
+These are some useful panels from the dashboard:
+
+- Pipeline duration: check how long the auto builds take to run.
+- Top slowest jobs: check which jobs are taking the longest to run.
+- Change in median job duration: check what jobs are slowest than before.
+  This is useful for detecting regressions.
+- Top failed jobs: check which jobs are failing the most.
+
+To learn more about the dashboard, see the [Datadog CI docs].
+
+[Datadog CI docs]: https://docs.datadoghq.com/continuous_integration/
+[public dashboard]: https://p.datadoghq.com/sb/3a172e20-e9e1-11ed-80e3-da7ad0900002-b5f7bb7e08b664a06b08527da85f7e30
 
 ## Determining the CI configuration
 

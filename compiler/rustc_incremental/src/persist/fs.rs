@@ -120,7 +120,7 @@ use rustc_session::{Session, StableCrateId};
 use rustc_span::Symbol;
 use tracing::debug;
 
-use crate::errors;
+use crate::diagnostics;
 
 #[cfg(test)]
 mod tests;
@@ -184,15 +184,7 @@ fn lock_file_path(session_dir: &Path) -> PathBuf {
 /// Returns the path for a given filename within the incremental compilation directory
 /// in the current session.
 pub fn in_incr_comp_dir_sess(sess: &Session, file_name: &str) -> PathBuf {
-    in_incr_comp_dir(&sess.incr_comp_session_dir(), file_name)
-}
-
-/// Returns the path for a given filename within the incremental compilation directory,
-/// not necessarily from the current session.
-///
-/// To ensure the file is part of the current session, use [`in_incr_comp_dir_sess`].
-pub fn in_incr_comp_dir(incr_comp_session_dir: &Path, file_name: &str) -> PathBuf {
-    incr_comp_session_dir.join(file_name)
+    sess.incr_comp_session_dir().join(file_name)
 }
 
 /// Allocates the private session directory.
@@ -233,7 +225,7 @@ pub(crate) fn prepare_session_directory(
     let crate_dir = match try_canonicalize(&crate_dir) {
         Ok(v) => v,
         Err(err) => {
-            sess.dcx().emit_fatal(errors::CanonicalizePath { path: crate_dir, err });
+            sess.dcx().emit_fatal(diagnostics::CanonicalizePath { path: crate_dir, err });
         }
     };
 
@@ -276,7 +268,7 @@ pub(crate) fn prepare_session_directory(
             debug!("successfully copied data from: {}", source_directory.display());
 
             if !allows_links {
-                sess.dcx().emit_warn(errors::HardLinkFailed { path: &session_dir });
+                sess.dcx().emit_warn(diagnostics::HardLinkFailed { path: &session_dir });
             }
 
             sess.init_incr_comp_session(session_dir, directory_lock);
@@ -291,7 +283,7 @@ pub(crate) fn prepare_session_directory(
             // Try to remove the session directory we just allocated. We don't
             // know if there's any garbage in it from the failed copy action.
             if let Err(err) = std_fs::remove_dir_all(&session_dir) {
-                sess.dcx().emit_warn(errors::DeletePartial { path: &session_dir, err });
+                sess.dcx().emit_warn(diagnostics::DeletePartial { path: &session_dir, err });
             }
 
             delete_session_dir_lock_file(sess, &lock_file_path);
@@ -302,9 +294,10 @@ pub(crate) fn prepare_session_directory(
 
 /// This function finalizes and thus 'publishes' the session directory by
 /// renaming it to `s-{timestamp}-{svh}` and releasing the file lock.
-/// If there have been compilation errors, however, this function will just
-/// delete the presumably invalid session directory.
+/// This must not be called if there have been any compilation errors.
 pub fn finalize_session_directory(sess: &Session, svh: Option<Svh>) {
+    assert!(sess.dcx().has_errors_or_delayed_bugs().is_none());
+
     if sess.opts.incremental.is_none() {
         return;
     }
@@ -314,24 +307,6 @@ pub fn finalize_session_directory(sess: &Session, svh: Option<Svh>) {
     let _timer = sess.timer("incr_comp_finalize_session_directory");
 
     let incr_comp_session_dir: PathBuf = sess.incr_comp_session_dir().clone();
-
-    if sess.dcx().has_errors_or_delayed_bugs().is_some() {
-        // If there have been any errors during compilation, we don't want to
-        // publish this session directory. Rather, we'll just delete it.
-
-        debug!(
-            "finalize_session_directory() - invalidating session directory: {}",
-            incr_comp_session_dir.display()
-        );
-
-        if let Err(err) = std_fs::remove_dir_all(&*incr_comp_session_dir) {
-            sess.dcx().emit_warn(errors::DeleteFull { path: &incr_comp_session_dir, err });
-        }
-
-        let lock_file_path = lock_file_path(&*incr_comp_session_dir);
-        delete_session_dir_lock_file(sess, &lock_file_path);
-        sess.mark_incr_comp_session_as_invalid();
-    }
 
     debug!("finalize_session_directory() - session directory: {}", incr_comp_session_dir.display());
 
@@ -358,21 +333,19 @@ pub fn finalize_session_directory(sess: &Session, svh: Option<Svh>) {
     match rename_path_with_retry(&*incr_comp_session_dir, &new_path, 3) {
         Ok(_) => {
             debug!("finalize_session_directory() - directory renamed successfully");
-
-            // This unlocks the directory
-            sess.finalize_incr_comp_session(new_path);
         }
         Err(e) => {
             // Warn about the error. However, no need to abort compilation now.
-            sess.dcx().emit_note(errors::Finalize { path: &incr_comp_session_dir, err: e });
+            sess.dcx().emit_note(diagnostics::Finalize { path: &incr_comp_session_dir, err: e });
 
-            debug!("finalize_session_directory() - error, marking as invalid");
-            // Drop the file lock, so we can garage collect
-            sess.mark_incr_comp_session_as_invalid();
+            debug!("finalize_session_directory() - error");
         }
     }
 
-    let _ = garbage_collect_session_directories(sess);
+    // This unlocks the directory
+    sess.finalize_incr_comp_session();
+
+    let _ = garbage_collect_session_directories(sess, &new_path);
 }
 
 pub(crate) fn delete_all_session_dir_contents(sess: &Session) -> io::Result<()> {
@@ -464,7 +437,9 @@ fn create_dir(sess: &Session, path: &Path, dir_tag: &str) {
         Ok(()) => {
             debug!("{} directory created successfully", dir_tag);
         }
-        Err(err) => sess.dcx().emit_fatal(errors::CreateIncrCompDir { tag: dir_tag, path, err }),
+        Err(err) => {
+            sess.dcx().emit_fatal(diagnostics::CreateIncrCompDir { tag: dir_tag, path, err })
+        }
     }
 }
 
@@ -483,7 +458,7 @@ fn lock_directory(sess: &Session, session_dir: &Path) -> (flock::Lock, PathBuf) 
         Ok(lock) => (lock, lock_file_path),
         Err(lock_err) => {
             let is_unsupported_lock = flock::Lock::error_unsupported(&lock_err);
-            sess.dcx().emit_fatal(errors::CreateLock {
+            sess.dcx().emit_fatal(diagnostics::CreateLock {
                 lock_err,
                 session_dir,
                 is_unsupported_lock,
@@ -495,7 +470,7 @@ fn lock_directory(sess: &Session, session_dir: &Path) -> (flock::Lock, PathBuf) 
 
 fn delete_session_dir_lock_file(sess: &Session, lock_file_path: &Path) {
     if let Err(err) = safe_remove_file(lock_file_path) {
-        sess.dcx().emit_warn(errors::DeleteLock { path: lock_file_path, err });
+        sess.dcx().emit_warn(diagnostics::DeleteLock { path: lock_file_path, err });
     }
 }
 
@@ -608,10 +583,12 @@ fn is_old_enough_to_be_collected(timestamp: SystemTime) -> bool {
 }
 
 /// Runs garbage collection for the current session.
-pub(crate) fn garbage_collect_session_directories(sess: &Session) -> io::Result<()> {
+pub(crate) fn garbage_collect_session_directories(
+    sess: &Session,
+    session_directory: &Path,
+) -> io::Result<()> {
     debug!("garbage_collect_session_directories() - begin");
 
-    let session_directory = sess.incr_comp_session_dir();
     debug!(
         "garbage_collect_session_directories() - session directory: {}",
         session_directory.display()
@@ -708,7 +685,7 @@ pub(crate) fn garbage_collect_session_directories(sess: &Session) -> io::Result<
         if !lock_file_to_session_dir.items().any(|(_, dir)| *dir == directory_name) {
             let path = crate_directory.join(directory_name);
             if let Err(err) = std_fs::remove_dir_all(&path) {
-                sess.dcx().emit_warn(errors::InvalidGcFailed { path: &path, err });
+                sess.dcx().emit_warn(diagnostics::InvalidGcFailed { path: &path, err });
             }
         }
     }
@@ -840,7 +817,7 @@ pub(crate) fn garbage_collect_session_directories(sess: &Session) -> io::Result<
         debug!("garbage_collect_session_directories() - deleting `{}`", path.display());
 
         if let Err(err) = std_fs::remove_dir_all(&path) {
-            sess.dcx().emit_warn(errors::FinalizedGcFailed { path: &path, err });
+            sess.dcx().emit_warn(diagnostics::FinalizedGcFailed { path: &path, err });
         } else {
             delete_session_dir_lock_file(sess, &lock_file_path(&path));
         }
@@ -858,7 +835,7 @@ fn delete_old(sess: &Session, path: &Path) {
     debug!("garbage_collect_session_directories() - deleting `{}`", path.display());
 
     if let Err(err) = std_fs::remove_dir_all(path) {
-        sess.dcx().emit_warn(errors::SessionGcFailed { path, err });
+        sess.dcx().emit_warn(diagnostics::SessionGcFailed { path, err });
     } else {
         delete_session_dir_lock_file(sess, &lock_file_path(path));
     }

@@ -94,6 +94,8 @@ declare_features! (
     (accepted, c_str_literals, "1.77.0", Some(105723)),
     /// Allows `extern "C-unwind" fn` to enable unwinding across ABI boundaries and treat `extern "C" fn` as nounwind.
     (accepted, c_unwind, "1.81.0", Some(74990)),
+    /// Allows using C-variadics.
+    (accepted, c_variadic, "CURRENT_RUSTC_VERSION", Some(44930)),
     /// Allows `#[cfg_attr(predicate, multiple, attributes, here)]`.
     (accepted, cfg_attr_multi, "1.33.0", Some(54881)),
     /// Allows the use of `#[cfg(<true/false>)]`.
@@ -108,6 +110,8 @@ declare_features! (
     (accepted, cfg_target_abi, "1.78.0", Some(80970)),
     /// Allows `cfg(target_feature = "...")`.
     (accepted, cfg_target_feature, "1.27.0", Some(29717)),
+    /// Allows `cfg(target_has_atomic_primitive_alignment = "...")`.
+    (accepted, cfg_target_has_atomic_equal_alignment, "1.97.0", Some(93822)),
     /// Allows `cfg(target_vendor = "...")`.
     (accepted, cfg_target_vendor, "1.33.0", Some(29718)),
     /// Allows implementing `Clone` for closures where possible (RFC 2132).

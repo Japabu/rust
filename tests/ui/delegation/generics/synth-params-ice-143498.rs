@@ -15,12 +15,11 @@
 #![feature(iter_partition_in_place)]
 #![feature(trusted_random_access)]
 #![feature(try_find)]
-#![allow(incomplete_features)]
 
 impl X {
 //~^ ERROR: cannot find type `X` in this scope
     reuse< std::fmt::Debug as Iterator >::*;
-    //~^ ERROR: expected method or associated constant, found associated type `Iterator::Item`
+    //~^ ERROR: cannot find method or associated constant `Item` in trait `Iterator`
     //~| ERROR: expected a type, found a trait
 }
 

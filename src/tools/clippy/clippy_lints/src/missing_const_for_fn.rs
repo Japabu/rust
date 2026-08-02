@@ -2,7 +2,9 @@ use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::qualify_min_const_fn::is_min_const_fn;
-use clippy_utils::{fn_has_unsatisfiable_preds, is_entrypoint_fn, is_from_proc_macro, is_in_test, trait_ref_of_method};
+use clippy_utils::{
+    fn_has_unsatisfiable_clauses, is_entrypoint_fn, is_from_proc_macro, is_in_test, trait_ref_of_method,
+};
 use rustc_abi::ExternAbi;
 use rustc_errors::Applicability;
 use rustc_hir::def_id::CRATE_DEF_ID;
@@ -103,8 +105,8 @@ impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
             return;
         }
 
-        // Building MIR for `fn`s with unsatisfiable preds results in ICE.
-        if fn_has_unsatisfiable_preds(cx, def_id.to_def_id()) {
+        // Building MIR for `fn`s with unsatisfiable clauses results in ICE.
+        if fn_has_unsatisfiable_clauses(cx, def_id.to_def_id()) {
             return;
         }
 
@@ -141,7 +143,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
             let parent = cx.tcx.hir_get_parent_item(hir_id).def_id;
             if parent != CRATE_DEF_ID
                 && let hir::Node::Item(item) = cx.tcx.hir_node_by_def_id(parent)
-                && let hir::ItemKind::Trait(..) = &item.kind
+                && let hir::ItemKind::Trait { .. } = &item.kind
             {
                 return;
             }
@@ -187,7 +189,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
 // We don't have to lint on something that's already `const`
 #[must_use]
 fn already_const(header: hir::FnHeader) -> bool {
-    header.constness == Constness::Const
+    matches!(header.constness, Constness::Const { .. })
 }
 
 fn could_be_const_with_abi(cx: &LateContext<'_>, msrv: Msrv, abi: ExternAbi) -> bool {
@@ -203,11 +205,18 @@ fn could_be_const_with_abi(cx: &LateContext<'_>, msrv: Msrv, abi: ExternAbi) -> 
 /// Return `true` when the given `def_id` is a function that has `impl Trait` ty as one of
 /// its parameter types.
 fn fn_inputs_has_impl_trait_ty(cx: &LateContext<'_>, def_id: LocalDefId) -> bool {
-    let inputs = cx.tcx.fn_sig(def_id).instantiate_identity().inputs().skip_binder();
+    let inputs = cx
+        .tcx
+        .fn_sig(def_id)
+        .instantiate_identity()
+        .skip_norm_wip()
+        .inputs()
+        .skip_binder();
     inputs.iter().any(|input| {
         matches!(
             input.kind(),
-            &ty::Alias(ty::AliasTy { kind: ty::Free{def_id} , ..}) if cx.tcx.type_of(def_id).skip_binder().is_opaque()
+            &ty::Alias(_, ty::AliasTy { kind: ty::Free{def_id} , ..})
+                if cx.tcx.type_of(def_id).skip_binder().is_opaque()
         )
     })
 }

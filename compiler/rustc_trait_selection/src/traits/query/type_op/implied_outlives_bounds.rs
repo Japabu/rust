@@ -7,7 +7,7 @@ use rustc_infer::traits::query::type_op::ImpliedOutlivesBounds;
 use rustc_middle::infer::canonical::CanonicalQueryResponse;
 use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::outlives::{Component, push_outlives_components};
-use rustc_middle::ty::{self, ParamEnvAnd, Ty, TyCtxt, TypeVisitable, TypeVisitor};
+use rustc_middle::ty::{self, ParamEnvAnd, Ty, TyCtxt, TypeVisitable, TypeVisitor, Unnormalized};
 use rustc_span::def_id::CRATE_DEF_ID;
 use rustc_span::{DUMMY_SP, Span, sym};
 use smallvec::{SmallVec, smallvec};
@@ -61,6 +61,8 @@ pub fn compute_implied_outlives_bounds_inner<'tcx>(
         "compute_implied_outlives_bounds assumes region obligations are empty before starting"
     );
 
+    let tcx = ocx.infcx.tcx;
+
     // FIXME: This doesn't seem right. All call sites already normalize `ty`:
     // - `Ty`s from the `DefiningTy` in Borrowck: we have to normalize in the caller
     //      in order to get implied bounds involving any unconstrained region vars
@@ -73,7 +75,11 @@ pub fn compute_implied_outlives_bounds_inner<'tcx>(
     // for example, if we have some constrained param type like `T: Trait<Out = U>`,
     // and we know that `&'a T::Out` is WF, then we want to imply `U: 'a`.
     let normalized_ty = ocx
-        .deeply_normalize(&ObligationCause::dummy_with_span(span), param_env, ty)
+        .deeply_normalize(
+            &ObligationCause::dummy_with_span(span),
+            param_env,
+            Unnormalized::new_wip(ty),
+        )
         .map_err(|_| NoSolution)?;
 
     // Sometimes when we ask what it takes for T: WF, we get back that
@@ -91,17 +97,17 @@ pub fn compute_implied_outlives_bounds_inner<'tcx>(
             continue;
         }
 
+        let arg = ocx.infcx.resolve_vars_if_possible(arg);
         // From the full set of obligations, just filter down to the region relationships.
         for obligation in
             wf::unnormalized_obligations(ocx.infcx, param_env, arg, DUMMY_SP, CRATE_DEF_ID)
-                .into_iter()
-                .flatten()
+                .into_flat_iter()
         {
             let pred = ocx
                 .deeply_normalize(
                     &ObligationCause::dummy_with_span(span),
                     param_env,
-                    obligation.predicate,
+                    Unnormalized::new_wip(obligation.predicate),
                 )
                 .map_err(|_| NoSolution)?;
             let Some(pred) = pred.kind().no_bound_vars() else {
@@ -121,8 +127,7 @@ pub fn compute_implied_outlives_bounds_inner<'tcx>(
                 | ty::PredicateKind::ConstEquate(..)
                 | ty::PredicateKind::Ambiguous
                 | ty::PredicateKind::NormalizesTo(..)
-                | ty::PredicateKind::Clause(ty::ClauseKind::UnstableFeature(_))
-                | ty::PredicateKind::AliasRelate(..) => {}
+                | ty::PredicateKind::Clause(ty::ClauseKind::UnstableFeature(_)) => {}
 
                 // We need to search through *all* WellFormed predicates
                 ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(term)) => {
@@ -139,8 +144,8 @@ pub fn compute_implied_outlives_bounds_inner<'tcx>(
                     r_b,
                 ))) => {
                     let mut components = smallvec![];
-                    push_outlives_components(ocx.infcx.tcx, ty_a, &mut components);
-                    outlives_bounds.extend(implied_bounds_from_components(r_b, components))
+                    push_outlives_components(tcx, ty_a, &mut components);
+                    outlives_bounds.extend(implied_bounds_from_components(tcx, r_b, components))
                 }
             }
         }
@@ -157,8 +162,8 @@ pub fn compute_implied_outlives_bounds_inner<'tcx>(
             ocx.infcx.clone_registered_region_obligations()
         {
             let mut components = smallvec![];
-            push_outlives_components(ocx.infcx.tcx, sup_type, &mut components);
-            outlives_bounds.extend(implied_bounds_from_components(sub_region, components));
+            push_outlives_components(tcx, sup_type, &mut components);
+            outlives_bounds.extend(implied_bounds_from_components(tcx, sub_region, components));
         }
     }
 
@@ -195,6 +200,7 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for ContainsBevyParamSet<'tcx> {
 /// `T: 'a` to hold. We get to assume that the caller has validated
 /// those relationships.
 fn implied_bounds_from_components<'tcx>(
+    tcx: TyCtxt<'tcx>,
     sub_region: ty::Region<'tcx>,
     sup_components: SmallVec<[Component<TyCtxt<'tcx>>; 4]>,
 ) -> Vec<OutlivesBound<'tcx>> {
@@ -204,7 +210,11 @@ fn implied_bounds_from_components<'tcx>(
             match component {
                 Component::Region(r) => Some(OutlivesBound::RegionSubRegion(sub_region, r)),
                 Component::Param(p) => Some(OutlivesBound::RegionSubParam(sub_region, p)),
-                Component::Alias(p) => Some(OutlivesBound::RegionSubAlias(sub_region, p)),
+                Component::Alias(is_rigid, p) => {
+                    // We expect them to be already deeply normalized.
+                    debug_assert_eq!(is_rigid, ty::IsRigid::yes_if_next_solver(tcx));
+                    Some(OutlivesBound::RegionSubAlias(sub_region, p))
+                }
                 Component::Placeholder(_p) => {
                     // FIXME(non_lifetime_binders): Placeholders don't currently
                     // imply anything for outlives, though they could easily.

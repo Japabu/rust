@@ -9,22 +9,21 @@ use std::sync::Arc;
 use rustc_ast::attr::MarkedAttrs;
 use rustc_ast::tokenstream::TokenStream;
 use rustc_ast::visit::{AssocCtxt, Visitor};
-use rustc_ast::{self as ast, AttrVec, HasAttrs, Item, NodeId, PatKind, Safety};
+use rustc_ast::{self as ast, AttrVec, Attribute, HasAttrs, Item, NodeId, PatKind, Safety};
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
-use rustc_data_structures::sync;
+use rustc_data_structures::{Limit, sync};
 use rustc_errors::{BufferedEarlyLint, DiagCtxtHandle, ErrorGuaranteed, PResult};
 use rustc_feature::Features;
 use rustc_hir as hir;
 use rustc_hir::attrs::{CfgEntry, CollapseMacroDebuginfo, Deprecation};
 use rustc_hir::def::MacroKinds;
-use rustc_hir::limit::Limit;
 use rustc_hir::{Stability, find_attr};
 use rustc_lint_defs::RegisteredTools;
 use rustc_parse::MACRO_ARGUMENTS;
 use rustc_parse::parser::Parser;
 use rustc_session::Session;
 use rustc_session::parse::ParseSess;
-use rustc_span::def_id::{CrateNum, DefId, LocalDefId};
+use rustc_span::def_id::{CrateNum, DefId, LocalDefId, ModId};
 use rustc_span::edition::Edition;
 use rustc_span::hygiene::{AstPass, ExpnData, ExpnKind, LocalExpnId, MacroKind};
 use rustc_span::source_map::SourceMap;
@@ -32,15 +31,17 @@ use rustc_span::{DUMMY_SP, Ident, Span, Symbol, kw};
 use smallvec::{SmallVec, smallvec};
 use thin_vec::ThinVec;
 
-use crate::errors;
+use crate::diagnostics;
 use crate::expand::{self, AstFragment, Invocation};
 use crate::mbe::macro_rules::ParserAnyMacro;
 use crate::module::DirOwnership;
 use crate::stats::MacroStat;
 
-// When adding new variants, make sure to
-// adjust the `visit_*` / `flat_map_*` calls in `InvocationCollector`
-// to use `assign_id!`
+/// This type encapsulates every AST node that can have attributes, i.e. those
+/// nodes with a non-trivial implementation of `HasAttrs`.
+///
+/// When adding new variants, make sure to adjust the `visit_*` / `flat_map_*`
+/// calls in `InvocationCollector` to use `assign_id!`
 #[derive(Debug, Clone)]
 pub enum Annotatable {
     Item(Box<ast::Item>),
@@ -117,6 +118,7 @@ impl Annotatable {
         }
     }
 
+    /// Converts the `Annotatable` to a token stream, e.g. to hand to a proc macro.
     pub fn to_tokens(&self) -> TokenStream {
         match self {
             Annotatable::Item(node) => TokenStream::from_ast(node),
@@ -274,9 +276,8 @@ impl<'cx> MacroExpanderResult<'cx> {
         arm_span: Span,
         macro_ident: Ident,
     ) -> Self {
-        // Emit the SEMICOLON_IN_EXPRESSIONS_FROM_MACROS deprecation lint.
+        // Emit SEMICOLON_IN_EXPRESSIONS_FROM_MACROS here, rather than the NON_LOCAL version.
         let is_local = true;
-
         let parser =
             ParserAnyMacro::from_tts(cx, tts, site_span, arm_span, is_local, macro_ident, &[], &[]);
         ExpandResult::Ready(Box::new(parser))
@@ -409,17 +410,10 @@ pub trait GlobDelegationExpander {
     fn expand(&self, ecx: &mut ExtCtxt<'_>) -> ExpandResult<Vec<(Ident, Option<Ident>)>, ()>;
 }
 
-// Use a macro because forwarding to a simple function has type system issues
-macro_rules! make_stmts_default {
-    ($me:expr) => {
-        $me.make_expr().map(|e| {
-            smallvec![ast::Stmt {
-                id: ast::DUMMY_NODE_ID,
-                span: e.span,
-                kind: ast::StmtKind::Expr(e),
-            }]
-        })
-    };
+fn make_stmts_default(expr: Option<Box<ast::Expr>>) -> Option<SmallVec<[ast::Stmt; 1]>> {
+    expr.map(|e| {
+        smallvec![ast::Stmt { id: ast::DUMMY_NODE_ID, span: e.span, kind: ast::StmtKind::Expr(e) }]
+    })
 }
 
 /// The result of a macro expansion. The return values of the various
@@ -465,7 +459,7 @@ pub trait MacResult {
     /// By default this attempts to create an expression statement,
     /// returning None if that fails.
     fn make_stmts(self: Box<Self>) -> Option<SmallVec<[ast::Stmt; 1]>> {
-        make_stmts_default!(self)
+        make_stmts_default(self.make_expr())
     }
 
     fn make_ty(self: Box<Self>) -> Option<Box<ast::Ty>> {
@@ -510,39 +504,27 @@ pub trait MacResult {
     }
 }
 
-macro_rules! make_MacEager {
-    ( $( $fld:ident: $t:ty, )* ) => {
-        /// `MacResult` implementation for the common case where you've already
-        /// built each form of AST that you might return.
-        #[derive(Default)]
-        pub struct MacEager {
-            $(
-                pub $fld: Option<$t>,
-            )*
-        }
-
-        impl MacEager {
-            $(
-                pub fn $fld(v: $t) -> Box<dyn MacResult> {
-                    Box::new(MacEager {
-                        $fld: Some(v),
-                        ..Default::default()
-                    })
-                }
-            )*
-        }
-    }
+/// `MacResult` implementation for the common case where you've already
+/// built each form of AST that you might return.
+#[derive(Default)]
+pub struct MacEager {
+    pub expr: Option<Box<ast::Expr>>,
+    pub items: Option<SmallVec<[Box<ast::Item>; 1]>>,
+    pub ty: Option<Box<ast::Ty>>,
 }
 
-make_MacEager! {
-    expr: Box<ast::Expr>,
-    pat: Box<ast::Pat>,
-    items: SmallVec<[Box<ast::Item>; 1]>,
-    impl_items: SmallVec<[Box<ast::AssocItem>; 1]>,
-    trait_items: SmallVec<[Box<ast::AssocItem>; 1]>,
-    foreign_items: SmallVec<[Box<ast::ForeignItem>; 1]>,
-    stmts: SmallVec<[ast::Stmt; 1]>,
-    ty: Box<ast::Ty>,
+impl MacEager {
+    pub fn expr(v: Box<ast::Expr>) -> Box<dyn MacResult> {
+        Box::new(MacEager { expr: Some(v), ..Default::default() })
+    }
+
+    pub fn items(v: SmallVec<[Box<ast::Item>; 1]>) -> Box<dyn MacResult> {
+        Box::new(MacEager { items: Some(v), ..Default::default() })
+    }
+
+    pub fn ty(v: Box<ast::Ty>) -> Box<dyn MacResult> {
+        Box::new(MacEager { ty: Some(v), ..Default::default() })
+    }
 }
 
 impl MacResult for MacEager {
@@ -554,40 +536,13 @@ impl MacResult for MacEager {
         self.items
     }
 
-    fn make_impl_items(self: Box<Self>) -> Option<SmallVec<[Box<ast::AssocItem>; 1]>> {
-        self.impl_items
-    }
-
-    fn make_trait_impl_items(self: Box<Self>) -> Option<SmallVec<[Box<ast::AssocItem>; 1]>> {
-        self.impl_items
-    }
-
-    fn make_trait_items(self: Box<Self>) -> Option<SmallVec<[Box<ast::AssocItem>; 1]>> {
-        self.trait_items
-    }
-
-    fn make_foreign_items(self: Box<Self>) -> Option<SmallVec<[Box<ast::ForeignItem>; 1]>> {
-        self.foreign_items
-    }
-
-    fn make_stmts(self: Box<Self>) -> Option<SmallVec<[ast::Stmt; 1]>> {
-        match self.stmts.as_ref().map_or(0, |s| s.len()) {
-            0 => make_stmts_default!(self),
-            _ => self.stmts,
-        }
-    }
-
     fn make_pat(self: Box<Self>) -> Option<Box<ast::Pat>> {
-        if let Some(p) = self.pat {
-            return Some(p);
-        }
         if let Some(e) = self.expr {
             if matches!(e.kind, ast::ExprKind::Lit(_) | ast::ExprKind::IncludedBytes(_)) {
                 return Some(Box::new(ast::Pat {
                     id: ast::DUMMY_NODE_ID,
                     span: e.span,
                     kind: PatKind::Expr(e),
-                    tokens: None,
                 }));
             }
         }
@@ -643,12 +598,7 @@ impl MacResult for DummyResult {
     }
 
     fn make_pat(self: Box<DummyResult>) -> Option<Box<ast::Pat>> {
-        Some(Box::new(ast::Pat {
-            id: ast::DUMMY_NODE_ID,
-            kind: PatKind::Wild,
-            span: self.span,
-            tokens: None,
-        }))
+        Some(Box::new(ast::Pat { id: ast::DUMMY_NODE_ID, kind: PatKind::Wild, span: self.span }))
     }
 
     fn make_items(self: Box<DummyResult>) -> Option<SmallVec<[Box<ast::Item>; 1]>> {
@@ -687,7 +637,6 @@ impl MacResult for DummyResult {
             id: ast::DUMMY_NODE_ID,
             kind: ast::TyKind::Tup(ThinVec::new()),
             span: self.span,
-            tokens: None,
         }))
     }
 
@@ -849,9 +798,9 @@ pub struct SyntaxExtension {
     /// Should debuginfo for the macro be collapsed to the outermost expansion site (in other
     /// words, was the macro definition annotated with `#[collapse_debuginfo]`)?
     pub collapse_debuginfo: bool,
-    /// Suppresses the "this error originates in the macro" note when a diagnostic points at this
-    /// macro.
-    pub hide_backtrace: bool,
+    /// Prevents diagnostics pointing into this macro and suppresses the "this error originates in
+    /// the macro" note when a diagnostic points at this macro.
+    pub diagnostic_opaque: bool,
 }
 
 impl SyntaxExtension {
@@ -885,7 +834,7 @@ impl SyntaxExtension {
             allow_internal_unsafe: false,
             local_inner_macros: false,
             collapse_debuginfo: false,
-            hide_backtrace: false,
+            diagnostic_opaque: false,
         }
     }
 
@@ -898,7 +847,7 @@ impl SyntaxExtension {
     fn get_collapse_debuginfo(sess: &Session, attrs: &[hir::Attribute], ext: bool) -> bool {
         let flag = sess.opts.cg.collapse_macro_debuginfo;
         let attr = if let Some(info) = find_attr!(attrs, CollapseDebugInfo(info) => info) {
-            info.clone()
+            *info
         } else if find_attr!(attrs, RustcBuiltinMacro { .. }) {
             CollapseMacroDebuginfo::Yes
         } else {
@@ -913,12 +862,6 @@ impl SyntaxExtension {
             [true,  true,  true,  true],
         ];
         collapse_table[flag as usize][attr as usize]
-    }
-
-    fn get_hide_backtrace(attrs: &[hir::Attribute]) -> bool {
-        // FIXME(estebank): instead of reusing `#[rustc_diagnostic_item]` as a proxy, introduce a
-        // new attribute purely for this under the `#[diagnostic]` namespace.
-        find_attr!(attrs, RustcDiagnosticItem(..))
     }
 
     /// Constructs a syntax extension with the given properties
@@ -943,7 +886,7 @@ impl SyntaxExtension {
         let collapse_debuginfo = Self::get_collapse_debuginfo(sess, attrs, !is_local);
         tracing::debug!(?name, ?local_inner_macros, ?collapse_debuginfo, ?allow_internal_unsafe);
 
-        let (builtin_name, helper_attrs) = match find_attr!(attrs, RustcBuiltinMacro { builtin_name, helper_attrs, .. } => (builtin_name, helper_attrs))
+        let (builtin_name, helper_attrs) = match find_attr!(attrs, RustcBuiltinMacro { builtin_name, helper_attrs } => (builtin_name, helper_attrs))
         {
             // Override `helper_attrs` passed above if it's a built-in macro,
             // marking `proc_macro_derive` macros as built-in is not a realistic use case.
@@ -955,12 +898,13 @@ impl SyntaxExtension {
             // Not a built-in macro
             None => (None, helper_attrs),
         };
-        let hide_backtrace = builtin_name.is_some() || Self::get_hide_backtrace(attrs);
+        let diagnostic_opaque = builtin_name.is_some()
+            || (!sess.opts.unstable_opts.macro_backtrace && find_attr!(attrs, Opaque));
 
         let stability = find_attr!(attrs, Stability { stability, .. } => *stability);
 
         if let Some(sp) = find_attr!(attrs, RustcBodyStability{ span, .. } => *span) {
-            sess.dcx().emit_err(errors::MacroBodyStability {
+            sess.dcx().emit_err(diagnostics::MacroBodyStability {
                 span: sp,
                 head_span: sess.source_map().guess_head_span(span),
             });
@@ -983,7 +927,7 @@ impl SyntaxExtension {
             allow_internal_unsafe,
             local_inner_macros,
             collapse_debuginfo,
-            hide_backtrace,
+            diagnostic_opaque,
         }
     }
 
@@ -1019,18 +963,24 @@ impl SyntaxExtension {
     pub fn glob_delegation(
         trait_def_id: DefId,
         impl_def_id: LocalDefId,
+        star_span: Span,
         edition: Edition,
     ) -> SyntaxExtension {
         struct GlobDelegationExpanderImpl {
             trait_def_id: DefId,
             impl_def_id: LocalDefId,
+            star_span: Span,
         }
         impl GlobDelegationExpander for GlobDelegationExpanderImpl {
             fn expand(
                 &self,
                 ecx: &mut ExtCtxt<'_>,
             ) -> ExpandResult<Vec<(Ident, Option<Ident>)>, ()> {
-                match ecx.resolver.glob_delegation_suffixes(self.trait_def_id, self.impl_def_id) {
+                match ecx.resolver.glob_delegation_suffixes(
+                    self.trait_def_id,
+                    self.impl_def_id,
+                    self.star_span,
+                ) {
                     Ok(suffixes) => ExpandResult::Ready(suffixes),
                     Err(Indeterminate) if ecx.force_mode => ExpandResult::Ready(Vec::new()),
                     Err(Indeterminate) => ExpandResult::Retry(()),
@@ -1038,7 +988,7 @@ impl SyntaxExtension {
             }
         }
 
-        let expander = GlobDelegationExpanderImpl { trait_def_id, impl_def_id };
+        let expander = GlobDelegationExpanderImpl { trait_def_id, impl_def_id, star_span };
         SyntaxExtension::default(SyntaxExtensionKind::GlobDelegation(Arc::new(expander)), edition)
     }
 
@@ -1049,7 +999,7 @@ impl SyntaxExtension {
         descr: Symbol,
         kind: MacroKind,
         macro_def_id: Option<DefId>,
-        parent_module: Option<DefId>,
+        parent_module: Option<ModId>,
     ) -> ExpnData {
         ExpnData::new(
             ExpnKind::Macro(kind, descr),
@@ -1063,7 +1013,7 @@ impl SyntaxExtension {
             self.allow_internal_unsafe,
             self.local_inner_macros,
             self.collapse_debuginfo,
-            self.hide_backtrace,
+            self.diagnostic_opaque,
         )
     }
 }
@@ -1117,6 +1067,8 @@ pub trait ResolverExpand {
     // Resolver interfaces for specific built-in macros.
     /// Does `#[derive(...)]` attribute with the given `ExpnId` have built-in `Copy` inside it?
     fn has_derive_copy(&self, expn_id: LocalExpnId) -> bool;
+    /// Does `#[derive(...)]` attribute with the given `ExpnId` have built-in `Ord` inside it?
+    fn has_derive_ord(&self, expn_id: LocalExpnId) -> bool;
     /// Resolve paths inside the `#[derive(...)]` attribute with the given `ExpnId`.
     fn resolve_derives(
         &mut self,
@@ -1159,8 +1111,11 @@ pub trait ResolverExpand {
         cfg_span: Span,
     );
 
-    /// Tools registered with `#![register_tool]` and used by tool attributes and lints.
-    fn registered_tools(&self) -> &RegisteredTools;
+    /// Tools registered with `#![register_tool]` or `#![register_attribute_tool]`.
+    fn registered_attr_tools(&self) -> &RegisteredTools;
+
+    /// Tools registered with `#![register_tool]` or `#![register_lint_tool]`.
+    fn registered_lint_tools(&self) -> &RegisteredTools;
 
     /// Mark this invocation id as a glob delegation.
     fn register_glob_delegation(&mut self, invoc_id: LocalExpnId);
@@ -1170,6 +1125,7 @@ pub trait ResolverExpand {
         &self,
         trait_def_id: DefId,
         impl_def_id: LocalDefId,
+        star_span: Span,
     ) -> Result<Vec<(Ident, Option<Ident>)>, Indeterminate>;
 
     /// Record the name of an opaque `Ty::ImplTrait` pre-expansion so that it can be used
@@ -1186,8 +1142,9 @@ pub trait LintStoreExpand {
         &self,
         sess: &Session,
         features: &Features,
-        registered_tools: &RegisteredTools,
+        registered_lint_tools: &RegisteredTools,
         node_id: NodeId,
+        attrs: &[Attribute],
         items: &[Box<Item>],
         name: Symbol,
     );
@@ -1195,7 +1152,7 @@ pub trait LintStoreExpand {
 
 type LintStoreExpandDyn<'a> = Option<&'a (dyn LintStoreExpand + 'a)>;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct ModuleData {
     /// Path to the module starting from the crate name, like `my_crate::foo::bar`.
     pub mod_path: Vec<Ident>,
@@ -1354,7 +1311,7 @@ impl<'a> ExtCtxt<'a> {
 
     pub fn trace_macros_diag(&mut self) {
         for (span, notes) in self.expansions.iter() {
-            let mut db = self.dcx().create_note(errors::TraceMacro { span: *span });
+            let mut db = self.dcx().create_note(diagnostics::TraceMacro { span: *span });
             for note in notes {
                 db.note(note.clone());
             }
@@ -1372,7 +1329,7 @@ impl<'a> ExtCtxt<'a> {
     pub fn std_path(&self, components: &[Symbol]) -> Vec<Ident> {
         let def_site = self.with_def_site_ctxt(DUMMY_SP);
         iter::once(Ident::new(kw::DollarCrate, def_site))
-            .chain(components.iter().map(|&s| Ident::with_dummy_span(s)))
+            .chain(components.iter().map(|&s| Ident::new(s, def_site)))
             .collect()
     }
     pub fn def_site_path(&self, components: &[Symbol]) -> Vec<Ident> {
@@ -1397,7 +1354,7 @@ pub fn resolve_path(sess: &Session, path: impl Into<PathBuf>, span: Span) -> PRe
         let callsite = span.source_callsite();
         let source_map = sess.source_map();
         let Some(mut base_path) = source_map.span_to_filename(callsite).into_local_path() else {
-            return Err(sess.dcx().create_err(errors::ResolveRelativePath {
+            return Err(sess.dcx().create_err(diagnostics::ResolveRelativePath {
                 span,
                 path: source_map
                     .filename_for_diagnostics(&source_map.span_to_filename(callsite))

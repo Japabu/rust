@@ -1,6 +1,9 @@
 use std::ops::Deref;
 
-use rustc_type_ir::solve::{Certainty, Goal, NoSolution};
+use rustc_type_ir::solve::{
+    Certainty, ComputeGoalFastPathOutcome, FetchEligibleAssocItemResponse, Goal, NoSolution,
+    VisibleForLeakCheck,
+};
 use rustc_type_ir::{self as ty, InferCtxtLike, Interner, TypeFoldable};
 
 pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
@@ -21,7 +24,7 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
         &self,
         goal: Goal<Self::Interner, <Self::Interner as Interner>::Predicate>,
         span: <Self::Interner as Interner>::Span,
-    ) -> Option<Certainty>;
+    ) -> ComputeGoalFastPathOutcome<Self::Interner>;
 
     fn fresh_var_for_kind_with_span(
         &self,
@@ -35,7 +38,7 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
     fn evaluate_const(
         &self,
         param_env: <Self::Interner as Interner>::ParamEnv,
-        uv: ty::UnevaluatedConst<Self::Interner>,
+        alias_const: ty::AliasConst<Self::Interner>,
     ) -> Option<<Self::Interner as Interner>::Const>;
 
     // FIXME: This only is here because `wf::obligations` is in `rustc_trait_selection`!
@@ -45,9 +48,9 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
         term: <Self::Interner as Interner>::Term,
     ) -> Option<Vec<Goal<Self::Interner, <Self::Interner as Interner>::Predicate>>>;
 
-    fn make_deduplicated_outlives_constraints(
+    fn make_deduplicated_region_constraints(
         &self,
-    ) -> Vec<ty::OutlivesPredicate<Self::Interner, <Self::Interner as Interner>::GenericArg>>;
+    ) -> Vec<(ty::RegionConstraint<Self::Interner>, VisibleForLeakCheck)>;
 
     fn instantiate_canonical<V>(
         &self,
@@ -67,7 +70,7 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
 
     fn add_item_bounds_for_hidden_type(
         &self,
-        def_id: <Self::Interner as Interner>::DefId,
+        def_id: <Self::Interner as Interner>::OpaqueTyId,
         args: <Self::Interner as Interner>::GenericArgs,
         param_env: <Self::Interner as Interner>::ParamEnv,
         hidden_ty: <Self::Interner as Interner>::Ty,
@@ -77,12 +80,9 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
     fn fetch_eligible_assoc_item(
         &self,
         goal_trait_ref: ty::TraitRef<Self::Interner>,
-        trait_assoc_def_id: <Self::Interner as Interner>::DefId,
+        trait_assoc_def_id: <Self::Interner as Interner>::TraitAssocTermId,
         impl_def_id: <Self::Interner as Interner>::ImplId,
-    ) -> Result<
-        Option<<Self::Interner as Interner>::DefId>,
-        <Self::Interner as Interner>::ErrorGuaranteed,
-    >;
+    ) -> FetchEligibleAssocItemResponse<Self::Interner>;
 
     fn is_transmutable(
         &self,

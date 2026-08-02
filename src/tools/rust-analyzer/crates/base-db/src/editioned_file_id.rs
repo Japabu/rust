@@ -5,12 +5,36 @@ use std::hash::Hash;
 
 use salsa::Database;
 use span::Edition;
+use syntax::{SyntaxError, ast};
 use vfs::FileId;
+
+use crate::SourceDatabase;
 
 #[salsa::interned(debug, constructor = from_span_file_id, no_lifetime)]
 #[derive(PartialOrd, Ord)]
 pub struct EditionedFileId {
     field: span::EditionedFileId,
+}
+
+#[salsa::tracked]
+impl EditionedFileId {
+    #[salsa::tracked(lru = 128)]
+    pub fn parse(self, db: &dyn SourceDatabase) -> syntax::Parse<ast::SourceFile> {
+        let _p = tracing::info_span!("parse", ?self).entered();
+        let (file_id, edition) = self.unpack(db);
+        let text = db.file_text(file_id).text(db);
+        ast::SourceFile::parse(text, edition)
+    }
+
+    // firewall query
+    #[salsa::tracked(returns(as_deref))]
+    pub fn parse_errors(self, db: &dyn SourceDatabase) -> Option<Box<[SyntaxError]>> {
+        let errors = self.parse(db).errors();
+        match &*errors {
+            [] => None,
+            [..] => Some(errors.into()),
+        }
+    }
 }
 
 impl EditionedFileId {

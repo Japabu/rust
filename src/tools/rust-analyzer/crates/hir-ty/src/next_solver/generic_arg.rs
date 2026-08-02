@@ -8,7 +8,8 @@
 
 use std::{hint::unreachable_unchecked, marker::PhantomData, ptr::NonNull};
 
-use hir_def::{GenericDefId, GenericParamId};
+use arrayvec::ArrayVec;
+use hir_def::{GenericDefId, GenericParamId, hir::generics::LifetimeParamData};
 use intern::InternedRef;
 use rustc_type_ir::{
     ClosureArgs, ConstVid, CoroutineArgs, CoroutineClosureArgs, FallibleTypeFolder,
@@ -18,7 +19,6 @@ use rustc_type_ir::{
     relate::{Relate, VarianceDiagInfo},
     walk::TypeWalker,
 };
-use smallvec::SmallVec;
 
 use crate::next_solver::{
     ConstInterned, RegionInterned, TyInterned, impl_foldable_for_interned_slice, interned_slice,
@@ -191,6 +191,25 @@ impl StoredGenericArg {
 impl std::fmt::Debug for StoredGenericArg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.as_ref().fmt(f)
+    }
+}
+
+impl<'db> TypeVisitable<DbInterner<'db>> for StoredGenericArg {
+    fn visit_with<V: TypeVisitor<DbInterner<'db>>>(&self, visitor: &mut V) -> V::Result {
+        self.as_ref().visit_with(visitor)
+    }
+}
+
+impl<'db> TypeFoldable<DbInterner<'db>> for StoredGenericArg {
+    fn try_fold_with<F: FallibleTypeFolder<DbInterner<'db>>>(
+        self,
+        folder: &mut F,
+    ) -> Result<Self, F::Error> {
+        Ok(self.as_ref().try_fold_with(folder)?.store())
+    }
+
+    fn fold_with<F: TypeFolder<DbInterner<'db>>>(self, folder: &mut F) -> Self {
+        self.as_ref().fold_with(folder).store()
     }
 }
 
@@ -457,7 +476,76 @@ impl_foldable_for_interned_slice!(GenericArgs);
 
 impl<'db> rustc_type_ir::inherent::GenericArg<DbInterner<'db>> for GenericArg<'db> {}
 
+impl<'db> TypeVisitable<DbInterner<'db>> for StoredGenericArgs {
+    fn visit_with<V: TypeVisitor<DbInterner<'db>>>(&self, visitor: &mut V) -> V::Result {
+        self.as_ref().visit_with(visitor)
+    }
+}
+
+impl<'db> TypeFoldable<DbInterner<'db>> for StoredGenericArgs {
+    fn try_fold_with<F: FallibleTypeFolder<DbInterner<'db>>>(
+        self,
+        folder: &mut F,
+    ) -> Result<Self, F::Error> {
+        Ok(self.as_ref().try_fold_with(folder)?.store())
+    }
+
+    fn fold_with<F: TypeFolder<DbInterner<'db>>>(self, folder: &mut F) -> Self {
+        self.as_ref().fold_with(folder).store()
+    }
+}
+
+trait GenericArgsBuilder<'db>: AsRef<[GenericArg<'db>]> {
+    fn push(&mut self, arg: GenericArg<'db>);
+}
+
+impl<'db, const N: usize> GenericArgsBuilder<'db> for ArrayVec<GenericArg<'db>, N> {
+    fn push(&mut self, arg: GenericArg<'db>) {
+        self.push(arg);
+    }
+}
+
+impl<'db> GenericArgsBuilder<'db> for Vec<GenericArg<'db>> {
+    fn push(&mut self, arg: GenericArg<'db>) {
+        self.push(arg);
+    }
+}
+
 impl<'db> GenericArgs<'db> {
+    #[inline(always)]
+    fn fill_builder<F>(
+        args: &mut impl GenericArgsBuilder<'db>,
+        defs: &Generics<'db>,
+        mut mk_kind: F,
+    ) where
+        F: FnMut(
+            u32,
+            GenericParamId,
+            Option<&LifetimeParamData>,
+            &[GenericArg<'db>],
+        ) -> GenericArg<'db>,
+    {
+        defs.iter().enumerate().for_each(|(idx, (param, lt_data))| {
+            let new_arg = mk_kind(idx as u32, param, lt_data, args.as_ref());
+            args.push(new_arg);
+        });
+    }
+
+    #[cold]
+    fn fill_vec_builder<F>(defs: &Generics<'db>, count: usize, mk_kind: F) -> GenericArgs<'db>
+    where
+        F: FnMut(
+            u32,
+            GenericParamId,
+            Option<&LifetimeParamData>,
+            &[GenericArg<'db>],
+        ) -> GenericArg<'db>,
+    {
+        let mut args = Vec::with_capacity(count);
+        Self::fill_builder(&mut args, defs, mk_kind);
+        GenericArgs::new_from_slice(&args)
+    }
+
     /// Creates an `GenericArgs` for generic parameter definitions,
     /// by calling closures to obtain each kind.
     /// The closures get to observe the `GenericArgs` as they're
@@ -465,27 +553,36 @@ impl<'db> GenericArgs<'db> {
     /// replace defaults of generic parameters.
     pub fn for_item<F>(
         interner: DbInterner<'db>,
-        def_id: SolverDefId,
-        mut mk_kind: F,
+        def_id: SolverDefId<'db>,
+        mk_kind: F,
     ) -> GenericArgs<'db>
     where
-        F: FnMut(u32, GenericParamId, &[GenericArg<'db>]) -> GenericArg<'db>,
+        F: FnMut(
+            u32,
+            GenericParamId,
+            Option<&LifetimeParamData>,
+            &[GenericArg<'db>],
+        ) -> GenericArg<'db>,
     {
         let defs = interner.generics_of(def_id);
         let count = defs.count();
 
         if count == 0 {
-            return Default::default();
+            GenericArgs::default()
+        } else if count <= 10 {
+            let mut args = ArrayVec::<_, 10>::new();
+            Self::fill_builder(&mut args, &defs, mk_kind);
+            GenericArgs::new_from_slice(&args)
+        } else {
+            Self::fill_vec_builder(&defs, count, mk_kind)
         }
-
-        let mut args = SmallVec::with_capacity(count);
-        Self::fill_item(&mut args, interner, defs, &mut mk_kind);
-        interner.mk_args(&args)
     }
 
     /// Creates an all-error `GenericArgs`.
-    pub fn error_for_item(interner: DbInterner<'db>, def_id: SolverDefId) -> GenericArgs<'db> {
-        GenericArgs::for_item(interner, def_id, |_, id, _| GenericArg::error_from_id(interner, id))
+    pub fn error_for_item(interner: DbInterner<'db>, def_id: SolverDefId<'db>) -> GenericArgs<'db> {
+        GenericArgs::for_item(interner, def_id, |_, id, _, _| {
+            GenericArg::error_from_id(interner, id)
+        })
     }
 
     /// Like `for_item`, but prefers the default of a parameter if it has any.
@@ -498,16 +595,18 @@ impl<'db> GenericArgs<'db> {
         F: FnMut(u32, GenericParamId, &[GenericArg<'db>]) -> GenericArg<'db>,
     {
         let defaults = interner.db.generic_defaults(def_id);
-        Self::for_item(interner, def_id.into(), |idx, id, prev| match defaults.get(idx as usize) {
-            Some(default) => default.instantiate(interner, prev),
-            None => fallback(idx, id, prev),
+        Self::for_item(interner, def_id.into(), |idx, id, _, prev| {
+            match defaults.get(idx as usize) {
+                Some(default) => default.instantiate(interner, prev).skip_norm_wip(),
+                None => fallback(idx, id, prev),
+            }
         })
     }
 
     /// Like `for_item()`, but calls first uses the args from `first`.
     pub fn fill_rest<F>(
         interner: DbInterner<'db>,
-        def_id: SolverDefId,
+        def_id: SolverDefId<'db>,
         first: impl IntoIterator<Item = GenericArg<'db>>,
         mut fallback: F,
     ) -> GenericArgs<'db>
@@ -515,7 +614,7 @@ impl<'db> GenericArgs<'db> {
         F: FnMut(u32, GenericParamId, &[GenericArg<'db>]) -> GenericArg<'db>,
     {
         let mut iter = first.into_iter();
-        Self::for_item(interner, def_id, |idx, id, prev| {
+        Self::for_item(interner, def_id, |idx, id, _, prev| {
             iter.next().unwrap_or_else(|| fallback(idx, id, prev))
         })
     }
@@ -534,35 +633,9 @@ impl<'db> GenericArgs<'db> {
         Self::fill_rest(interner, def_id.into(), first, |idx, id, prev| {
             defaults
                 .get(idx as usize)
-                .map(|default| default.instantiate(interner, prev))
+                .map(|default| default.instantiate(interner, prev).skip_norm_wip())
                 .unwrap_or_else(|| fallback(idx, id, prev))
         })
-    }
-
-    fn fill_item<F>(
-        args: &mut SmallVec<[GenericArg<'db>; 8]>,
-        interner: DbInterner<'_>,
-        defs: Generics,
-        mk_kind: &mut F,
-    ) where
-        F: FnMut(u32, GenericParamId, &[GenericArg<'db>]) -> GenericArg<'db>,
-    {
-        if let Some(def_id) = defs.parent {
-            let parent_defs = interner.generics_of(def_id.into());
-            Self::fill_item(args, interner, parent_defs, mk_kind);
-        }
-        Self::fill_single(args, &defs, mk_kind);
-    }
-
-    fn fill_single<F>(args: &mut SmallVec<[GenericArg<'db>; 8]>, defs: &Generics, mk_kind: &mut F)
-    where
-        F: FnMut(u32, GenericParamId, &[GenericArg<'db>]) -> GenericArg<'db>,
-    {
-        args.reserve(defs.own_params.len());
-        for param in &defs.own_params {
-            let kind = mk_kind(args.len() as u32, param.id, args);
-            args.push(kind);
-        }
     }
 
     pub fn types(self) -> impl Iterator<Item = Ty<'db>> {
@@ -622,7 +695,7 @@ impl<'db> rustc_type_ir::inherent::GenericArgs<DbInterner<'db>> for GenericArgs<
         interner: DbInterner<'db>,
         def_id: <DbInterner<'db> as rustc_type_ir::Interner>::DefId,
     ) -> <DbInterner<'db> as rustc_type_ir::Interner>::GenericArgs {
-        Self::for_item(interner, def_id, |index, kind, _| mk_param(interner, index, kind))
+        Self::for_item(interner, def_id, |index, kind, _, _| mk_param(interner, index, kind))
     }
 
     fn extend_with_error(
@@ -630,7 +703,7 @@ impl<'db> rustc_type_ir::inherent::GenericArgs<DbInterner<'db>> for GenericArgs<
         def_id: <DbInterner<'db> as rustc_type_ir::Interner>::DefId,
         original_args: &[<DbInterner<'db> as rustc_type_ir::Interner>::GenericArg],
     ) -> <DbInterner<'db> as rustc_type_ir::Interner>::GenericArgs {
-        Self::for_item(interner, def_id, |index, kind, _| {
+        Self::for_item(interner, def_id, |index, kind, _, _| {
             if let Some(arg) = original_args.get(index as usize) {
                 *arg
             } else {

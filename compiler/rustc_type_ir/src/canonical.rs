@@ -4,24 +4,25 @@ use std::ops::Index;
 use arrayvec::ArrayVec;
 use derive_where::derive_where;
 #[cfg(feature = "nightly")]
-use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_NoContext};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash_NoContext};
 use rustc_type_ir_macros::{
     GenericTypeVisitable, Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic,
 };
+use thin_vec::ThinVec;
 
 use crate::data_structures::HashMap;
 use crate::inherent::*;
-use crate::{self as ty, Interner, TypingMode, UniverseIndex};
+use crate::{self as ty, Interner, Region, TypingModeEqWrapper, UniverseIndex};
 
 #[derive_where(Clone, Hash, PartialEq, Debug; I: Interner, V)]
 #[derive_where(Copy; I: Interner, V: Copy)]
 #[cfg_attr(
     feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
 )]
 pub struct CanonicalQueryInput<I: Interner, V> {
     pub canonical: Canonical<I, V>,
-    pub typing_mode: TypingMode<I>,
+    pub typing_mode: TypingModeEqWrapper<I>,
 }
 
 impl<I: Interner, V: Eq> Eq for CanonicalQueryInput<I, V> {}
@@ -33,7 +34,7 @@ impl<I: Interner, V: Eq> Eq for CanonicalQueryInput<I, V> {}
 #[derive_where(Copy; I: Interner, V: Copy)]
 #[cfg_attr(
     feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
 )]
 pub struct Canonical<I: Interner, V> {
     pub value: V,
@@ -91,7 +92,7 @@ impl<I: Interner, V: fmt::Display> fmt::Display for Canonical<I, V> {
 #[derive(GenericTypeVisitable)]
 #[cfg_attr(
     feature = "nightly",
-    derive(Decodable_NoContext, Encodable_NoContext, HashStable_NoContext)
+    derive(Decodable_NoContext, Encodable_NoContext, StableHash_NoContext)
 )]
 pub enum CanonicalVarKind<I: Interner> {
     /// General type variable `?T` that can be unified with arbitrary types.
@@ -220,7 +221,7 @@ impl<I: Interner> CanonicalVarKind<I> {
 #[derive_where(Clone, Copy, Hash, PartialEq, Debug; I: Interner)]
 #[cfg_attr(
     feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
 )]
 #[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic, Lift_Generic)]
 pub struct CanonicalVarValues<I: Interner> {
@@ -366,7 +367,7 @@ impl<I: Interner> Index<ty::BoundVar> for CanonicalVarValues<I> {
 #[derive_where(Clone, Debug; I: Interner)]
 pub struct CanonicalParamEnvCacheEntry<I: Interner> {
     pub param_env: I::ParamEnv,
-    pub variables: Vec<I::GenericArg>,
+    pub variables: ThinVec<I::GenericArg>,
     pub variable_lookup_table: HashMap<I::GenericArg, usize>,
     pub var_kinds: Vec<CanonicalVarKind<I>>,
 }

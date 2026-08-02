@@ -4,10 +4,10 @@ error[E0282]: type annotations needed
 LL |     iter::empty()
    |     ^^^^^^^^^^^ cannot infer type of the type parameter `T` declared on the function `empty`
    |
-help: consider specifying the generic argument
+help: consider specifying a concrete type for the type parameter `T`
    |
-LL |     iter::empty::<T>()
-   |                +++++
+LL |     iter::empty::</* Type */>()
+   |                ++++++++++++++
 
 error[E0282]: type annotations needed
   --> $DIR/duplicate-bound-err.rs:18:5
@@ -15,10 +15,10 @@ error[E0282]: type annotations needed
 LL |     iter::empty()
    |     ^^^^^^^^^^^ cannot infer type of the type parameter `T` declared on the function `empty`
    |
-help: consider specifying the generic argument
+help: consider specifying a concrete type for the type parameter `T`
    |
-LL |     iter::empty::<T>()
-   |                +++++
+LL |     iter::empty::</* Type */>()
+   |                ++++++++++++++
 
 error[E0282]: type annotations needed
   --> $DIR/duplicate-bound-err.rs:22:5
@@ -26,10 +26,10 @@ error[E0282]: type annotations needed
 LL |     iter::empty()
    |     ^^^^^^^^^^^ cannot infer type of the type parameter `T` declared on the function `empty`
    |
-help: consider specifying the generic argument
+help: consider specifying a concrete type for the type parameter `T`
    |
-LL |     iter::empty::<T>()
-   |                +++++
+LL |     iter::empty::</* Type */>()
+   |                ++++++++++++++
 
 error: unconstrained opaque type
   --> $DIR/duplicate-bound-err.rs:26:51
@@ -107,6 +107,14 @@ LL |     fn foo() -> impl Iterator<Item = i32, Item = u32> {
 ...
 LL |         [2u32].into_iter()
    |         ------------------ return type was inferred to be `std::array::IntoIter<u32, 1>` here
+   |
+note: the method call chain might not have had the expected associated types
+  --> $DIR/duplicate-bound-err.rs:110:16
+   |
+LL |         [2u32].into_iter()
+   |         ------ ^^^^^^^^^^^ `Iterator::Item` is `u32` here
+   |         |
+   |         this expression has type `[u32; 1]`
 
 error[E0271]: expected `impl Iterator<Item = u32>` to be an iterator that yields `i32`, but it yields `u32`
   --> $DIR/duplicate-bound-err.rs:107:17

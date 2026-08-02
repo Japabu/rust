@@ -7,6 +7,7 @@ use rustc_middle::ty::util::IntTypeExt;
 use rustc_middle::ty::{self, AdtDef, Ty, TyCtxt};
 use rustc_session::Session;
 
+use crate::PassPolicy;
 use crate::patch::MirPatch;
 
 /// A pass that seeks to optimize unnecessary moves of large enum types, if there is a large
@@ -31,11 +32,13 @@ pub(super) struct EnumSizeOpt {
 }
 
 impl<'tcx> crate::MirPass<'tcx> for EnumSizeOpt {
-    fn is_enabled(&self, sess: &Session) -> bool {
+    fn policy(&self, sess: &Session) -> PassPolicy {
         // There are some differences in behavior on wasm and ARM that are not properly
         // understood, so we conservatively treat this optimization as unsound:
         // https://github.com/rust-lang/rust/issues/154413
-        sess.opts.unstable_opts.unsound_mir_opts && sess.mir_opt_level() >= 3
+        PassPolicy::optimization(
+            sess.opts.unstable_opts.unsound_mir_opts && sess.mir_opt_level() >= 3,
+        )
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -49,9 +52,9 @@ impl<'tcx> crate::MirPass<'tcx> for EnumSizeOpt {
 
         for (block, data) in body.basic_blocks.as_mut().iter_enumerated_mut() {
             for (statement_index, st) in data.statements.iter_mut().enumerate() {
-                let StatementKind::Assign(box (
+                let StatementKind::Assign((
                     lhs,
-                    Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs)),
+                    Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs), _),
                 )) = &st.kind
                 else {
                     continue;
@@ -83,7 +86,7 @@ impl<'tcx> crate::MirPass<'tcx> for EnumSizeOpt {
                         tmp_ty,
                     ),
                 };
-                let rval = Rvalue::Use(Operand::Constant(Box::new(constant_vals)));
+                let rval = Rvalue::Use(Operand::Constant(Box::new(constant_vals)), WithRetag::No);
                 let const_assign = StatementKind::Assign(Box::new((place, rval)));
 
                 let discr_place =
@@ -100,10 +103,14 @@ impl<'tcx> crate::MirPass<'tcx> for EnumSizeOpt {
                 let size_place = Place::from(patch.new_temp(tcx.types.usize, span));
                 let store_size = StatementKind::Assign(Box::new((
                     size_place,
-                    Rvalue::Use(Operand::Copy(Place {
-                        local: size_array_local,
-                        projection: tcx.mk_place_elems(&[PlaceElem::Index(discr_cast_place.local)]),
-                    })),
+                    Rvalue::Use(
+                        Operand::Copy(Place {
+                            local: size_array_local,
+                            projection: tcx
+                                .mk_place_elems(&[PlaceElem::Index(discr_cast_place.local)]),
+                        }),
+                        WithRetag::No,
+                    ),
                 )));
 
                 let dst = Place::from(patch.new_temp(Ty::new_mut_ptr(tcx, ty), span));
@@ -160,10 +167,6 @@ impl<'tcx> crate::MirPass<'tcx> for EnumSizeOpt {
         }
 
         patch.apply(body);
-    }
-
-    fn is_required(&self) -> bool {
-        false
     }
 }
 

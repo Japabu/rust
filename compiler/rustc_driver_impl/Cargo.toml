@@ -27,7 +27,6 @@ rustc_macros = { path = "../rustc_macros" }
 rustc_metadata = { path = "../rustc_metadata" }
 rustc_middle = { path = "../rustc_middle" }
 rustc_mir_build = { path = "../rustc_mir_build" }
-rustc_mir_transform = { path = "../rustc_mir_transform" }
 rustc_parse = { path = "../rustc_parse" }
 rustc_public = { path = "../rustc_public", features = ["rustc_internal"] }
 rustc_resolve = { path = "../rustc_resolve" }
@@ -59,7 +58,6 @@ ctrlc = "3.4.4"
 # tidy-alphabetical-start
 check_only = ['rustc_interface/check_only']
 llvm = ['rustc_interface/llvm']
-llvm_enzyme = ['rustc_interface/llvm_enzyme']
 llvm_offload = ['rustc_interface/llvm_offload']
 max_level_info = ['rustc_log/max_level_info']
 rustc_randomized_layouts = [

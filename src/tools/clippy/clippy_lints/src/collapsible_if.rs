@@ -1,14 +1,13 @@
 use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_hir_and_then;
 use clippy_utils::msrvs::Msrv;
-use clippy_utils::source::{HasSession, IntoSpan as _, SpanRangeExt, snippet, snippet_block_with_applicability};
+use clippy_utils::source::{IntoSpan as _, SpanExt, snippet, snippet_block_with_applicability};
 use clippy_utils::{can_use_if_let_chains, span_contains_cfg, span_contains_non_whitespace, sym, tokenize_with_text};
-use rustc_ast::BinOpKind;
+use rustc_ast::{BinOpKind, MetaItemInner};
 use rustc_errors::Applicability;
-use rustc_hir::attrs::{AttributeKind, LintAttributeKind};
-use rustc_hir::{Attribute, Block, Expr, ExprKind, StmtKind};
+use rustc_hir::{Block, Expr, ExprKind, StmtKind};
 use rustc_lexer::TokenKind;
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, Level};
 use rustc_session::impl_lint_pass;
 use rustc_span::{BytePos, Span, Symbol};
 
@@ -141,6 +140,8 @@ impl CollapsibleIf {
 
                     // Prevent "elseif"
                     // Check that the "else" is followed by whitespace
+                    // Note: We intentionally use char::is_whitespace instead of rustc_lexer::is_whitespace here to
+                    // avoid visual issues with zero-width spaces. See ui tests.
                     let requires_space = snippet(cx, up_to_else, "..").ends_with(|c: char| !c.is_whitespace());
                     let mut applicability = Applicability::MachineApplicable;
                     diag.span_suggestion(
@@ -238,24 +239,19 @@ impl CollapsibleIf {
                 !span_contains_non_whitespace(cx, span, self.lint_commented_code)
             },
 
-            [Attribute::Parsed(AttributeKind::LintAttributes(sub_attrs))] => {
-                sub_attrs
-                    .into_iter()
-                    .filter(|attr| attr.kind == LintAttributeKind::Expect)
-                    .flat_map(|attr| attr.lint_instances.iter().map(|group| (attr.attr_span, group)))
-                    .filter(|(_, lint_id)| {
-                        lint_id.tool_is_named(sym::clippy)
-                            && (expected_lint_name == lint_id.lint_name()
-                                || [expected_lint_name, sym::style, sym::all]
-                                    .contains(&lint_id.original_name_without_tool()))
-                    })
-                    .any(|(attr_span, _)| {
-                        // There is an `expect` attribute -- check that there is no _other_ significant text
-                        let span_before_attr = inner_if.span.split_at(1).1.until(attr_span);
-                        let span_after_attr = attr_span.between(inner_if_expr.span);
-                        !span_contains_non_whitespace(cx, span_before_attr, self.lint_commented_code)
-                            && !span_contains_non_whitespace(cx, span_after_attr, self.lint_commented_code)
-                    })
+            [attr]
+                if matches!(Level::from_opt_symbol(attr.name()), Some(Level::Expect))
+                    && let Some(metas) = attr.meta_item_list()
+                    && let Some(MetaItemInner::MetaItem(meta_item)) = metas.first()
+                    && let [tool, lint_name] = meta_item.path.segments.as_slice()
+                    && tool.ident.name == sym::clippy
+                    && [expected_lint_name, sym::style, sym::all].contains(&lint_name.ident.name) =>
+            {
+                // There is an `expect` attribute -- check that there is no _other_ significant text
+                let span_before_attr = inner_if.span.split_at(1).1.until(attr.span());
+                let span_after_attr = attr.span().between(inner_if_expr.span);
+                !span_contains_non_whitespace(cx, span_before_attr, self.lint_commented_code)
+                    && !span_contains_non_whitespace(cx, span_after_attr, self.lint_commented_code)
             },
 
             // There are other attributes, which are significant tokens -- check failed
@@ -323,7 +319,7 @@ pub(super) fn parens_around(expr: &Expr<'_>) -> Vec<(Span, String)> {
     }
 }
 
-fn span_extract_keyword(cx: &impl HasSession, span: Span, keyword: &str) -> Option<Span> {
+fn span_extract_keyword(cx: &LateContext<'_>, span: Span, keyword: &str) -> Option<Span> {
     span.with_source_text(cx, |snippet| {
         tokenize_with_text(snippet)
             .filter(|(t, s, _)| matches!(t, TokenKind::Ident if *s == keyword))
@@ -339,7 +335,7 @@ fn span_extract_keyword(cx: &impl HasSession, span: Span, keyword: &str) -> Opti
 }
 
 /// Peel the parentheses from an `if` expression, e.g. `((if true {} else {}))`.
-pub(super) fn peel_parens(cx: &impl HasSession, mut span: Span) -> (Span, Span, Span) {
+pub(super) fn peel_parens(cx: &LateContext<'_>, mut span: Span) -> (Span, Span, Span) {
     use crate::rustc_span::Pos;
 
     let start = span.shrink_to_lo();

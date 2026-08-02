@@ -12,12 +12,14 @@ use rustc_errors::{ErrorGuaranteed, MultiSpan};
 use rustc_hir as hir;
 use rustc_hir::LangItem;
 use rustc_hir::def_id::DefId;
-use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, extension};
+use rustc_macros::{StableHash, TyDecodable, TyEncodable, TypeFoldable, extension};
 use rustc_span::{DUMMY_SP, Span, Symbol, kw, sym};
 use rustc_type_ir::TyKind::*;
 use rustc_type_ir::solve::SizedTraitKind;
 use rustc_type_ir::walk::TypeWalker;
-use rustc_type_ir::{self as ir, BoundVar, CollectAndApply, TypeVisitableExt, elaborate};
+use rustc_type_ir::{
+    self as ir, BoundVar, CollectAndApply, MayBeErased, TypeVisitableExt, elaborate,
+};
 use tracing::instrument;
 use ty::util::IntTypeExt;
 
@@ -27,7 +29,7 @@ use crate::traits::ObligationCause;
 use crate::ty::InferTy::*;
 use crate::ty::{
     self, AdtDef, Const, Discr, GenericArg, GenericArgs, GenericArgsRef, List, ParamEnv, Region,
-    Ty, TyCtxt, TypeFlags, TypeSuperVisitable, TypeVisitable, TypeVisitor, UintTy, ValTree,
+    Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor, UintTy, ValTree,
 };
 
 // Re-export and re-parameterize some `I = TyCtxt<'tcx>` types here
@@ -36,10 +38,18 @@ pub type TyKind<'tcx> = ir::TyKind<TyCtxt<'tcx>>;
 pub type TypeAndMut<'tcx> = ir::TypeAndMut<TyCtxt<'tcx>>;
 pub type AliasTy<'tcx> = ir::AliasTy<TyCtxt<'tcx>>;
 pub type AliasTyKind<'tcx> = ir::AliasTyKind<TyCtxt<'tcx>>;
+pub type Alias<'tcx, K> = ir::Alias<TyCtxt<'tcx>, K>;
+pub type ProjectionAliasTy<'tcx> = ir::ProjectionAliasTy<TyCtxt<'tcx>>;
+pub type InherentAliasTy<'tcx> = ir::InherentAliasTy<TyCtxt<'tcx>>;
+pub type OpaqueAliasTy<'tcx> = ir::OpaqueAliasTy<TyCtxt<'tcx>>;
+pub type FreeAliasTy<'tcx> = ir::FreeAliasTy<TyCtxt<'tcx>>;
 pub type FnSig<'tcx> = ir::FnSig<TyCtxt<'tcx>>;
+pub type FnSigKind<'tcx> = ir::FnSigKind<TyCtxt<'tcx>>;
 pub type Binder<'tcx, T> = ir::Binder<TyCtxt<'tcx>, T>;
 pub type EarlyBinder<'tcx, T> = ir::EarlyBinder<TyCtxt<'tcx>, T>;
-pub type TypingMode<'tcx> = ir::TypingMode<TyCtxt<'tcx>>;
+pub type Unnormalized<'tcx, T> = ir::Unnormalized<TyCtxt<'tcx>, T>;
+pub type TypingMode<'tcx, S = MayBeErased> = ir::TypingMode<TyCtxt<'tcx>, S>;
+pub type TypingModeEqWrapper<'tcx> = ir::TypingModeEqWrapper<TyCtxt<'tcx>>;
 pub type Placeholder<'tcx, T> = ir::Placeholder<TyCtxt<'tcx>, T>;
 pub type PlaceholderRegion<'tcx> = ir::PlaceholderRegion<TyCtxt<'tcx>>;
 pub type PlaceholderType<'tcx> = ir::PlaceholderType<TyCtxt<'tcx>>;
@@ -156,21 +166,16 @@ impl<'tcx> ty::CoroutineArgs<TyCtxt<'tcx>> {
                 if tcx.is_async_drop_in_place_coroutine(def_id) {
                     layout.field_tys[*field].ty
                 } else {
-                    ty::EarlyBinder::bind(layout.field_tys[*field].ty).instantiate(tcx, self.args)
+                    ty::EarlyBinder::bind(tcx, layout.field_tys[*field].ty)
+                        .instantiate(tcx, self.args)
+                        .skip_norm_wip()
                 }
             })
         })
     }
-
-    /// This is the types of the fields of a coroutine which are not stored in a
-    /// variant.
-    #[inline]
-    fn prefix_tys(self) -> &'tcx List<Ty<'tcx>> {
-        self.upvar_tys()
-    }
 }
 
-#[derive(Debug, Copy, Clone, HashStable, TypeFoldable, TypeVisitable)]
+#[derive(Debug, Copy, Clone, StableHash, TypeFoldable, TypeVisitable)]
 pub enum UpvarArgs<'tcx> {
     Closure(GenericArgsRef<'tcx>),
     Coroutine(GenericArgsRef<'tcx>),
@@ -271,7 +276,7 @@ pub type PolyFnSig<'tcx> = Binder<'tcx, FnSig<'tcx>>;
 pub type CanonicalPolyFnSig<'tcx> = Canonical<'tcx, Binder<'tcx, FnSig<'tcx>>>;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, TyEncodable, TyDecodable)]
-#[derive(HashStable)]
+#[derive(StableHash)]
 pub struct ParamTy {
     pub index: u32,
     pub name: Symbol,
@@ -305,7 +310,7 @@ impl<'tcx> ParamTy {
 }
 
 #[derive(Copy, Clone, Hash, TyEncodable, TyDecodable, Eq, PartialEq, Ord, PartialOrd)]
-#[derive(HashStable)]
+#[derive(StableHash)]
 pub struct ParamConst {
     pub index: u32,
     pub name: Symbol,
@@ -364,7 +369,6 @@ impl ParamConst {
 impl<'tcx> Ty<'tcx> {
     /// Avoid using this in favour of more specific `new_*` methods, where possible.
     /// The more specific methods will often optimize their creation.
-    #[allow(rustc::usage_of_ty_tykind)]
     #[inline]
     fn new(tcx: TyCtxt<'tcx>, st: TyKind<'tcx>) -> Ty<'tcx> {
         tcx.mk_ty_from_kind(st)
@@ -469,14 +473,28 @@ impl<'tcx> Ty<'tcx> {
     }
 
     #[inline]
-    pub fn new_alias(tcx: TyCtxt<'tcx>, alias_ty: ty::AliasTy<'tcx>) -> Ty<'tcx> {
-        debug_assert_matches!(
-            (alias_ty.kind, tcx.def_kind(alias_ty.kind.def_id())),
-            (ty::Opaque { .. }, DefKind::OpaqueTy)
-                | (ty::Projection { .. } | ty::Inherent { .. }, DefKind::AssocTy)
-                | (ty::Free { .. }, DefKind::TyAlias)
-        );
-        Ty::new(tcx, Alias(alias_ty))
+    pub fn new_alias(
+        tcx: TyCtxt<'tcx>,
+        is_rigid: ty::IsRigid,
+        alias_ty: ty::AliasTy<'tcx>,
+    ) -> Ty<'tcx> {
+        if cfg!(debug_assertions) {
+            match alias_ty.kind {
+                ty::AliasTyKind::Projection { def_id } => {
+                    debug_assert_matches!(tcx.def_kind(def_id), DefKind::AssocTy)
+                }
+                ty::AliasTyKind::Inherent { def_id } => {
+                    debug_assert_matches!(tcx.def_kind(def_id), DefKind::AssocTy)
+                }
+                ty::AliasTyKind::Opaque { def_id } => {
+                    debug_assert_matches!(tcx.def_kind(def_id), DefKind::OpaqueTy)
+                }
+                ty::AliasTyKind::Free { def_id } => {
+                    debug_assert_matches!(tcx.def_kind(def_id), DefKind::TyAlias)
+                }
+            }
+        }
+        Ty::new(tcx, Alias(is_rigid, alias_ty))
     }
 
     #[inline]
@@ -515,8 +533,13 @@ impl<'tcx> Ty<'tcx> {
 
     #[inline]
     #[instrument(level = "debug", skip(tcx))]
-    pub fn new_opaque(tcx: TyCtxt<'tcx>, def_id: DefId, args: GenericArgsRef<'tcx>) -> Ty<'tcx> {
-        Ty::new_alias(tcx, AliasTy::new_from_args(tcx, ty::Opaque { def_id }, args))
+    pub fn new_opaque(
+        tcx: TyCtxt<'tcx>,
+        is_rigid: ty::IsRigid,
+        def_id: DefId,
+        args: GenericArgsRef<'tcx>,
+    ) -> Ty<'tcx> {
+        Ty::new_alias(tcx, is_rigid, AliasTy::new_from_args(tcx, ty::Opaque { def_id }, args))
     }
 
     /// Constructs a `TyKind::Error` type with current `ErrorGuaranteed`
@@ -650,7 +673,6 @@ impl<'tcx> Ty<'tcx> {
                 | DefKind::Use
                 | DefKind::ForeignMod
                 | DefKind::AnonConst
-                | DefKind::InlineConst
                 | DefKind::OpaqueTy
                 | DefKind::Field
                 | DefKind::LifetimeParam
@@ -702,17 +724,19 @@ impl<'tcx> Ty<'tcx> {
         T::collect_and_apply(iter, |ts| Ty::new_tup(tcx, ts))
     }
 
+    /// Prefer using the [TyCtxt::type_of] query over this, that makes it easier to get all the pieces correct
     #[inline]
     pub fn new_fn_def(
         tcx: TyCtxt<'tcx>,
         def_id: DefId,
-        args: impl IntoIterator<Item: Into<GenericArg<'tcx>>>,
+        args: ty::Binder<'tcx, impl IntoIterator<Item: Into<GenericArg<'tcx>>>>,
     ) -> Ty<'tcx> {
         debug_assert_matches!(
             tcx.def_kind(def_id),
             DefKind::AssocFn | DefKind::Fn | DefKind::Ctor(_, CtorKind::Fn)
         );
-        let args = tcx.check_and_mk_args(def_id, args);
+        // FIXME(156581): check that the binder is being used correctly (turbofishing/fndef changes)
+        let args = args.map_bound(|args| tcx.check_and_mk_args(def_id, args));
         Ty::new(tcx, FnDef(def_id, args))
     }
 
@@ -738,25 +762,22 @@ impl<'tcx> Ty<'tcx> {
                 .projection_bounds()
                 .filter(|item| !tcx.generics_require_sized_self(item.item_def_id()))
                 .count();
-            let expected_count: usize = obj
-                .principal_def_id()
-                .into_iter()
-                .flat_map(|principal_def_id| {
-                    // IMPORTANT: This has to agree with HIR ty lowering of dyn trait!
-                    elaborate::supertraits(
-                        tcx,
-                        ty::Binder::dummy(ty::TraitRef::identity(tcx, principal_def_id)),
-                    )
-                    .map(|principal| {
-                        tcx.associated_items(principal.def_id())
-                            .in_definition_order()
-                            .filter(|item| item.is_type() || item.is_type_const())
-                            .filter(|item| !item.is_impl_trait_in_trait())
-                            .filter(|item| !tcx.generics_require_sized_self(item.def_id))
-                            .count()
-                    })
+            let expected_count: usize = obj.principal_def_id().map_or(0, |principal_def_id| {
+                // IMPORTANT: This has to agree with HIR ty lowering of dyn trait!
+                elaborate::supertraits(
+                    tcx,
+                    ty::Binder::dummy(ty::TraitRef::identity(tcx, principal_def_id)),
+                )
+                .map(|principal| {
+                    tcx.associated_items(principal.def_id())
+                        .in_definition_order()
+                        .filter(|item| item.is_type() || item.is_type_const())
+                        .filter(|item| !item.is_impl_trait_in_trait())
+                        .filter(|item| !tcx.generics_require_sized_self(item.def_id))
+                        .count()
                 })
-                .sum();
+                .sum()
+            });
             assert_eq!(
                 projection_count, expected_count,
                 "expected {obj:?} to have {expected_count} projections, \
@@ -769,11 +790,13 @@ impl<'tcx> Ty<'tcx> {
     #[inline]
     pub fn new_projection_from_args(
         tcx: TyCtxt<'tcx>,
+        is_rigid: ty::IsRigid,
         item_def_id: DefId,
         args: ty::GenericArgsRef<'tcx>,
     ) -> Ty<'tcx> {
         Ty::new_alias(
             tcx,
+            is_rigid,
             AliasTy::new_from_args(tcx, ty::Projection { def_id: item_def_id }, args),
         )
     }
@@ -781,10 +804,15 @@ impl<'tcx> Ty<'tcx> {
     #[inline]
     pub fn new_projection(
         tcx: TyCtxt<'tcx>,
+        is_rigid: ty::IsRigid,
         item_def_id: DefId,
         args: impl IntoIterator<Item: Into<GenericArg<'tcx>>>,
     ) -> Ty<'tcx> {
-        Ty::new_alias(tcx, AliasTy::new(tcx, ty::Projection { def_id: item_def_id }, args))
+        Ty::new_alias(
+            tcx,
+            is_rigid,
+            AliasTy::new(tcx, ty::Projection { def_id: item_def_id }, args),
+        )
     }
 
     #[inline]
@@ -872,7 +900,7 @@ impl<'tcx> Ty<'tcx> {
                     ty_param.into()
                 } else {
                     assert!(has_default);
-                    tcx.type_of(param.def_id).instantiate(tcx, args).into()
+                    tcx.type_of(param.def_id).instantiate(tcx, args).skip_norm_wip().into()
                 }
             }
         });
@@ -960,8 +988,12 @@ impl<'tcx> rustc_type_ir::inherent::Ty<TyCtxt<'tcx>> for Ty<'tcx> {
         Ty::new_canonical_bound(tcx, var)
     }
 
-    fn new_alias(interner: TyCtxt<'tcx>, alias_ty: ty::AliasTy<'tcx>) -> Self {
-        Ty::new_alias(interner, alias_ty)
+    fn new_alias(
+        interner: TyCtxt<'tcx>,
+        is_rigid: ty::IsRigid,
+        alias_ty: ty::AliasTy<'tcx>,
+    ) -> Self {
+        Ty::new_alias(interner, is_rigid, alias_ty)
     }
 
     fn new_error(interner: TyCtxt<'tcx>, guar: ErrorGuaranteed) -> Self {
@@ -1076,7 +1108,11 @@ impl<'tcx> rustc_type_ir::inherent::Ty<TyCtxt<'tcx>> for Ty<'tcx> {
         Ty::from_coroutine_closure_kind(interner, kind)
     }
 
-    fn new_fn_def(interner: TyCtxt<'tcx>, def_id: DefId, args: ty::GenericArgsRef<'tcx>) -> Self {
+    fn new_fn_def(
+        interner: TyCtxt<'tcx>,
+        def_id: DefId,
+        args: ty::Binder<'tcx, ty::GenericArgsRef<'tcx>>,
+    ) -> Self {
         Ty::new_fn_def(interner, def_id, args)
     }
 
@@ -1118,12 +1154,6 @@ impl<'tcx> Ty<'tcx> {
     #[inline(always)]
     pub fn kind(self) -> &'tcx TyKind<'tcx> {
         self.0.0
-    }
-
-    // FIXME(compiler-errors): Think about removing this.
-    #[inline(always)]
-    pub fn flags(self) -> TypeFlags {
-        self.0.0.flags
     }
 
     #[inline]
@@ -1180,6 +1210,14 @@ impl<'tcx> Ty<'tcx> {
     }
 
     #[inline]
+    pub fn float_vid(self) -> Option<ty::FloatVid> {
+        match self.kind() {
+            &Infer(FloatVar(vid)) => Some(vid),
+            _ => None,
+        }
+    }
+
+    #[inline]
     pub fn is_ty_or_numeric_infer(self) -> bool {
         matches!(self.kind(), Infer(_))
     }
@@ -1187,6 +1225,11 @@ impl<'tcx> Ty<'tcx> {
     #[inline]
     pub fn is_phantom_data(self) -> bool {
         if let Adt(def, _) = self.kind() { def.is_phantom_data() } else { false }
+    }
+
+    #[inline]
+    pub fn is_unsafe_cell(self) -> bool {
+        if let Adt(def, _) = self.kind() { def.is_unsafe_cell() } else { false }
     }
 
     #[inline]
@@ -1268,7 +1311,10 @@ impl<'tcx> Ty<'tcx> {
             ScalableElt::ElementCount(_) => (NumScalableVectors::for_non_tuple(), *def),
             ScalableElt::Container => (
                 NumScalableVectors::from_field_count(def.non_enum_variant().fields.len())?,
-                def.non_enum_variant().fields[FieldIdx::ZERO].ty(tcx, args).ty_adt_def()?,
+                def.non_enum_variant().fields[FieldIdx::ZERO]
+                    .ty(tcx, args)
+                    .skip_norm_wip()
+                    .ty_adt_def()?,
             ),
         };
         let Some(ScalableElt::ElementCount(element_count)) = vec_def.repr().scalable else {
@@ -1277,7 +1323,7 @@ impl<'tcx> Ty<'tcx> {
         let variant = vec_def.non_enum_variant();
         assert_eq!(variant.fields.len(), 1);
         let field_ty = variant.fields[FieldIdx::ZERO].ty(tcx, args);
-        Some((element_count, field_ty, num_vectors))
+        Some((element_count, field_ty.skip_norm_wip(), num_vectors))
     }
 
     pub fn simd_size_and_type(self, tcx: TyCtxt<'tcx>) -> (u64, Ty<'tcx>) {
@@ -1288,7 +1334,7 @@ impl<'tcx> Ty<'tcx> {
         let variant = def.non_enum_variant();
         assert_eq!(variant.fields.len(), 1);
         let field_ty = variant.fields[FieldIdx::ZERO].ty(tcx, args);
-        let Array(f0_elem_ty, f0_len) = field_ty.kind() else {
+        let Array(f0_elem_ty, f0_len) = field_ty.skip_norm_wip().kind() else {
             bug!("Simd type has non-array field type {field_ty:?}")
         };
         // FIXME(repr_simd): https://github.com/rust-lang/rust/pull/78863#discussion_r522784112
@@ -1583,6 +1629,11 @@ impl<'tcx> Ty<'tcx> {
         self.kind().fn_sig(tcx)
     }
 
+    #[tracing::instrument(level = "trace", skip(tcx))]
+    pub fn unnormalized_fn_sig(self, tcx: TyCtxt<'tcx>) -> ty::Unnormalized<'tcx, PolyFnSig<'tcx>> {
+        self.kind().unnormalized_fn_sig(tcx)
+    }
+
     #[inline]
     pub fn is_fn(self) -> bool {
         matches!(self.kind(), FnDef(..) | FnPtr(..))
@@ -1595,7 +1646,7 @@ impl<'tcx> Ty<'tcx> {
 
     #[inline]
     pub fn is_opaque(self) -> bool {
-        matches!(self.kind(), Alias(ty::AliasTy { kind: ty::Opaque { .. }, .. }))
+        matches!(self.kind(), Alias(_, ty::AliasTy { kind: ty::Opaque { .. }, .. }))
     }
 
     #[inline]
@@ -1677,7 +1728,12 @@ impl<'tcx> Ty<'tcx> {
                 let assoc_items = tcx.associated_item_def_ids(
                     tcx.require_lang_item(hir::LangItem::DiscriminantKind, DUMMY_SP),
                 );
-                Ty::new_projection_from_args(tcx, assoc_items[0], tcx.mk_args(&[self.into()]))
+                Ty::new_projection_from_args(
+                    tcx,
+                    ty::IsRigid::No,
+                    assoc_items[0],
+                    tcx.mk_args(&[self.into()]),
+                )
             }
 
             ty::Pat(ty, _) => ty.discriminant_ty(tcx),
@@ -1721,7 +1777,7 @@ impl<'tcx> Ty<'tcx> {
     pub fn ptr_metadata_ty_or_tail(
         self,
         tcx: TyCtxt<'tcx>,
-        normalize: impl FnMut(Ty<'tcx>) -> Ty<'tcx>,
+        normalize: impl FnMut(Unnormalized<'tcx, Ty<'tcx>>) -> Ty<'tcx>,
     ) -> Result<Ty<'tcx>, Ty<'tcx>> {
         let tail = tcx.struct_tail_raw(self, &ObligationCause::dummy(), normalize, || {});
         match tail.kind() {
@@ -1742,28 +1798,28 @@ impl<'tcx> Ty<'tcx> {
             | ty::Closure(..)
             | ty::CoroutineClosure(..)
             | ty::Never
-            | ty::Error(_)
+            | ty::Error(_) => Ok(tcx.types.unit),
             // Extern types have metadata = ().
-            | ty::Foreign(..)
+            ty::Foreign(..) => Ok(tcx.types.unit),
             // If returned by `struct_tail_raw` this is a unit struct
             // without any fields, or not a struct, and therefore is Sized.
-            | ty::Adt(..)
+            ty::Adt(..) => Ok(tcx.types.unit),
             // If returned by `struct_tail_raw` this is the empty tuple,
             // a.k.a. unit type, which is Sized
-            | ty::Tuple(..) => Ok(tcx.types.unit),
+            ty::Tuple(..) => Ok(tcx.types.unit),
 
             ty::Str | ty::Slice(_) => Ok(tcx.types.usize),
 
             ty::Dynamic(_, _) => {
                 let dyn_metadata = tcx.require_lang_item(LangItem::DynMetadata, DUMMY_SP);
-                Ok(tcx.type_of(dyn_metadata).instantiate(tcx, &[tail.into()]))
+                Ok(tcx.type_of(dyn_metadata).instantiate(tcx, &[tail.into()]).skip_norm_wip())
             }
 
             // We don't know the metadata of `self`, but it must be equal to the
             // metadata of `tail`.
             ty::Param(_) | ty::Alias(..) => Err(tail),
 
-            | ty::UnsafeBinder(_) => todo!("FIXME(unsafe_binder)"),
+            ty::UnsafeBinder(_) => unimplemented!("FIXME(unsafe_binder)"),
 
             ty::Infer(ty::TyVar(_))
             | ty::Pat(..)
@@ -1780,7 +1836,7 @@ impl<'tcx> Ty<'tcx> {
     pub fn ptr_metadata_ty(
         self,
         tcx: TyCtxt<'tcx>,
-        normalize: impl FnMut(Ty<'tcx>) -> Ty<'tcx>,
+        normalize: impl FnMut(Unnormalized<'tcx, Ty<'tcx>>) -> Ty<'tcx>,
     ) -> Ty<'tcx> {
         match self.ptr_metadata_ty_or_tail(tcx, normalize) {
             Ok(metadata) => metadata,
@@ -1806,11 +1862,11 @@ impl<'tcx> Ty<'tcx> {
         if pointee_ty.has_trivial_sizedness(tcx, SizedTraitKind::Sized) {
             tcx.types.unit
         } else {
-            match pointee_ty.ptr_metadata_ty_or_tail(tcx, |x| x) {
+            match pointee_ty.ptr_metadata_ty_or_tail(tcx, |x| x.skip_norm_wip()) {
                 Ok(metadata_ty) => metadata_ty,
                 Err(tail_ty) => {
                     let metadata_def_id = tcx.require_lang_item(LangItem::Metadata, DUMMY_SP);
-                    Ty::new_projection(tcx, metadata_def_id, [tail_ty])
+                    Ty::new_projection(tcx, ty::IsRigid::No, metadata_def_id, [tail_ty])
                 }
             }
         }
@@ -1947,9 +2003,9 @@ impl<'tcx> Ty<'tcx> {
 
             ty::Tuple(tys) => tys.last().is_none_or(|ty| ty.has_trivial_sizedness(tcx, sizedness)),
 
-            ty::Adt(def, args) => def
-                .sizedness_constraint(tcx, sizedness)
-                .is_none_or(|ty| ty.instantiate(tcx, args).has_trivial_sizedness(tcx, sizedness)),
+            ty::Adt(def, args) => def.sizedness_constraint(tcx, sizedness).is_none_or(|ty| {
+                ty.instantiate(tcx, args).skip_norm_wip().has_trivial_sizedness(tcx, sizedness)
+            }),
 
             ty::Alias(..) | ty::Param(_) | ty::Placeholder(..) | ty::Bound(..) => false,
 
@@ -2160,6 +2216,6 @@ mod size_asserts {
     use super::*;
     // tidy-alphabetical-start
     static_assert_size!(TyKind<'_>, 32);
-    static_assert_size!(ty::WithCachedTypeInfo<TyKind<'_>>, 56);
+    static_assert_size!(ty::WithCachedTypeInfo<TyKind<'_>>, 40);
     // tidy-alphabetical-end
 }

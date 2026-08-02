@@ -298,7 +298,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             error.code,
             FulfillmentErrorCode::Select(crate::traits::SelectionError::Unimplemented)
                 | FulfillmentErrorCode::Project(_)
-        ) && self.apply_do_not_recommend(&mut error.obligation)
+        ) && self.apply_do_not_recommend(&mut error.obligation, &error.root_obligation)
         {
             error.code = FulfillmentErrorCode::Select(SelectionError::Unimplemented);
         }
@@ -340,7 +340,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 | ObligationCauseCode::WhereClauseInExpr(..) = code
                 {
                     self.note_obligation_cause_code(
-                        error.obligation.cause.body_id,
+                        error.obligation.cause.body_def_id,
                         &mut diag,
                         error.obligation.predicate,
                         error.obligation.param_env,
@@ -455,7 +455,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
 pub(crate) fn to_pretty_impl_header(tcx: TyCtxt<'_>, impl_def_id: DefId) -> Option<String> {
     use std::fmt::Write;
 
-    let trait_ref = tcx.impl_opt_trait_ref(impl_def_id)?.instantiate_identity();
+    let trait_ref = tcx.impl_opt_trait_ref(impl_def_id)?.instantiate_identity().skip_norm_wip();
     let mut w = "impl".to_owned();
 
     #[derive(Debug, Default)]
@@ -485,19 +485,19 @@ pub(crate) fn to_pretty_impl_header(tcx: TyCtxt<'_>, impl_def_id: DefId) -> Opti
         " {}{} for {}",
         tcx.impl_polarity(impl_def_id).as_str(),
         trait_ref.print_only_trait_path(),
-        tcx.type_of(impl_def_id).instantiate_identity()
+        tcx.type_of(impl_def_id).instantiate_identity().skip_norm_wip()
     )
     .unwrap();
 
-    let predicates = tcx.predicates_of(impl_def_id).predicates;
-    let mut pretty_predicates = Vec::with_capacity(predicates.len());
+    let clauses = tcx.clauses_of(impl_def_id).clauses;
+    let mut pretty_clauses = Vec::with_capacity(clauses.len());
 
     let sized_trait = tcx.lang_items().sized_trait();
     let meta_sized_trait = tcx.lang_items().meta_sized_trait();
 
-    for (p, _) in predicates {
+    for (c, _) in clauses {
         // Accumulate the sizedness bounds for each self ty.
-        if let Some(trait_clause) = p.as_trait_clause() {
+        if let Some(trait_clause) = c.as_trait_clause() {
             let self_ty = trait_clause.self_ty().skip_binder();
             let sizedness_of = types_with_sizedness_bounds.entry(self_ty).or_default();
             if Some(trait_clause.def_id()) == sized_trait {
@@ -509,7 +509,7 @@ pub(crate) fn to_pretty_impl_header(tcx: TyCtxt<'_>, impl_def_id: DefId) -> Opti
             }
         }
 
-        pretty_predicates.push(p.to_string());
+        pretty_clauses.push(c.to_string());
     }
 
     for (ty, sizedness) in types_with_sizedness_bounds {
@@ -517,22 +517,22 @@ pub(crate) fn to_pretty_impl_header(tcx: TyCtxt<'_>, impl_def_id: DefId) -> Opti
             if sizedness.sized {
                 // Maybe a default bound, don't write anything.
             } else {
-                pretty_predicates.push(format!("{ty}: ?Sized"));
+                pretty_clauses.push(format!("{ty}: ?Sized"));
             }
         } else {
             if sizedness.sized {
                 // Maybe a default bound, don't write anything.
-                pretty_predicates.push(format!("{ty}: Sized"));
+                pretty_clauses.push(format!("{ty}: Sized"));
             } else if sizedness.meta_sized {
-                pretty_predicates.push(format!("{ty}: MetaSized"));
+                pretty_clauses.push(format!("{ty}: MetaSized"));
             } else {
-                pretty_predicates.push(format!("{ty}: PointeeSized"));
+                pretty_clauses.push(format!("{ty}: PointeeSized"));
             }
         }
     }
 
-    if !pretty_predicates.is_empty() {
-        write!(w, "\n  where {}", pretty_predicates.join(", ")).unwrap();
+    if !pretty_clauses.is_empty() {
+        write!(w, "\n  where {}", pretty_clauses.join(", ")).unwrap();
     }
 
     w.push(';');
@@ -577,8 +577,9 @@ pub fn report_dyn_incompatibility<'tcx>(
     let trait_str = tcx.def_path_str(trait_def_id);
     let trait_span = tcx.hir_get_if_local(trait_def_id).and_then(|node| match node {
         hir::Node::Item(item) => match item.kind {
-            hir::ItemKind::Trait(_, _, _, ident, ..)
-            | hir::ItemKind::TraitAlias(_, ident, _, _) => Some(ident.span),
+            hir::ItemKind::Trait { ident, .. } | hir::ItemKind::TraitAlias(_, ident, _, _) => {
+                Some(ident.span)
+            }
             _ => unreachable!(),
         },
         _ => None,

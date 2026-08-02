@@ -2,13 +2,16 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::iter;
 use std::process::Command;
+use std::str::FromStr;
 use std::sync::OnceLock;
 
 use build_helper::git::GitConfig;
 use camino::{Utf8Path, Utf8PathBuf};
 use semver::Version;
 
+use crate::debuggers::LldbVersion;
 use crate::edition::Edition;
+use crate::executor::TestVariant;
 use crate::fatal;
 use crate::util::{Utf8PathBufExt, add_dylib_path, string_enum};
 
@@ -82,8 +85,73 @@ string_enum! {
 }
 
 string_enum! {
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum PassFailMode {
+        CheckFail => "check-fail",
+        CheckPass => "check-pass",
+        BuildFail => "build-fail",
+        BuildPass => "build-pass",
+        /// Running the program must make it exit with a regular failure exit code
+        /// in the range `1..=127`. If the program is terminated by e.g. a signal
+        /// the test will fail.
+        RunFail => "run-fail",
+        /// Running the program must result in a crash, e.g. by `SIGABRT` or
+        /// `SIGSEGV` on Unix or on Windows by having an appropriate NTSTATUS high
+        /// bit in the exit code.
+        RunCrash => "run-crash",
+        /// Running the program must either fail or crash. Useful for e.g. sanitizer
+        /// tests since some sanitizer implementations exit the process with code 1
+        /// to in the face of memory errors while others abort (crash) the process
+        /// in the face of memory errors.
+        RunFailOrCrash => "run-fail-or-crash",
+        RunPass => "run-pass",
+    }
+}
+
+impl PassFailMode {
+    pub(crate) fn is_pass(&self) -> bool {
+        match self {
+            PassFailMode::CheckPass | PassFailMode::BuildPass | PassFailMode::RunPass => true,
+
+            PassFailMode::CheckFail
+            | PassFailMode::BuildFail
+            | PassFailMode::RunFail
+            | PassFailMode::RunCrash
+            | PassFailMode::RunFailOrCrash => false,
+        }
+    }
+
+    pub(crate) fn is_check(&self) -> bool {
+        match self {
+            PassFailMode::CheckFail | PassFailMode::CheckPass => true,
+
+            PassFailMode::BuildFail
+            | PassFailMode::BuildPass
+            | PassFailMode::RunFail
+            | PassFailMode::RunCrash
+            | PassFailMode::RunFailOrCrash
+            | PassFailMode::RunPass => false,
+        }
+    }
+
+    pub(crate) fn is_run(&self) -> bool {
+        match self {
+            PassFailMode::CheckFail
+            | PassFailMode::CheckPass
+            | PassFailMode::BuildFail
+            | PassFailMode::BuildPass => false,
+
+            PassFailMode::RunFail
+            | PassFailMode::RunCrash
+            | PassFailMode::RunFailOrCrash
+            | PassFailMode::RunPass => true,
+        }
+    }
+}
+
+string_enum! {
     #[derive(Clone, Copy, PartialEq, Debug, Hash)]
-    pub(crate) enum PassMode {
+    pub(crate) enum ForcePassMode {
         Check => "check",
         Build => "build",
         Run => "run",
@@ -97,30 +165,6 @@ string_enum! {
         Fail => "run-fail",
         Crash => "run-crash",
     }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, PartialOrd)]
-pub(crate) enum RunFailMode {
-    /// Running the program must make it exit with a regular failure exit code
-    /// in the range `1..=127`. If the program is terminated by e.g. a signal
-    /// the test will fail.
-    Fail,
-    /// Running the program must result in a crash, e.g. by `SIGABRT` or
-    /// `SIGSEGV` on Unix or on Windows by having an appropriate NTSTATUS high
-    /// bit in the exit code.
-    Crash,
-    /// Running the program must either fail or crash. Useful for e.g. sanitizer
-    /// tests since some sanitizer implementations exit the process with code 1
-    /// to in the face of memory errors while others abort (crash) the process
-    /// in the face of memory errors.
-    FailOrCrash,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, PartialOrd)]
-pub(crate) enum FailMode {
-    Check,
-    Build,
-    Run(RunFailMode),
 }
 
 string_enum! {
@@ -186,15 +230,15 @@ pub(crate) enum CodegenBackend {
     Llvm,
 }
 
-impl<'a> TryFrom<&'a str> for CodegenBackend {
-    type Error = &'static str;
+impl FromStr for CodegenBackend {
+    type Err = &'static str;
 
-    fn try_from(value: &'a str) -> Result<Self, Self::Error> {
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.to_lowercase().as_str() {
             "cranelift" => Ok(Self::Cranelift),
             "gcc" => Ok(Self::Gcc),
             "llvm" => Ok(Self::Llvm),
-            _ => Err("unknown backend"),
+            _ => Err("unknown codegen backend"),
         }
     }
 }
@@ -410,18 +454,6 @@ pub(crate) struct Config {
     /// [`TestMode::CoverageMap`].
     pub(crate) suite: TestSuite,
 
-    /// When specified, **only** the specified [`Debugger`] will be used to run against the
-    /// `tests/debuginfo` test suite. When unspecified, `compiletest` will attempt to find all three
-    /// of {`lldb`, `cdb`, `gdb`} implicitly, and then try to run the `debuginfo` test suite against
-    /// all three debuggers.
-    ///
-    /// FIXME: this implicit behavior is really nasty, in that it makes it hard for the user to
-    /// control *which* debugger(s) are available and used to run the debuginfo test suite. We
-    /// should have `bootstrap` allow the user to *explicitly* configure the debuggers, and *not*
-    /// try to implicitly discover some random debugger from the user environment. This makes the
-    /// debuginfo test suite particularly hard to work with.
-    pub(crate) debugger: Option<Debugger>,
-
     /// Run ignored tests *unconditionally*, overriding their ignore reason.
     ///
     /// FIXME: this is wired up through the test execution logic, but **not** accessible from
@@ -470,7 +502,7 @@ pub(crate) struct Config {
     /// FIXME: make it even more obvious (especially in PR CI where `--pass=check` is used) when a
     /// pass mode is forced when the test fails, because it can be very non-obvious when e.g. an
     /// error is emitted only when `//@ build-pass` but not `//@ check-pass`.
-    pub(crate) force_pass_mode: Option<PassMode>,
+    pub(crate) force_pass_mode: Option<ForcePassMode>,
 
     /// Explicitly enable or disable running of the target test binary.
     ///
@@ -507,7 +539,7 @@ pub(crate) struct Config {
     /// may override this setting.
     ///
     /// FIXME: this flag / config option is somewhat misleading. For instance, in ui tests, it's
-    /// *only* applied to the [`PassMode::Run`] test crate and not its auxiliaries.
+    /// *only* applied to the [`PassFailMode::RunPass`] test crate and not its auxiliaries.
     pub(crate) optimize_tests: bool,
 
     /// Target platform tuple.
@@ -555,7 +587,7 @@ pub(crate) struct Config {
     /// Version of LLDB.
     ///
     /// FIXME: `lldb_version` is *derived* from lldb, but it's *not* technically a config!
-    pub(crate) lldb_version: Option<u32>,
+    pub(crate) lldb_version: Option<LldbVersion>,
 
     /// Version of LLVM.
     ///
@@ -602,6 +634,10 @@ pub(crate) struct Config {
     ///
     /// FIXME: this is *way* too coarse; the user can't select *which* info to verbosely dump.
     pub(crate) verbose: bool,
+
+    /// Whether to enable verbose subprocess output for run-make tests.
+    /// Set to false to suppress output for passing tests (e.g. for cg_clif with --no-capture).
+    pub verbose_run_make_subprocess_output: bool,
 
     /// Where to find the remote test client process, if we're using it.
     ///
@@ -1260,13 +1296,13 @@ pub(crate) fn output_relative_path(config: &Config, relative_dir: &Utf8Path) -> 
 pub(crate) fn output_testname_unique(
     config: &Config,
     testpaths: &TestPaths,
-    revision: Option<&str>,
+    variant: &TestVariant,
 ) -> Utf8PathBuf {
     let mode = config.compare_mode.as_ref().map_or("", |m| m.to_str());
-    let debugger = config.debugger.as_ref().map_or("", |m| m.to_str());
+    let debugger = variant.debugger.as_ref().map_or("", |m| m.to_str());
     Utf8PathBuf::from(&testpaths.file.file_stem().unwrap())
         .with_extra_extension(config.mode.output_dir_disambiguator())
-        .with_extra_extension(revision.unwrap_or(""))
+        .with_extra_extension(variant.revision().unwrap_or(""))
         .with_extra_extension(mode)
         .with_extra_extension(debugger)
 }
@@ -1277,10 +1313,10 @@ pub(crate) fn output_testname_unique(
 pub(crate) fn output_base_dir(
     config: &Config,
     testpaths: &TestPaths,
-    revision: Option<&str>,
+    variant: &TestVariant,
 ) -> Utf8PathBuf {
     output_relative_path(config, &testpaths.relative_dir)
-        .join(output_testname_unique(config, testpaths, revision))
+        .join(output_testname_unique(config, testpaths, variant))
 }
 
 /// Absolute path to the base filename used as output for the given
@@ -1289,9 +1325,9 @@ pub(crate) fn output_base_dir(
 pub(crate) fn output_base_name(
     config: &Config,
     testpaths: &TestPaths,
-    revision: Option<&str>,
+    variant: &TestVariant,
 ) -> Utf8PathBuf {
-    output_base_dir(config, testpaths, revision).join(testpaths.file.file_stem().unwrap())
+    output_base_dir(config, testpaths, variant).join(testpaths.file.file_stem().unwrap())
 }
 
 /// Absolute path to the directory to use for incremental compilation. Example:
@@ -1299,7 +1335,7 @@ pub(crate) fn output_base_name(
 pub(crate) fn incremental_dir(
     config: &Config,
     testpaths: &TestPaths,
-    revision: Option<&str>,
+    variant: &TestVariant,
 ) -> Utf8PathBuf {
-    output_base_name(config, testpaths, revision).with_extension("inc")
+    output_base_name(config, testpaths, variant).with_extension("inc")
 }

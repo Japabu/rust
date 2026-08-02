@@ -1,19 +1,18 @@
-#![attr = LintAttributes([LintAttribute {kind: Allow, attr_style: Inner,
-lint_instances: [incomplete_features]}])]
-#![attr = Feature([fn_delegation#0])]
-extern crate std;
-#[attr = PreludeImport]
-use ::std::prelude::rust_2015::*;
 //@ pretty-compare-only
 //@ pretty-mode:hir
 //@ pp-exact:hir-delegation.pp
 
+#![allow(incomplete_features)]
+#![attr = Feature([fn_delegation#0])]
+extern crate std;
+#[attr = PreludeImport]
+use ::std::prelude::rust_2015::*;
 
 fn b<C>(e: C) { }
 
 trait G {
     #[attr = Inline(Hint)]
-    fn b<C>(arg0: _) -> _ { b::<C>({ }) }
+    fn b<C>(arg0: _) -> _ { b::<C>(arg0) }
 }
 
 mod m {

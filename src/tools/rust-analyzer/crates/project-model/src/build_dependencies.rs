@@ -382,7 +382,6 @@ impl WorkspaceBuildScripts {
                     }
                     Message::CompilerArtifact(message) => {
                         with_output_for(&message.package_id, &mut |name, data| {
-                            progress(format!("proc-macro {name} built"));
                             if data.proc_macro_dylib_path == ProcMacroDylibPath::NotBuilt {
                                 data.proc_macro_dylib_path = ProcMacroDylibPath::NotProcMacro;
                             }
@@ -392,6 +391,7 @@ impl WorkspaceBuildScripts {
                                     .kind
                                     .contains(&cargo_metadata::TargetKind::ProcMacro)
                             {
+                                progress(format!("proc-macro {name} built"));
                                 data.proc_macro_dylib_path =
                                     match message.filenames.iter().find(|file| is_dylib(file)) {
                                         Some(filename) => {
@@ -450,6 +450,9 @@ impl WorkspaceBuildScripts {
 
                 cmd.args(["check", "--quiet", "--workspace", "--message-format=json"]);
                 cmd.args(&config.extra_args);
+                if let Some(config_path) = &config.config_path {
+                    cmd.arg("--config").arg(config_path);
+                }
 
                 cmd.arg("--manifest-path");
                 cmd.arg(manifest_path);
@@ -470,12 +473,14 @@ impl WorkspaceBuildScripts {
                     if let Some(lockfile_copy) = &lockfile_copy {
                         requires_unstable_options = true;
                         match lockfile_copy.usage {
-                            LockfileUsage::WithFlag => {
-                                cmd.arg("--lockfile-path");
-                                cmd.arg(lockfile_copy.path.as_str());
+                            LockfileUsage::WithEnvVarUnstable => {
+                                cmd.arg("-Zlockfile-path");
+                                cmd.env(
+                                    "CARGO_RESOLVER_LOCKFILE_PATH",
+                                    lockfile_copy.path.as_os_str(),
+                                );
                             }
                             LockfileUsage::WithEnvVar => {
-                                cmd.arg("-Zlockfile-path");
                                 cmd.env(
                                     "CARGO_RESOLVER_LOCKFILE_PATH",
                                     lockfile_copy.path.as_os_str(),
@@ -560,7 +565,7 @@ impl WorkspaceBuildScripts {
 
 // FIXME: Find a better way to know if it is a dylib.
 fn is_dylib(path: &Utf8Path) -> bool {
-    match path.extension().map(|e| e.to_owned().to_lowercase()) {
+    match path.extension().map(|e| e.to_ascii_lowercase()) {
         None => false,
         Some(ext) => matches!(ext.as_str(), "dll" | "dylib" | "so"),
     }

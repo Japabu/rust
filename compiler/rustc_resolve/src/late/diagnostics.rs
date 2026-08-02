@@ -1,4 +1,4 @@
-// ignore-tidy-filelength
+// ignore-tidy-file-filelength
 
 use std::borrow::Cow;
 use std::iter;
@@ -12,37 +12,37 @@ use rustc_ast::{
 };
 use rustc_ast_pretty::pprust::{path_to_string, where_bound_predicate_to_string};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap, FxIndexSet};
+use rustc_data_structures::unord::UnordItems;
 use rustc_errors::codes::*;
 use rustc_errors::{
     Applicability, Diag, Diagnostic, ErrorGuaranteed, MultiSpan, SuggestionStyle, pluralize,
     struct_span_code_err,
 };
 use rustc_hir as hir;
+use rustc_hir::attrs::diagnostic::{CustomDiagnostic, FormatArgs};
 use rustc_hir::def::Namespace::{self, *};
-use rustc_hir::def::{self, CtorKind, CtorOf, DefKind, MacroKinds};
+use rustc_hir::def::{CtorKind, CtorOf, DefKind, MacroKinds};
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId};
 use rustc_hir::{MissingLifetimeKind, PrimTy, find_attr};
 use rustc_middle::ty;
 use rustc_session::{Session, lint};
 use rustc_span::edit_distance::{edit_distance, find_best_match_for_name};
 use rustc_span::edition::Edition;
-use rustc_span::{DUMMY_SP, Ident, Span, Symbol, kw, sym};
-use thin_vec::ThinVec;
+use rustc_span::{DUMMY_SP, DesugaringKind, Ident, Span, Symbol, kw, sym};
+use thin_vec::{ThinVec, thin_vec};
 use tracing::debug;
 
 use super::NoConstantGenericsReason;
-use crate::diagnostics::{ImportSuggestion, LabelSuggestion, TypoSuggestion};
+use crate::diagnostics::impls::{ImportSuggestion, LabelSuggestion, TypoSuggestion};
 use crate::late::{
     AliasPossibility, LateResolutionVisitor, LifetimeBinderKind, LifetimeRes, LifetimeRibKind,
     LifetimeUseSet, QSelf, RibKind,
 };
 use crate::ty::fast_reject::SimplifiedType;
 use crate::{
-    Finalize, Module, ModuleKind, ModuleOrUniformRoot, ParentScope, PathResult, PathSource,
-    Resolver, ScopeSet, Segment, errors, path_names_to_string,
+    Finalize, Module, ModuleOrUniformRoot, ParentScope, PathResult, PathSource, Res, Resolver,
+    ScopeSet, Segment, diagnostics, path_names_to_string,
 };
-
-type Res = def::Res<ast::NodeId>;
 
 /// A field or associated item from self type suggested in case of resolution failure.
 enum AssocSuggestion {
@@ -105,7 +105,6 @@ fn import_candidate_to_enum_paths(suggestion: &ImportSuggestion) -> (String, Str
     let enum_path = ast::Path {
         span: suggestion.path.span,
         segments: suggestion.path.segments[0..path_len - 1].iter().cloned().collect(),
-        tokens: None,
     };
     let enum_path_string = path_names_to_string(&enum_path);
 
@@ -134,7 +133,7 @@ pub(super) struct MissingLifetime {
 
 /// Description of the lifetimes appearing in a function parameter.
 /// This is used to provide a literal explanation to the elision failure.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct ElisionFnParameter {
     /// The index of the argument in the original definition.
     pub index: usize,
@@ -150,10 +149,8 @@ pub(super) struct ElisionFnParameter {
 /// This is used to suggest introducing an explicit lifetime.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum LifetimeElisionCandidate {
-    /// This is not a real lifetime.
+    /// This is not a real lifetime, or it is a named lifetime, in which case we won't suggest anything.
     Ignore,
-    /// There is a named lifetime, we won't suggest anything.
-    Named,
     Missing(MissingLifetime),
 }
 
@@ -167,6 +164,7 @@ struct BaseError {
     could_be_expr: bool,
     suggestion: Option<(Span, &'static str, String)>,
     module: Option<DefId>,
+    notes: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -192,7 +190,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
         assoc_name: Symbol,
     ) -> Option<DefId> {
         let module = self.r.get_module(trait_def_id)?;
-        self.r.resolutions(module).borrow().iter().find_map(|(key, resolution)| {
+        self.r.resolutions(module).iter().find_map(|(key, resolution)| {
             if key.ident.name != assoc_name {
                 return None;
             }
@@ -324,9 +322,9 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
             && let Some(assoc) = self.diag_metadata.current_impl_item
         {
             let generics = match &assoc.kind {
-                AssocItemKind::Const(box ast::ConstItem { generics, .. })
-                | AssocItemKind::Fn(box ast::Fn { generics, .. })
-                | AssocItemKind::Type(box ast::TyAlias { generics, .. }) => Some(generics),
+                AssocItemKind::Const(ast::ConstItem { generics, .. })
+                | AssocItemKind::Fn(ast::Fn { generics, .. })
+                | AssocItemKind::Type(ast::TyAlias { generics, .. }) => Some(generics),
                 AssocItemKind::Delegation(..)
                 | AssocItemKind::MacCall(..)
                 | AssocItemKind::DelegationMac(..) => None,
@@ -387,11 +385,11 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
         span: Span,
         source: PathSource<'_, 'ast, 'ra>,
         res: Option<Res>,
+        could_be_expr: bool,
     ) -> BaseError {
         // Make the base error.
         let mut expected = source.descr_expected();
         let path_str = Segment::names_to_string(path);
-        let item_str = path.last().unwrap().ident;
 
         if let Some(res) = res {
             BaseError {
@@ -404,36 +402,16 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                     }
                     _ => None,
                 },
-                could_be_expr: match res {
-                    Res::Def(DefKind::Fn, _) => {
-                        // Verify whether this is a fn call or an Fn used as a type.
-                        self.r
-                            .tcx
-                            .sess
-                            .source_map()
-                            .span_to_snippet(span)
-                            .is_ok_and(|snippet| snippet.ends_with(')'))
-                    }
-                    Res::Def(
-                        DefKind::Ctor(..)
-                        | DefKind::AssocFn
-                        | DefKind::Const { .. }
-                        | DefKind::AssocConst { .. },
-                        _,
-                    )
-                    | Res::SelfCtor(_)
-                    | Res::PrimTy(_)
-                    | Res::Local(_) => true,
-                    _ => false,
-                },
+                could_be_expr,
                 suggestion: None,
                 module: None,
+                notes: Vec::new(),
             }
         } else {
             let mut span_label = None;
             let item_ident = path.last().unwrap().ident;
             let item_span = item_ident.span;
-            let (mod_prefix, mod_str, module, suggestion) = if path.len() == 1 {
+            let (tick, mod_prefix, mod_str, module, suggestion) = if path.len() == 1 {
                 debug!(?self.diag_metadata.current_impl_items);
                 debug!(?self.diag_metadata.current_function);
                 let suggestion = if self.current_trait_ref.is_none()
@@ -444,7 +422,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                     && let Some(item) = items.iter().find(|i| {
                         i.kind.ident().is_some_and(|ident| {
                             // Don't suggest if the item is in Fn signature arguments (#112590).
-                            ident.name == item_str.name && !sig.span.contains(item_span)
+                            ident.name == item_ident.name && !sig.span.contains(item_span)
                         })
                     }) {
                     let sp = item_span.shrink_to_lo();
@@ -514,15 +492,16 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                 } else {
                     None
                 };
-                (String::new(), "this scope".to_string(), None, suggestion)
+                ("", String::new(), "this scope".to_string(), None, suggestion)
             } else if path.len() == 2 && path[0].ident.name == kw::PathRoot {
                 if self.r.tcx.sess.edition() > Edition::Edition2015 {
                     // In edition 2018 onwards, the `::foo` syntax may only pull from the extern prelude
                     // which overrides all other expectations of item type
                     expected = "crate";
-                    (String::new(), "the list of imported crates".to_string(), None, None)
+                    ("", String::new(), "the list of imported crates".to_string(), None, None)
                 } else {
                     (
+                        "",
                         String::new(),
                         "the crate root".to_string(),
                         Some(CRATE_DEF_ID.to_def_id()),
@@ -530,7 +509,13 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                     )
                 }
             } else if path.len() == 2 && path[0].ident.name == kw::Crate {
-                (String::new(), "the crate root".to_string(), Some(CRATE_DEF_ID.to_def_id()), None)
+                (
+                    "",
+                    String::new(),
+                    "the crate root".to_string(),
+                    Some(CRATE_DEF_ID.to_def_id()),
+                    None,
+                )
             } else {
                 let mod_path = &path[..path.len() - 1];
                 let mod_res = self.resolve_path(mod_path, Some(TypeNS), None, source);
@@ -543,42 +528,91 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
 
                 let mod_prefix =
                     mod_prefix.map_or_else(String::new, |res| format!("{} ", res.descr()));
-                (mod_prefix, format!("`{}`", Segment::names_to_string(mod_path)), module_did, None)
+                ("`", mod_prefix, Segment::names_to_string(mod_path), module_did, None)
             };
 
-            let (fallback_label, suggestion) = if path_str == "async"
-                && expected.starts_with("struct")
-            {
-                ("`async` blocks are only allowed in Rust 2018 or later".to_string(), suggestion)
+            let suggestion =
+                if ["true", "false"].contains(&item_ident.to_string().to_lowercase().as_str()) {
+                    // check if we are in situation of typo like `True` instead of `true`.
+                    let item_typo = item_ident.to_string().to_lowercase();
+                    Some((item_span, "you may want to use a bool value instead", item_typo))
+                // FIXME(vincenzopalazzo): make the check smarter,
+                // and maybe expand with levenshtein distance checks
+                } else if item_ident.as_str() == "printf" {
+                    Some((
+                        item_span,
+                        "you may have meant to use the `print` macro",
+                        "print!".to_owned(),
+                    ))
+                } else {
+                    suggestion
+                };
+            let mut msg = format!(
+                "cannot find {expected} `{item_ident}` in {mod_prefix}{tick}{mod_str}{tick}"
+            );
+            let mut fallback_label = if path_str == "async" && expected.starts_with("struct") {
+                "`async` blocks are only allowed in Rust 2018 or later".to_string()
             } else {
-                // check if we are in situation of typo like `True` instead of `true`.
-                let override_suggestion =
-                    if ["true", "false"].contains(&item_str.to_string().to_lowercase().as_str()) {
-                        let item_typo = item_str.to_string().to_lowercase();
-                        Some((item_span, "you may want to use a bool value instead", item_typo))
-                    // FIXME(vincenzopalazzo): make the check smarter,
-                    // and maybe expand with levenshtein distance checks
-                    } else if item_str.as_str() == "printf" {
-                        Some((
-                            item_span,
-                            "you may have meant to use the `print` macro",
-                            "print!".to_owned(),
-                        ))
-                    } else {
-                        suggestion
-                    };
-                (format!("not found in {mod_str}"), override_suggestion)
+                format!("not found in {tick}{mod_str}{tick}")
             };
+            let mut notes = Vec::new();
+            if let Some(module_def_id) = module
+                && let Some(directive) = self.r.on_unknown_data(module_def_id)
+            {
+                let args = FormatArgs { unresolved: item_ident.to_string(), this: mod_str, .. };
+                let CustomDiagnostic {
+                    message,
+                    label,
+                    notes: custom_notes,
+                    parent_label: _unreachable,
+                } = directive.eval(None, &args);
+                if let Some(message) = message {
+                    notes.push(msg);
+                    msg = message;
+                }
+                if let Some(label) = label {
+                    fallback_label = label;
+                    if let Some((_, span_label)) = span_label.take() {
+                        notes.push(span_label.to_string());
+                    }
+                }
+                notes.extend(custom_notes);
+            }
 
             BaseError {
-                msg: format!("cannot find {expected} `{item_str}` in {mod_prefix}{mod_str}"),
+                msg,
                 fallback_label,
                 span: item_span,
                 span_label,
-                could_be_expr: false,
+                could_be_expr,
                 suggestion,
                 module,
+                notes,
             }
+        }
+    }
+
+    fn could_be_expr(&self, res: Res, span: Span) -> bool {
+        match res {
+            // Verify whether this is a fn call or an Fn used as a type.
+            Res::Def(DefKind::Fn, _) => self
+                .r
+                .tcx
+                .sess
+                .source_map()
+                .span_to_snippet(span)
+                .is_ok_and(|snippet| snippet.ends_with(')')),
+            Res::Def(
+                DefKind::Ctor(..)
+                | DefKind::AssocFn
+                | DefKind::Const { .. }
+                | DefKind::AssocConst { .. },
+                _,
+            )
+            | Res::SelfCtor(_)
+            | Res::PrimTy(_)
+            | Res::Local(_) => true,
+            _ => false,
         }
     }
 
@@ -614,7 +648,6 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                             && self
                                 .r
                                 .resolutions(module)
-                                .borrow()
                                 .iter()
                                 .any(|(key, _r)| key.ident.name == following_seg.ident.name)
                     } else {
@@ -640,11 +673,28 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
         qself: Option<&QSelf>,
     ) -> (Diag<'tcx>, Vec<ImportSuggestion>) {
         debug!(?res, ?source);
-        let base_error = self.make_base_error(path, span, source, res);
+        let cross_namespace_res = res.filter(|res| !res.matches_ns(source.namespace()));
+        let could_be_expr = res.is_some_and(|res| self.could_be_expr(res, span));
+        let base_error = self.make_base_error(
+            path,
+            span,
+            source,
+            if cross_namespace_res.is_some() { None } else { res },
+            could_be_expr,
+        );
 
         let code = source.error_code(res.is_some());
         let mut err = self.r.dcx().struct_span_err(base_error.span, base_error.msg.clone());
         err.code(code);
+
+        if let Some(res) = cross_namespace_res {
+            err.note(format!(
+                "{} {} named `{}` exists in another namespace",
+                res.article(),
+                res.descr(),
+                Segment::names_to_string(path),
+            ));
+        }
 
         // Try to get the span of the identifier within the path's syntax context
         // (if that's different).
@@ -661,6 +711,9 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
 
         if let Some((span, label)) = base_error.span_label {
             err.span_label(span, label);
+        }
+        for note in &base_error.notes {
+            err.note(note.clone());
         }
 
         if let Some(ref sugg) = base_error.suggestion {
@@ -980,12 +1033,15 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                     AssocSuggestion::Field(field_span) => {
                         if self_is_available {
                             let source_map = self.r.tcx.sess.source_map();
-                            // check if the field is used in a format string, such as `"{x}"`
-                            let field_is_format_named_arg = source_map
+                            let field_is_format_named_arg = matches!(
+                                span.desugaring_kind(),
+                                Some(DesugaringKind::FormatLiteral { .. })
+                            ) && source_map
                                 .span_to_source(span, |s, start, _| {
-                                    Ok(s.get(start - 1..start) == Some("{"))
-                                });
-                            if let Ok(true) = field_is_format_named_arg {
+                                    Ok(s.get(start.saturating_sub(1)..start) == Some("{"))
+                                })
+                                .unwrap_or(false);
+                            if field_is_format_named_arg {
                                 err.help(
                                     format!("you might have meant to use the available field in a format string: `\"{{}}\", self.{}`", segment.ident.name),
                                 );
@@ -1040,14 +1096,15 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                 }
 
                 if let Some(Res::Def(DefKind::Struct, def_id)) = res {
-                    let private_fields = self.has_private_fields(def_id);
-                    let adjust_error_message =
-                        private_fields && self.is_struct_with_fn_ctor(def_id);
-                    if adjust_error_message {
-                        self.update_err_for_private_tuple_struct_fields(err, &source, def_id);
-                    }
-
-                    if private_fields {
+                    if let Some(ctor) = self.r.struct_ctor(def_id)
+                        && ctor.has_private_fields(self.parent_scope.module, self.r)
+                    {
+                        if matches!(
+                            ctor.res,
+                            Res::Def(DefKind::Ctor(CtorOf::Struct, CtorKind::Fn), _)
+                        ) {
+                            self.update_err_for_private_tuple_struct_fields(err, &source, def_id);
+                        }
                         err.note("constructor is not visible here due to private fields");
                     }
                 } else {
@@ -1106,7 +1163,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
 
     fn lookup_doc_alias_name(&mut self, path: &[Segment], ns: Namespace) -> Option<(DefId, Ident)> {
         let find_doc_alias_name = |r: &mut Resolver<'ra, '_>, m: Module<'ra>, item_name: Symbol| {
-            for resolution in r.resolutions(m).borrow().values() {
+            for resolution in r.resolutions(m).values() {
                 let Some(did) =
                     resolution.borrow().best_decl().and_then(|binding| binding.res().opt_def_id())
                 else {
@@ -1131,7 +1188,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
             for rib in self.ribs[ns].iter().rev() {
                 let item = path[0].ident;
                 if let RibKind::Module(module) | RibKind::Block(Some(module)) = rib.kind
-                    && let Some(did) = find_doc_alias_name(self.r, module, item.name)
+                    && let Some(did) = find_doc_alias_name(self.r, module.to_module(), item.name)
                 {
                     return Some((did, item));
                 }
@@ -1593,7 +1650,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                 Side::Start => (segment.ident.span.between(range.span), " @ ".into()),
                 Side::End => (range.span.to(segment.ident.span), format!("{} @ ..", segment.ident)),
             };
-            err.subdiagnostic(errors::UnexpectedResUseAtOpInSlicePatWithRangeSugg {
+            err.subdiagnostic(diagnostics::UnexpectedResUseAtOpInSlicePatWithRangeSugg {
                 span,
                 ident: segment.ident,
                 snippet,
@@ -1696,7 +1753,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
             && let TyKind::Path(_, self_ty_path) = &self_ty.kind
             && let PathResult::Module(ModuleOrUniformRoot::Module(module)) =
                 self.resolve_path(&Segment::from_path(self_ty_path), Some(TypeNS), None, source)
-            && let ModuleKind::Def(DefKind::Trait, ..) = module.kind
+            && module.def_kind() == Some(DefKind::Trait)
             && trait_ref.path.span == span
             && let PathSource::Trait(_) = source
             && let Some(Res::Def(DefKind::Struct | DefKind::Enum | DefKind::Union, _)) = res
@@ -1757,7 +1814,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
             }) else {
                 return;
             };
-            err.subdiagnostic(errors::UnexpectedResChangeTyParamToConstParamSugg {
+            err.subdiagnostic(diagnostics::UnexpectedResChangeTyParamToConstParamSugg {
                 before: span.shrink_to_lo(),
                 after: span.shrink_to_hi(),
             });
@@ -1774,8 +1831,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
             // const generics. Of course, `Struct` and `Enum` may contain ty params, too, but the
             // benefits of including them here outweighs the small number of false positives.
             Some(Res::Def(DefKind::Struct | DefKind::Enum, _))
-                if self.r.tcx.features().adt_const_params()
-                    || self.r.tcx.features().min_adt_const_params() =>
+                if self.r.features.adt_const_params() || self.r.features.min_adt_const_params() =>
             {
                 Applicability::MaybeIncorrect
             }
@@ -1800,7 +1856,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
         });
 
         if let Some(param) = param {
-            err.subdiagnostic(errors::UnexpectedResChangeTyToConstParamSugg {
+            err.subdiagnostic(diagnostics::UnexpectedResChangeTyToConstParamSugg {
                 span: param.shrink_to_lo(),
                 applicability,
             });
@@ -1847,7 +1903,6 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                 let targets: Vec<_> = self
                     .r
                     .resolutions(module)
-                    .borrow()
                     .iter()
                     .filter_map(|(key, resolution)| {
                         let resolution = resolution.borrow();
@@ -1892,10 +1947,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
         let ast::TyKind::Path(Some(qself), path) = &bounded_ty.kind else { return false };
         // use this to verify that ident is a type param.
         let Some(partial_res) = self.r.partial_res_map.get(&bounded_ty.id) else { return false };
-        if !matches!(
-            partial_res.full_res(),
-            Some(hir::def::Res::Def(hir::def::DefKind::AssocTy, _))
-        ) {
+        if !matches!(partial_res.full_res(), Some(Res::Def(DefKind::AssocTy, _))) {
             return false;
         }
 
@@ -1905,10 +1957,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
         let Some(partial_res) = self.r.partial_res_map.get(&peeled_ty.id) else {
             return false;
         };
-        if !matches!(
-            partial_res.full_res(),
-            Some(hir::def::Res::Def(hir::def::DefKind::TyParam, _))
-        ) {
+        if !matches!(partial_res.full_res(), Some(Res::Def(DefKind::TyParam, _))) {
             return false;
         }
         let ([ast::PathSegment { args: None, .. }], [ast::GenericBound::Trait(poly_trait_ref)]) =
@@ -1928,7 +1977,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
             let Some(partial_res) = self.r.partial_res_map.get(&id) else {
                 return false;
             };
-            if !matches!(partial_res.full_res(), Some(hir::def::Res::Def(..))) {
+            if !matches!(partial_res.full_res(), Some(Res::Def(..))) {
                 return false;
             }
 
@@ -2015,21 +2064,8 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
         }
     }
 
-    fn is_struct_with_fn_ctor(&mut self, def_id: DefId) -> bool {
-        def_id
-            .as_local()
-            .and_then(|local_id| self.r.struct_constructors.get(&local_id))
-            .map(|struct_ctor| {
-                matches!(
-                    struct_ctor.0,
-                    def::Res::Def(DefKind::Ctor(CtorOf::Struct, CtorKind::Fn), _)
-                )
-            })
-            .unwrap_or(false)
-    }
-
     fn update_err_for_private_tuple_struct_fields(
-        &mut self,
+        &self,
         err: &mut Diag<'_>,
         source: &PathSource<'_, '_, '_>,
         def_id: DefId,
@@ -2090,9 +2126,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
 
             let (lhs_span, rhs_span) = match &expr.kind {
                 ExprKind::Field(base, ident) => (base.span, ident.span),
-                ExprKind::MethodCall(box MethodCall { receiver, span, .. }) => {
-                    (receiver.span, *span)
-                }
+                ExprKind::MethodCall(MethodCall { receiver, span, .. }) => (receiver.span, *span),
                 _ => return false,
             };
 
@@ -2141,7 +2175,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
             }
         };
 
-        let bad_struct_syntax_suggestion = |this: &mut Self, err: &mut Diag<'_>, def_id: DefId| {
+        let bad_struct_syntax_suggestion = |this: &Self, err: &mut Diag<'_>, def_id: DefId| {
             let (followed_by_brace, closing_brace) = this.followed_by_brace(span);
 
             match source {
@@ -2201,7 +2235,17 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                         _ => (": val", "literal", Applicability::HasPlaceholders, None),
                     };
 
-                    if !this.has_private_fields(def_id) {
+                    // Imprecise for local structs without ctors, we don't keep fields for them.
+                    let has_private_fields = match def_id.as_local() {
+                        Some(def_id) => this.r.struct_ctors.get(&def_id).is_some_and(|ctor| {
+                            ctor.has_private_fields(this.parent_scope.module, this.r)
+                        }),
+                        None => this.r.tcx.associated_item_def_ids(def_id).iter().any(|field_id| {
+                            let vis = this.r.tcx.visibility(*field_id);
+                            !this.r.is_accessible_from(vis, this.parent_scope.module)
+                        }),
+                    };
+                    if !has_private_fields {
                         // If the fields of the type are private, we shouldn't be suggesting using
                         // the struct literal syntax at all, as that will cause a subsequent error.
                         let fields = this.r.field_idents(def_id);
@@ -2367,53 +2411,39 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                 self.suggest_using_enum_variant(err, source, def_id, span);
             }
             (Res::Def(DefKind::Struct, def_id), source) if ns == ValueNS => {
-                let struct_ctor = match def_id.as_local() {
-                    Some(def_id) => self.r.struct_constructors.get(&def_id).cloned(),
-                    None => {
-                        let ctor = self.r.cstore().ctor_untracked(self.r.tcx(), def_id);
-                        ctor.map(|(ctor_kind, ctor_def_id)| {
-                            let ctor_res =
-                                Res::Def(DefKind::Ctor(CtorOf::Struct, ctor_kind), ctor_def_id);
-                            let ctor_vis = self.r.tcx.visibility(ctor_def_id);
-                            let field_visibilities = self
-                                .r
-                                .tcx
-                                .associated_item_def_ids(def_id)
-                                .iter()
-                                .map(|&field_id| self.r.tcx.visibility(field_id))
-                                .collect();
-                            (ctor_res, ctor_vis, field_visibilities)
-                        })
-                    }
-                };
-
-                let (ctor_def, ctor_vis, fields) = if let Some(struct_ctor) = struct_ctor {
-                    if let PathSource::Expr(Some(parent)) = source
-                        && let ExprKind::Field(..) | ExprKind::MethodCall(..) = parent.kind
-                    {
-                        bad_struct_syntax_suggestion(self, err, def_id);
-                        return true;
-                    }
-                    struct_ctor
-                } else {
+                if let PathSource::Expr(Some(parent)) = source
+                    && let ExprKind::Field(..) | ExprKind::MethodCall(..) = parent.kind
+                {
+                    bad_struct_syntax_suggestion(self, err, def_id);
+                    return true;
+                }
+                let Some(ctor) = self.r.struct_ctor(def_id) else {
                     bad_struct_syntax_suggestion(self, err, def_id);
                     return true;
                 };
 
-                let is_accessible = self.r.is_accessible_from(ctor_vis, self.parent_scope.module);
-                if let Some(use_span) = self.r.inaccessible_ctor_reexport.get(&span)
-                    && is_accessible
+                // A type is re-exported and has an inaccessible constructor because it has fields
+                // that are inaccessible from the reexport's scope, extend the diagnostic.
+                let is_accessible = self.r.is_accessible_from(ctor.vis, self.parent_scope.module);
+                if is_accessible
+                    && let mod_path = &path[..path.len() - 1]
+                    && let PathResult::Module(ModuleOrUniformRoot::Module(import_mod)) =
+                        self.resolve_path(mod_path, Some(TypeNS), None, PathSource::Module)
+                    && ctor.has_private_fields(import_mod, self.r)
+                    && let Ok(import_decl) = self.r.cm().maybe_resolve_ident_in_module(
+                        ModuleOrUniformRoot::Module(import_mod),
+                        path.last().unwrap().ident,
+                        TypeNS,
+                        &self.parent_scope,
+                        None,
+                    )
                 {
                     err.span_note(
-                        *use_span,
+                        import_decl.span,
                         "the type is accessed through this re-export, but the type's constructor \
                          is not visible in this import's scope due to private fields",
                     );
-                    if is_accessible
-                        && fields
-                            .iter()
-                            .all(|vis| self.r.is_accessible_from(*vis, self.parent_scope.module))
-                    {
+                    if !ctor.has_private_fields(self.parent_scope.module, self.r) {
                         err.span_suggestion_verbose(
                             span,
                             "the type can be constructed directly, because its fields are \
@@ -2430,17 +2460,17 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                     }
                     self.update_err_for_private_tuple_struct_fields(err, &source, def_id);
                 }
-                if !is_expected(ctor_def) || is_accessible {
+                if !is_expected(ctor.res) || is_accessible {
                     return true;
                 }
 
                 let field_spans =
                     self.update_err_for_private_tuple_struct_fields(err, &source, def_id);
 
-                if let Some(spans) =
-                    field_spans.filter(|spans| spans.len() > 0 && fields.len() == spans.len())
+                if let Some(spans) = field_spans
+                    .filter(|spans| spans.len() > 0 && ctor.field_visibilities.len() == spans.len())
                 {
-                    let non_visible_spans: Vec<Span> = iter::zip(&fields, &spans)
+                    let non_visible_spans: Vec<Span> = iter::zip(&ctor.field_visibilities, &spans)
                         .filter(|(vis, _)| {
                             !self.r.is_accessible_from(**vis, self.parent_scope.module)
                         })
@@ -2597,7 +2627,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
     }
 
     fn suggest_alternative_construction_methods(
-        &mut self,
+        &self,
         def_id: DefId,
         err: &mut Diag<'_>,
         path_span: Span,
@@ -2693,7 +2723,11 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
             .extern_crate_map
             .items()
             // FIXME: This doesn't include impls like `impl Default for String`.
-            .flat_map(|(_, crate_)| self.r.tcx.implementations_of_trait((*crate_, default_trait)))
+            .flat_map(|(_, crate_)| {
+                UnordItems::new(
+                    self.r.tcx.implementations_of_trait((*crate_, default_trait)).into_iter(),
+                )
+            })
             .filter_map(|(_, simplified_self_ty)| *simplified_self_ty)
             .filter_map(|simplified_self_ty| match simplified_self_ty {
                 SimplifiedType::Adt(did) => Some(did),
@@ -2715,24 +2749,6 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
         }
     }
 
-    fn has_private_fields(&self, def_id: DefId) -> bool {
-        let fields = match def_id.as_local() {
-            Some(def_id) => self.r.struct_constructors.get(&def_id).cloned().map(|(_, _, f)| f),
-            None => Some(
-                self.r
-                    .tcx
-                    .associated_item_def_ids(def_id)
-                    .iter()
-                    .map(|&field_id| self.r.tcx.visibility(field_id))
-                    .collect(),
-            ),
-        };
-
-        fields.is_some_and(|fields| {
-            fields.iter().any(|vis| !self.r.is_accessible_from(*vis, self.parent_scope.module))
-        })
-    }
-
     /// Given the target `ident` and `kind`, search for the similarly named associated item
     /// in `self.current_trait_ref`.
     pub(crate) fn find_similarly_named_assoc_item(
@@ -2749,7 +2765,6 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
         let targets = self
             .r
             .resolutions(*module)
-            .borrow()
             .iter()
             .filter_map(|(key, res)| res.borrow().best_decl().map(|binding| (key, binding.res())))
             .filter(|(_, res)| match (kind, res) {
@@ -2766,7 +2781,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
     }
 
     fn lookup_assoc_candidate<FilterFn>(
-        &mut self,
+        &self,
         ident: Ident,
         ns: Namespace,
         filter_fn: FilterFn,
@@ -2787,8 +2802,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
         }
         // Fields are generally expected in the same contexts as locals.
         if filter_fn(Res::Local(ast::DUMMY_NODE_ID)) {
-            if let Some(node_id) =
-                self.diag_metadata.current_self_type.as_ref().and_then(extract_node_id)
+            if let Some(node_id) = self.diag_metadata.current_self_type.and_then(extract_node_id)
                 && let Some(resolution) = self.r.partial_res_map.get(&node_id)
                 && let Some(Res::Def(DefKind::Struct | DefKind::Union, did)) = resolution.full_res()
                 && let Some(fields) = self.r.field_idents(did)
@@ -2806,7 +2820,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                 {
                     return Some(match &assoc_item.kind {
                         ast::AssocItemKind::Const(..) => AssocSuggestion::AssocConst,
-                        ast::AssocItemKind::Fn(box ast::Fn { sig, .. }) if sig.decl.has_self() => {
+                        ast::AssocItemKind::Fn(ast::Fn { sig, .. }) if sig.decl.has_self() => {
                             AssocSuggestion::MethodWithSelf { called }
                         }
                         ast::AssocItemKind::Fn(..) => AssocSuggestion::AssocFn { called },
@@ -2814,8 +2828,9 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                         ast::AssocItemKind::Delegation(..)
                             if self
                                 .r
-                                .delegation_fn_sigs
-                                .get(&self.r.local_def_id(assoc_item.id))
+                                .owners
+                                .get(&assoc_item.id)
+                                .and_then(|o| self.r.delegation_fn_sigs.get(&o.def_id))
                                 .is_some_and(|sig| sig.has_self) =>
                         {
                             AssocSuggestion::MethodWithSelf { called }
@@ -2903,10 +2918,16 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                 }
 
                 if let RibKind::Block(Some(module)) = rib.kind {
-                    self.r.add_module_candidates(module, &mut names, &filter_fn, Some(ctxt));
+                    self.r.add_module_candidates(
+                        module.to_module(),
+                        &mut names,
+                        &filter_fn,
+                        Some(ctxt),
+                    );
                 } else if let RibKind::Module(module) = rib.kind {
                     // Encountered a module item, abandon ribs and look into that module and preludes.
-                    let parent_scope = &ParentScope { module, ..self.parent_scope };
+                    let parent_scope =
+                        &ParentScope { module: module.to_module(), ..self.parent_scope };
                     self.r.add_scope_set_candidates(
                         &mut names,
                         ScopeSet::All(ns),
@@ -2946,7 +2967,6 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                     let module = self.r.expect_module(def_id);
                     self.r
                         .resolutions(module)
-                        .borrow()
                         .iter()
                         .any(|(key, _)| key.ident.name == following_seg.ident.name)
                 }
@@ -3047,12 +3067,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
     fn find_module(&self, def_id: DefId) -> Option<(Module<'ra>, ImportSuggestion)> {
         let mut result = None;
         let mut seen_modules = FxHashSet::default();
-        let root_did = self.r.graph_root.def_id();
-        let mut worklist = vec![(
-            self.r.graph_root,
-            ThinVec::new(),
-            root_did.is_local() || !self.r.tcx.is_doc_hidden(root_did),
-        )];
+        let mut worklist = vec![(self.r.graph_root.to_module(), ThinVec::new(), true)];
 
         while let Some((in_module, path_segments, doc_visible)) = worklist.pop() {
             // abort if the module is already found
@@ -3072,8 +3087,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                     let doc_visible = doc_visible
                         && (module_def_id.is_local() || !r.tcx.is_doc_hidden(module_def_id));
                     if module_def_id == def_id {
-                        let path =
-                            Path { span: name_binding.span, segments: path_segments, tokens: None };
+                        let path = Path { span: name_binding.span, segments: path_segments };
                         result = Some((
                             r.expect_module(module_def_id),
                             ImportSuggestion {
@@ -3108,7 +3122,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                 if let Res::Def(DefKind::Ctor(CtorOf::Variant, kind), def_id) = name_binding.res() {
                     let mut segms = enum_import_suggestion.path.segments.clone();
                     segms.push(ast::PathSegment::from_ident(ident.orig(orig_ident_span)));
-                    let path = Path { span: name_binding.span, segments: segms, tokens: None };
+                    let path = Path { span: name_binding.span, segments: segms };
                     variants.push((path, def_id, kind));
                 }
             });
@@ -3141,7 +3155,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                 ExprKind::Call(..) => (None, true),
                 // `Type.Foo(a, b)`, suggest replacing `.` -> `::` if variant `Foo` exists and is a tuple variant,
                 // otherwise suggest adding a variant after `Type`.
-                ExprKind::MethodCall(box MethodCall {
+                ExprKind::MethodCall(MethodCall {
                     receiver,
                     span,
                     seg: PathSegment { ident, .. },
@@ -3474,7 +3488,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                 format!("corresponding const parameter on the type defined here",),
             );
 
-            err.subdiagnostic(errors::UnexpectedMissingConstParameter {
+            err.subdiagnostic(diagnostics::UnexpectedMissingConstParameter {
                 span: insert_span,
                 snippet,
                 item_name: format!("{}", target_ident),
@@ -3508,7 +3522,11 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
         if !self.diag_metadata.currently_processing_generic_args && !single_uppercase_char {
             return (None, None);
         }
-        match (self.diag_metadata.current_item, single_uppercase_char, self.diag_metadata.currently_processing_generic_args) {
+        match (
+            self.diag_metadata.current_item,
+            single_uppercase_char,
+            self.diag_metadata.currently_processing_generic_args,
+        ) {
             (Some(Item { kind: ItemKind::Fn(fn_), .. }), _, _) if fn_.ident.name == sym::main => {
                 // Ignore `fn main()` as we don't want to suggest `fn main<T>()`
             }
@@ -3521,7 +3539,8 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                         | kind @ ItemKind::Union(..),
                     ..
                 }),
-                true, _
+                true,
+                _,
             )
             // Without the 2nd `true`, we'd suggest `impl <T>` for `impl T` when a type `T` isn't found
             | (Some(Item { kind: kind @ ItemKind::Impl(..), .. }), true, true)
@@ -3541,7 +3560,9 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
 
                     let (msg, sugg) = match source {
                         PathSource::Type | PathSource::PreciseCapturingArg(TypeNS) => {
-                            if let Some(err) = self.detect_and_suggest_const_parameter_error(path, source) {
+                            if let Some(err) =
+                                self.detect_and_suggest_const_parameter_error(path, source)
+                            {
                                 return (None, Some(err));
                             }
                             ("you might be missing a type parameter", ident)
@@ -3556,8 +3577,10 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                         let span = if let [.., bound] = &param.bounds[..] {
                             bound.span()
                         } else if let GenericParam {
-                            kind: GenericParamKind::Const { ty, span: _, default  }, ..
-                        } = param {
+                            kind: GenericParamKind::Const { ty, span: _, default },
+                            ..
+                        } = param
+                        {
                             default.as_ref().map(|def| def.value.span).unwrap_or(ty.span)
                         } else {
                             param.ident.span
@@ -3568,12 +3591,10 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                     };
                     // Do not suggest if this is coming from macro expansion.
                     if span.can_be_used_for_suggestions() {
-                        return (Some((
-                            span.shrink_to_hi(),
-                            msg,
-                            sugg,
-                            Applicability::MaybeIncorrect,
-                        )), None);
+                        return (
+                            Some((span.shrink_to_hi(), msg, sugg, Applicability::MaybeIncorrect)),
+                            None,
+                        );
                     }
                 }
             }
@@ -3657,6 +3678,9 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
             };
             match use_set {
                 Some(LifetimeUseSet::Many) => {}
+                // A lifetime bound is a real use of that lifetime parameter, even
+                // though visiting a bound like `'b: 'a` only records a use of `'a`.
+                Some(LifetimeUseSet::One { .. }) if !param.bounds.is_empty() => {}
                 Some(LifetimeUseSet::One { use_span, use_ctxt }) => {
                     let param_ident = param.ident;
                     let deletion_span =
@@ -3689,7 +3713,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                                 } else {
                                     Some(deletion_span)
                                 };
-                                Some(errors::SingleUseLifetimeSugg {
+                                Some(diagnostics::SingleUseLifetimeSugg {
                                     deletion_span,
                                     use_span,
                                     replace_lt,
@@ -3697,7 +3721,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                             } else {
                                 None
                             };
-                            errors::SingleUseLifetime {
+                            diagnostics::SingleUseLifetime {
                                 suggestion,
                                 param_span: param_ident.span,
                                 use_span,
@@ -3717,7 +3741,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                             lint::builtin::UNUSED_LIFETIMES,
                             param.id,
                             param.ident.span,
-                            errors::UnusedLifetime { deletion_span, ident: param.ident },
+                            diagnostics::UnusedLifetime { deletion_span, ident: param.ident },
                         );
                     }
                 }
@@ -3790,6 +3814,50 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
             Vec<(Span, String)>,
         ) -> bool,
     ) {
+        self.suggest_introducing_lifetime_filtered(err, name, |_| true, suggest);
+    }
+
+    pub(crate) fn suggest_introducing_lifetime_for_assoc_ty_binding(
+        &self,
+        err: &mut Diag<'_>,
+        lifetime: Span,
+    ) {
+        self.suggest_introducing_lifetime_filtered(
+            err,
+            None,
+            |kind| {
+                !matches!(
+                    kind,
+                    LifetimeBinderKind::FnPtrType
+                        | LifetimeBinderKind::PolyTrait
+                        | LifetimeBinderKind::WhereBound
+                )
+            },
+            |err, _higher_ranked, span, message, intro_sugg, _| {
+                err.multipart_suggestion(
+                    message,
+                    vec![(span, intro_sugg), (lifetime.shrink_to_hi(), "'a ".to_string())],
+                    Applicability::MaybeIncorrect,
+                );
+                false
+            },
+        );
+    }
+
+    fn suggest_introducing_lifetime_filtered(
+        &self,
+        err: &mut Diag<'_>,
+        name: Option<Ident>,
+        mut consider: impl FnMut(LifetimeBinderKind) -> bool,
+        suggest: impl Fn(
+            &mut Diag<'_>,
+            bool,
+            Span,
+            Cow<'static, str>,
+            String,
+            Vec<(Span, String)>,
+        ) -> bool,
+    ) {
         let mut suggest_note = true;
         for rib in self.lifetime_ribs.iter().rev() {
             let mut should_continue = true;
@@ -3802,7 +3870,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                     {
                         continue;
                     }
-                    if let LifetimeBinderKind::ImplAssocType = kind {
+                    if matches!(kind, LifetimeBinderKind::ImplAssocType) || !consider(kind) {
                         continue;
                     }
 
@@ -3934,7 +4002,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
     ) -> ErrorGuaranteed {
         self.r
             .dcx()
-            .create_err(errors::ParamInTyOfConstParam {
+            .create_err(diagnostics::ParamInTyOfConstParam {
                 span: lifetime_ref.ident.span,
                 name: lifetime_ref.ident.name,
             })
@@ -3953,23 +4021,26 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
             NoConstantGenericsReason::IsEnumDiscriminant => self
                 .r
                 .dcx()
-                .create_err(errors::ParamInEnumDiscriminant {
+                .create_err(diagnostics::ParamInEnumDiscriminant {
                     span: lifetime_ref.ident.span,
                     name: lifetime_ref.ident.name,
-                    param_kind: errors::ParamKindInEnumDiscriminant::Lifetime,
+                    param_kind: diagnostics::ParamKindInEnumDiscriminant::Lifetime,
                 })
                 .emit(),
             NoConstantGenericsReason::NonTrivialConstArg => {
-                assert!(!self.r.tcx.features().generic_const_exprs());
+                assert!(!self.r.features.generic_const_exprs());
                 self.r
                     .dcx()
-                    .create_err(errors::ParamInNonTrivialAnonConst {
+                    .create_err(diagnostics::ParamInNonTrivialAnonConst {
                         span: lifetime_ref.ident.span,
                         name: lifetime_ref.ident.name,
-                        param_kind: errors::ParamKindInNonTrivialAnonConst::Lifetime,
-                        help: self.r.tcx.sess.is_nightly_build(),
-                        is_gca: self.r.tcx.features().generic_const_args(),
-                        help_gca: self.r.tcx.features().generic_const_args(),
+                        param_kind: diagnostics::ParamKindInNonTrivialAnonConst::Lifetime,
+                        help: self.r.tcx.sess.is_nightly_build()
+                            && !self.r.features.min_generic_const_args(),
+                        is_gca: self.r.features.generic_const_args(),
+                        help_gca: self.r.features.generic_const_args(),
+                        help_suggest_gca: self.r.tcx.sess.is_nightly_build()
+                            && !self.r.features.generic_const_args(),
                     })
                     .emit()
             }
@@ -4300,7 +4371,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                             "instead, you are more likely to want"
                         };
                         let mut owned_sugg = lt.kind == MissingLifetimeKind::Ampersand;
-                        let mut sugg_is_str_to_string = false;
+                        let mut sugg_slice_to_vec_or_string = false;
                         let mut sugg = vec![(lt.span, String::new())];
                         if let Some((kind, _span)) = self.diag_metadata.current_function
                             && let FnKind::Fn(_, _, ast::Fn { sig, .. }) = kind
@@ -4345,7 +4416,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                                                         lt.span.with_hi(ty.span.hi()),
                                                         "String".to_string(),
                                                     )];
-                                                    sugg_is_str_to_string = true;
+                                                    sugg_slice_to_vec_or_string = true;
                                                 }
                                                 Some(Res::PrimTy(..)) => {}
                                                 Some(Res::Def(
@@ -4372,7 +4443,7 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                                                         lt.span.with_hi(ty.span.hi()),
                                                         "String".to_string(),
                                                     )];
-                                                    sugg_is_str_to_string = true;
+                                                    sugg_slice_to_vec_or_string = true;
                                                 }
                                                 Res::PrimTy(..) => {}
                                                 Res::Def(
@@ -4403,13 +4474,15 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
                                         (lt.span.with_hi(inner_ty.span.lo()), "Vec<".to_string()),
                                         (ty.span.with_lo(inner_ty.span.hi()), ">".to_string()),
                                     ];
+                                    sugg_slice_to_vec_or_string = true;
                                 }
                             }
                         }
                         if owned_sugg {
+                            // Suggest to remove the ref prefix (usually an &) from the return type.
                             if let Some(span) =
                                 self.find_ref_prefix_span_for_owned_suggestion(lt.span)
-                                && !sugg_is_str_to_string
+                                && !sugg_slice_to_vec_or_string
                             {
                                 sugg = vec![(span, String::new())];
                             }
@@ -4479,7 +4552,6 @@ fn mk_where_bound_predicate(
                     kind: ast::TyKind::Path(None, poly_trait_ref.trait_ref.path.clone()),
                     id: DUMMY_NODE_ID,
                     span: DUMMY_SP,
-                    tokens: None,
                 })),
             },
             span: DUMMY_SP,
@@ -4506,11 +4578,11 @@ fn mk_where_bound_predicate(
     let new_where_bound_predicate = ast::WhereBoundPredicate {
         bound_generic_params: ThinVec::new(),
         bounded_ty: Box::new(ty.clone()),
-        bounds: vec![ast::GenericBound::Trait(ast::PolyTraitRef {
+        bounds: thin_vec![ast::GenericBound::Trait(ast::PolyTraitRef {
             bound_generic_params: ThinVec::new(),
             modifiers: ast::TraitBoundModifiers::NONE,
             trait_ref: ast::TraitRef {
-                path: ast::Path { segments: modified_segments, span: DUMMY_SP, tokens: None },
+                path: ast::Path { segments: modified_segments, span: DUMMY_SP },
                 ref_id: DUMMY_NODE_ID,
             },
             span: DUMMY_SP,

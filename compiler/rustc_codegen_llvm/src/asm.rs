@@ -1,10 +1,12 @@
 use std::assert_matches;
+use std::fmt::Write;
 
-use rustc_abi::{BackendRepr, Float, Integer, Primitive, Scalar};
+use rustc_abi::{BackendRepr, Float, Integer, Primitive, Scalar, Size};
 use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_codegen_ssa::mir::operand::OperandValue;
 use rustc_codegen_ssa::traits::*;
 use rustc_data_structures::fx::FxHashMap;
+use rustc_middle::mir::interpret::{PointerArithmetic, Scalar as ConstScalar};
 use rustc_middle::ty::Instance;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::{bug, span_bug};
@@ -43,7 +45,7 @@ impl<'ll, 'tcx> AsmBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
             match *op {
                 InlineAsmOperandRef::Out { reg, late, place } => {
                     let is_target_supported = |reg_class: InlineAsmRegClass| {
-                        for &(_, feature) in reg_class.supported_types(asm_arch, true) {
+                        for &(_, feature) in reg_class.supported_types(asm_arch, true).as_ref() {
                             if let Some(feature) = feature {
                                 if self
                                     .tcx
@@ -157,12 +159,18 @@ impl<'ll, 'tcx> AsmBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                         constraints.push(format!("{}", op_idx[&idx]));
                     }
                 }
-                InlineAsmOperandRef::SymFn { instance } => {
-                    inputs.push(self.cx.get_fn(instance));
-                    op_idx.insert(idx, constraints.len());
-                    constraints.push("s".to_string());
-                }
-                InlineAsmOperandRef::SymStatic { def_id } => {
+                InlineAsmOperandRef::Const { value, ty: _ } => match value {
+                    ConstScalar::Int(_) => (),
+                    ConstScalar::Ptr(ptr, _) => {
+                        let (prov, _) = ptr.prov_and_relative_offset();
+                        let global_alloc = self.tcx.global_alloc(prov.alloc_id());
+                        let value = self.cx.alloc_to_backend(global_alloc, false, None).unwrap();
+                        inputs.push(value);
+                        op_idx.insert(idx, constraints.len());
+                        constraints.push("s".to_string());
+                    }
+                },
+                InlineAsmOperandRef::SymThreadLocalStatic { def_id } => {
                     inputs.push(self.cx.get_static(def_id));
                     op_idx.insert(idx, constraints.len());
                     constraints.push("s".to_string());
@@ -189,7 +197,7 @@ impl<'ll, 'tcx> AsmBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                         template_str.push_str(s)
                     }
                 }
-                InlineAsmTemplatePiece::Placeholder { operand_idx, modifier, span: _ } => {
+                InlineAsmTemplatePiece::Placeholder { operand_idx, modifier, span } => {
                     match operands[operand_idx] {
                         InlineAsmOperandRef::In { reg, .. }
                         | InlineAsmOperandRef::Out { reg, .. }
@@ -204,12 +212,34 @@ impl<'ll, 'tcx> AsmBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                                 template_str.push_str(&format!("${{{}}}", op_idx[&operand_idx]));
                             }
                         }
-                        InlineAsmOperandRef::Const { ref string } => {
-                            // Const operands get injected directly into the template
-                            template_str.push_str(string);
+                        InlineAsmOperandRef::Const { value, ty } => {
+                            match value {
+                                ConstScalar::Int(int) => {
+                                    // Const operands get injected directly into the template
+                                    let string = rustc_codegen_ssa::common::asm_const_to_str(
+                                        self.tcx,
+                                        span,
+                                        int,
+                                        self.layout_of(ty),
+                                    );
+                                    template_str.push_str(&string);
+                                }
+                                ConstScalar::Ptr(ptr, _) => {
+                                    let (_, offset) = ptr.prov_and_relative_offset();
+
+                                    // Only emit the raw symbol name
+                                    template_str
+                                        .push_str(&format!("${{{}:c}}", op_idx[&operand_idx]));
+
+                                    if offset != Size::ZERO {
+                                        let offset =
+                                            self.sign_extend_to_target_isize(offset.bytes());
+                                        write!(template_str, "{offset:+}").unwrap();
+                                    }
+                                }
+                            }
                         }
-                        InlineAsmOperandRef::SymFn { .. }
-                        | InlineAsmOperandRef::SymStatic { .. } => {
+                        InlineAsmOperandRef::SymThreadLocalStatic { .. } => {
                             // Only emit the raw symbol name
                             template_str.push_str(&format!("${{{}:c}}", op_idx[&operand_idx]));
                         }
@@ -229,6 +259,7 @@ impl<'ll, 'tcx> AsmBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                 InlineAsmArch::AArch64 | InlineAsmArch::Arm64EC | InlineAsmArch::Arm => {
                     constraints.push("~{cc}".to_string());
                 }
+                InlineAsmArch::Amdgpu => {}
                 InlineAsmArch::X86 | InlineAsmArch::X86_64 => {
                     constraints.extend_from_slice(&[
                         "~{dirflag}".to_string(),
@@ -278,6 +309,7 @@ impl<'ll, 'tcx> AsmBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                 }
                 InlineAsmArch::SpirV => {}
                 InlineAsmArch::Wasm32 | InlineAsmArch::Wasm64 => {}
+                InlineAsmArch::Xtensa => {}
                 InlineAsmArch::Bpf => {}
                 InlineAsmArch::Msp430 => {
                     constraints.push("~{sr}".to_string());
@@ -403,22 +435,44 @@ impl<'tcx> AsmCodegenMethods<'tcx> for CodegenCx<'_, 'tcx> {
                 InlineAsmTemplatePiece::Placeholder { operand_idx, modifier: _, span } => {
                     use rustc_codegen_ssa::back::symbol_export::escape_symbol_name;
                     match operands[operand_idx] {
-                        GlobalAsmOperandRef::Const { ref string } => {
-                            // Const operands get injected directly into the
-                            // template. Note that we don't need to escape $
-                            // here unlike normal inline assembly.
-                            template_str.push_str(string);
+                        GlobalAsmOperandRef::Const { value, ty } => {
+                            match value {
+                                ConstScalar::Int(int) => {
+                                    // Const operands get injected directly into the
+                                    // template. Note that we don't need to escape $
+                                    // here unlike normal inline assembly.
+                                    let string = rustc_codegen_ssa::common::asm_const_to_str(
+                                        self.tcx,
+                                        span,
+                                        int,
+                                        self.layout_of(ty),
+                                    );
+                                    template_str.push_str(&string);
+                                }
+
+                                ConstScalar::Ptr(ptr, _) => {
+                                    let (prov, offset) = ptr.prov_and_relative_offset();
+                                    let global_alloc = self.tcx.global_alloc(prov.alloc_id());
+                                    let llval =
+                                        self.alloc_to_backend(global_alloc, true, None).unwrap();
+
+                                    self.add_compiler_used_global(llval);
+                                    let symbol = llvm::build_string(|s| unsafe {
+                                        llvm::LLVMRustGetMangledName(llval, s);
+                                    })
+                                    .expect("symbol is not valid UTF-8");
+                                    template_str
+                                        .push_str(&escape_symbol_name(self.tcx, &symbol, span));
+
+                                    if offset != Size::ZERO {
+                                        let offset =
+                                            self.sign_extend_to_target_isize(offset.bytes());
+                                        write!(template_str, "{offset:+}").unwrap();
+                                    }
+                                }
+                            }
                         }
-                        GlobalAsmOperandRef::SymFn { instance } => {
-                            let llval = self.get_fn(instance);
-                            self.add_compiler_used_global(llval);
-                            let symbol = llvm::build_string(|s| unsafe {
-                                llvm::LLVMRustGetMangledName(llval, s);
-                            })
-                            .expect("symbol is not valid UTF-8");
-                            template_str.push_str(&escape_symbol_name(self.tcx, &symbol, span));
-                        }
-                        GlobalAsmOperandRef::SymStatic { def_id } => {
+                        GlobalAsmOperandRef::SymThreadLocalStatic { def_id } => {
                             let llval = self
                                 .renamed_statics
                                 .borrow()
@@ -698,6 +752,8 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'_>>) ->
             | Arm(ArmInlineAsmRegClass::dreg_low8)
             | Arm(ArmInlineAsmRegClass::qreg_low4) => "x",
             Arm(ArmInlineAsmRegClass::dreg) | Arm(ArmInlineAsmRegClass::qreg) => "w",
+            Amdgpu(AmdgpuInlineAsmRegClass::Sgpr(_)) => "s",
+            Amdgpu(AmdgpuInlineAsmRegClass::Vgpr(_)) => "v",
             Hexagon(HexagonInlineAsmRegClass::reg) => "r",
             Hexagon(HexagonInlineAsmRegClass::reg_pair) => "r",
             Hexagon(HexagonInlineAsmRegClass::preg) => unreachable!("clobber-only"),
@@ -705,7 +761,9 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'_>>) ->
             Hexagon(HexagonInlineAsmRegClass::vreg_pair) => "v",
             Hexagon(HexagonInlineAsmRegClass::qreg) => unreachable!("clobber-only"),
             LoongArch(LoongArchInlineAsmRegClass::reg) => "r",
-            LoongArch(LoongArchInlineAsmRegClass::freg) => "f",
+            LoongArch(LoongArchInlineAsmRegClass::freg)
+            | LoongArch(LoongArchInlineAsmRegClass::vreg)
+            | LoongArch(LoongArchInlineAsmRegClass::xreg) => "f",
             Mips(MipsInlineAsmRegClass::reg) => "r",
             Mips(MipsInlineAsmRegClass::freg) => "f",
             Nvptx(NvptxInlineAsmRegClass::reg16) => "h",
@@ -740,6 +798,11 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'_>>) ->
                 | X86InlineAsmRegClass::kreg0
                 | X86InlineAsmRegClass::tmm_reg,
             ) => unreachable!("clobber-only"),
+            Xtensa(XtensaInlineAsmRegClass::freg) => "f",
+            Xtensa(XtensaInlineAsmRegClass::reg) => "r",
+            Xtensa(XtensaInlineAsmRegClass::sreg | XtensaInlineAsmRegClass::breg) => {
+                unreachable!("clobber-only")
+            }
             Wasm(WasmInlineAsmRegClass::local) => "r",
             Bpf(BpfInlineAsmRegClass::reg) => "r",
             Bpf(BpfInlineAsmRegClass::wreg) => "w",
@@ -803,8 +866,24 @@ fn modifier_to_llvm(
                 modifier
             }
         }
+        Amdgpu(_) => None,
         Hexagon(_) => None,
-        LoongArch(_) => None,
+        LoongArch(LoongArchInlineAsmRegClass::reg) => None,
+        LoongArch(LoongArchInlineAsmRegClass::freg) => modifier,
+        LoongArch(LoongArchInlineAsmRegClass::vreg) => {
+            if modifier.is_none() {
+                Some('w')
+            } else {
+                modifier
+            }
+        }
+        LoongArch(LoongArchInlineAsmRegClass::xreg) => {
+            if modifier.is_none() {
+                Some('u')
+            } else {
+                modifier
+            }
+        }
         Mips(_) => None,
         Nvptx(_) => None,
         PowerPC(PowerPCInlineAsmRegClass::vsreg) => {
@@ -845,6 +924,7 @@ fn modifier_to_llvm(
             | X86InlineAsmRegClass::kreg0
             | X86InlineAsmRegClass::tmm_reg,
         ) => unreachable!("clobber-only"),
+        Xtensa(_) => None,
         Wasm(WasmInlineAsmRegClass::local) => None,
         Bpf(_) => None,
         Avr(AvrInlineAsmRegClass::reg_pair)
@@ -883,6 +963,7 @@ fn dummy_output_type<'ll>(cx: &CodegenCx<'ll, '_>, reg: InlineAsmRegClass) -> &'
         Arm(ArmInlineAsmRegClass::qreg)
         | Arm(ArmInlineAsmRegClass::qreg_low8)
         | Arm(ArmInlineAsmRegClass::qreg_low4) => cx.type_vector(cx.type_i64(), 2),
+        Amdgpu(_) => cx.type_i32(),
         Hexagon(HexagonInlineAsmRegClass::reg) => cx.type_i32(),
         Hexagon(HexagonInlineAsmRegClass::reg_pair) => cx.type_i64(),
         Hexagon(HexagonInlineAsmRegClass::preg) => unreachable!("clobber-only"),
@@ -905,6 +986,8 @@ fn dummy_output_type<'ll>(cx: &CodegenCx<'ll, '_>, reg: InlineAsmRegClass) -> &'
         Hexagon(HexagonInlineAsmRegClass::qreg) => unreachable!("clobber-only"),
         LoongArch(LoongArchInlineAsmRegClass::reg) => cx.type_i32(),
         LoongArch(LoongArchInlineAsmRegClass::freg) => cx.type_f32(),
+        LoongArch(LoongArchInlineAsmRegClass::vreg) => cx.type_vector(cx.type_i32(), 4),
+        LoongArch(LoongArchInlineAsmRegClass::xreg) => cx.type_vector(cx.type_i32(), 8),
         Mips(MipsInlineAsmRegClass::reg) => cx.type_i32(),
         Mips(MipsInlineAsmRegClass::freg) => cx.type_f32(),
         Nvptx(NvptxInlineAsmRegClass::reg16) => cx.type_i16(),
@@ -939,6 +1022,11 @@ fn dummy_output_type<'ll>(cx: &CodegenCx<'ll, '_>, reg: InlineAsmRegClass) -> &'
             | X86InlineAsmRegClass::kreg0
             | X86InlineAsmRegClass::tmm_reg,
         ) => unreachable!("clobber-only"),
+        Xtensa(XtensaInlineAsmRegClass::reg) => cx.type_i32(),
+        Xtensa(XtensaInlineAsmRegClass::freg) => cx.type_f32(),
+        Xtensa(XtensaInlineAsmRegClass::sreg | XtensaInlineAsmRegClass::breg) => {
+            unreachable!("clobber-only")
+        }
         Wasm(WasmInlineAsmRegClass::local) => cx.type_i32(),
         Bpf(BpfInlineAsmRegClass::reg) => cx.type_i64(),
         Bpf(BpfInlineAsmRegClass::wreg) => cx.type_i32(),
@@ -1031,8 +1119,9 @@ fn llvm_fixup_input<'ll, 'tcx>(
             BackendRepr::SimdVector { element, count },
         ) if layout.size.bytes() == 8 => {
             let elem_ty = llvm_asm_scalar_type(bx.cx, element);
-            let vec_ty = bx.cx.type_vector(elem_ty, count);
-            let indices: Vec<_> = (0..count * 2).map(|x| bx.const_i32(x as i32)).collect();
+            let count = count.as_u32();
+            let vec_ty = bx.cx.type_vector(elem_ty, u64::from(count));
+            let indices: Vec<_> = (0..count * 2).map(|x| bx.const_u32(x)).collect();
             bx.shuffle_vector(value, bx.const_undef(vec_ty), bx.const_vector(&indices))
         }
         (X86(X86InlineAsmRegClass::reg_abcd), BackendRepr::Scalar(s))
@@ -1077,8 +1166,11 @@ fn llvm_fixup_input<'ll, 'tcx>(
                 | X86InlineAsmRegClass::ymm_reg
                 | X86InlineAsmRegClass::zmm_reg,
             ),
-            BackendRepr::SimdVector { element, count: count @ (8 | 16) },
-        ) if element.primitive() == Primitive::Float(Float::F16) => {
+            BackendRepr::SimdVector { element, count },
+        ) if let count = count.as_u64()
+            && let 8 | 16 = count
+            && element.primitive() == Primitive::Float(Float::F16) =>
+        {
             bx.bitcast(value, bx.type_vector(bx.type_i16(), count))
         }
         (
@@ -1114,8 +1206,11 @@ fn llvm_fixup_input<'ll, 'tcx>(
                 | ArmInlineAsmRegClass::qreg_low4
                 | ArmInlineAsmRegClass::qreg_low8,
             ),
-            BackendRepr::SimdVector { element, count: count @ (4 | 8) },
-        ) if element.primitive() == Primitive::Float(Float::F16) => {
+            BackendRepr::SimdVector { element, count },
+        ) if let count = count.as_u64()
+            && let 4 | 8 = count
+            && element.primitive() == Primitive::Float(Float::F16) =>
+        {
             bx.bitcast(value, bx.type_vector(bx.type_i16(), count))
         }
         (LoongArch(LoongArchInlineAsmRegClass::freg), BackendRepr::Scalar(s))
@@ -1203,6 +1298,7 @@ fn llvm_fixup_output<'ll, 'tcx>(
             BackendRepr::SimdVector { element, count },
         ) if layout.size.bytes() == 8 => {
             let elem_ty = llvm_asm_scalar_type(bx.cx, element);
+            let count = count.as_u64();
             let vec_ty = bx.cx.type_vector(elem_ty, count * 2);
             let indices: Vec<_> = (0..count).map(|x| bx.const_i32(x as i32)).collect();
             bx.shuffle_vector(value, bx.const_undef(vec_ty), bx.const_vector(&indices))
@@ -1245,8 +1341,11 @@ fn llvm_fixup_output<'ll, 'tcx>(
                 | X86InlineAsmRegClass::ymm_reg
                 | X86InlineAsmRegClass::zmm_reg,
             ),
-            BackendRepr::SimdVector { element, count: count @ (8 | 16) },
-        ) if element.primitive() == Primitive::Float(Float::F16) => {
+            BackendRepr::SimdVector { element, count },
+        ) if let count = count.as_u64()
+            && let 8 | 16 = count
+            && element.primitive() == Primitive::Float(Float::F16) =>
+        {
             bx.bitcast(value, bx.type_vector(bx.type_f16(), count))
         }
         (
@@ -1282,8 +1381,11 @@ fn llvm_fixup_output<'ll, 'tcx>(
                 | ArmInlineAsmRegClass::qreg_low4
                 | ArmInlineAsmRegClass::qreg_low8,
             ),
-            BackendRepr::SimdVector { element, count: count @ (4 | 8) },
-        ) if element.primitive() == Primitive::Float(Float::F16) => {
+            BackendRepr::SimdVector { element, count },
+        ) if let count = count.as_u64()
+            && let 4 | 8 = count
+            && element.primitive() == Primitive::Float(Float::F16) =>
+        {
             bx.bitcast(value, bx.type_vector(bx.type_f16(), count))
         }
         (LoongArch(LoongArchInlineAsmRegClass::freg), BackendRepr::Scalar(s))
@@ -1357,7 +1459,7 @@ fn llvm_fixup_output_type<'ll, 'tcx>(
             BackendRepr::SimdVector { element, count },
         ) if layout.size.bytes() == 8 => {
             let elem_ty = llvm_asm_scalar_type(cx, element);
-            cx.type_vector(elem_ty, count * 2)
+            cx.type_vector(elem_ty, count.as_u64() * 2)
         }
         (X86(X86InlineAsmRegClass::reg_abcd), BackendRepr::Scalar(s))
             if s.primitive() == Primitive::Float(Float::F64) =>
@@ -1394,8 +1496,11 @@ fn llvm_fixup_output_type<'ll, 'tcx>(
                 | X86InlineAsmRegClass::ymm_reg
                 | X86InlineAsmRegClass::zmm_reg,
             ),
-            BackendRepr::SimdVector { element, count: count @ (8 | 16) },
-        ) if element.primitive() == Primitive::Float(Float::F16) => {
+            BackendRepr::SimdVector { element, count },
+        ) if let count = count.as_u64()
+            && let 8 | 16 = count
+            && element.primitive() == Primitive::Float(Float::F16) =>
+        {
             cx.type_vector(cx.type_i16(), count)
         }
         (
@@ -1431,8 +1536,11 @@ fn llvm_fixup_output_type<'ll, 'tcx>(
                 | ArmInlineAsmRegClass::qreg_low4
                 | ArmInlineAsmRegClass::qreg_low8,
             ),
-            BackendRepr::SimdVector { element, count: count @ (4 | 8) },
-        ) if element.primitive() == Primitive::Float(Float::F16) => {
+            BackendRepr::SimdVector { element, count },
+        ) if let count = count.as_u64()
+            && let 4 | 8 = count
+            && element.primitive() == Primitive::Float(Float::F16) =>
+        {
             cx.type_vector(cx.type_i16(), count)
         }
         (LoongArch(LoongArchInlineAsmRegClass::freg), BackendRepr::Scalar(s))

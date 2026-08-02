@@ -5,24 +5,23 @@
 
 use std::path::PathBuf;
 
-use build_helper::exit;
 use build_helper::git::get_git_untracked_files;
 use clap_complete::{Generator, shells};
 
 use crate::core::build_steps::dist::distdir;
 use crate::core::build_steps::test;
 use crate::core::build_steps::tool::{self, RustcPrivateCompilers, SourceType, Tool};
-use crate::core::build_steps::vendor::{Vendor, default_paths_to_vendor};
-use crate::core::builder::{Builder, Kind, RunConfig, ShouldRun, Step, StepMetadata};
+use crate::core::build_steps::vendor::{VENDOR_DIR, Vendor, default_paths_to_vendor};
+use crate::core::builder::{Builder, CommandLineStep, Kind, RunConfig, ShouldRun, StepMetadata};
 use crate::core::config::TargetSelection;
 use crate::core::config::flags::{get_completion, top_level_help};
 use crate::utils::exec::command;
-use crate::{Mode, t};
+use crate::{Mode, exit, t};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct BuildManifest;
 
-impl Step for BuildManifest {
+impl CommandLineStep for BuildManifest {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -63,7 +62,7 @@ impl Step for BuildManifest {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct BumpStage0;
 
-impl Step for BumpStage0 {
+impl CommandLineStep for BumpStage0 {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -85,7 +84,7 @@ impl Step for BumpStage0 {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ReplaceVersionPlaceholder;
 
-impl Step for ReplaceVersionPlaceholder {
+impl CommandLineStep for ReplaceVersionPlaceholder {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -118,7 +117,7 @@ pub struct Miri {
     target: TargetSelection,
 }
 
-impl Step for Miri {
+impl CommandLineStep for Miri {
     type Output = ();
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -196,7 +195,7 @@ impl Step for Miri {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct CollectLicenseMetadata;
 
-impl Step for CollectLicenseMetadata {
+impl CommandLineStep for CollectLicenseMetadata {
     type Output = PathBuf;
     const IS_HOST: bool = true;
 
@@ -237,7 +236,7 @@ impl Step for CollectLicenseMetadata {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct GenerateCopyright;
 
-impl Step for GenerateCopyright {
+impl CommandLineStep for GenerateCopyright {
     type Output = Vec<PathBuf>;
     const IS_HOST: bool = true;
 
@@ -275,9 +274,10 @@ impl Step for GenerateCopyright {
                 sync_args: Vec::new(),
                 versioned_dirs: true,
                 root_dir: builder.src.clone(),
-                output_dir: cache_dir.clone(),
+                output_dir: Some(cache_dir.clone()),
+                only_library_workspace: false,
             });
-            cache_dir
+            cache_dir.join(VENDOR_DIR)
         };
 
         let _guard = builder.group("generate-copyright");
@@ -303,7 +303,7 @@ impl Step for GenerateCopyright {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct GenerateWindowsSys;
 
-impl Step for GenerateWindowsSys {
+impl CommandLineStep for GenerateWindowsSys {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -339,7 +339,7 @@ pub fn get_completion_paths(builder: &Builder<'_>) -> Vec<(&'static dyn Generato
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GenerateCompletions;
 
-impl Step for GenerateCompletions {
+impl CommandLineStep for GenerateCompletions {
     type Output = ();
 
     /// Uses `clap_complete` to generate shell completions.
@@ -367,7 +367,7 @@ impl Step for GenerateCompletions {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct UnicodeTableGenerator;
 
-impl Step for UnicodeTableGenerator {
+impl CommandLineStep for UnicodeTableGenerator {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -391,7 +391,7 @@ impl Step for UnicodeTableGenerator {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct FeaturesStatusDump;
 
-impl Step for FeaturesStatusDump {
+impl CommandLineStep for FeaturesStatusDump {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -426,7 +426,7 @@ pub struct CyclicStep {
     n: u32,
 }
 
-impl Step for CyclicStep {
+impl CommandLineStep for CyclicStep {
     type Output = ();
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -451,7 +451,7 @@ impl Step for CyclicStep {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct CoverageDump;
 
-impl Step for CoverageDump {
+impl CommandLineStep for CoverageDump {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -477,7 +477,7 @@ impl Step for CoverageDump {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Rustfmt;
 
-impl Step for Rustfmt {
+impl CommandLineStep for Rustfmt {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -509,7 +509,7 @@ impl Step for Rustfmt {
         let compilers = RustcPrivateCompilers::new(builder, stage, host);
         let rustfmt_build = builder.ensure(tool::Rustfmt::from_compilers(compilers));
 
-        let mut rustfmt = tool::prepare_tool_cargo(
+        let mut cargo = tool::prepare_tool_cargo(
             builder,
             rustfmt_build.build_compiler,
             Mode::ToolRustcPrivate,
@@ -520,10 +520,10 @@ impl Step for Rustfmt {
             &[],
         );
 
-        rustfmt.args(["--bin", "rustfmt", "--"]);
-        rustfmt.args(builder.config.args());
+        cargo.args(["--bin", "rustfmt", "--"]);
+        cargo.args(builder.config.args());
 
-        rustfmt.into_cmd().run(builder);
+        cargo.into_cmd().run(builder);
     }
 }
 
@@ -535,7 +535,7 @@ pub fn get_help_path(builder: &Builder<'_>) -> PathBuf {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GenerateHelp;
 
-impl Step for GenerateHelp {
+impl CommandLineStep for GenerateHelp {
     type Output = ();
 
     fn run(self, builder: &Builder<'_>) {

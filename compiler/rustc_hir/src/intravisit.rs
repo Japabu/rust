@@ -66,15 +66,11 @@
 
 use rustc_ast::Label;
 use rustc_ast::visit::{VisitorResult, try_visit, visit_opt, walk_list};
+use rustc_hir_id::HirId;
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{Ident, Span, Symbol};
 
 use crate::hir::*;
-
-pub trait IntoVisitor<'hir> {
-    type Visitor: Visitor<'hir>;
-    fn into_visitor(&self) -> Self::Visitor;
-}
 
 #[derive(Copy, Clone, Debug)]
 pub enum FnKind<'a> {
@@ -119,70 +115,64 @@ pub trait HirTyCtxt<'hir> {
     fn hir_foreign_item(&self, id: ForeignItemId) -> &'hir ForeignItem<'hir>;
 }
 
-// Used when no tcx is actually available, forcing manual implementation of nested visitors.
+/// Used when no tcx is actually available, forcing manual implementation of nested visitors.
 impl<'hir> HirTyCtxt<'hir> for ! {
     fn hir_node(&self, _: HirId) -> Node<'hir> {
-        unreachable!();
+        *self
     }
     fn hir_body(&self, _: BodyId) -> &'hir Body<'hir> {
-        unreachable!();
+        *self
     }
     fn hir_item(&self, _: ItemId) -> &'hir Item<'hir> {
-        unreachable!();
+        *self
     }
     fn hir_trait_item(&self, _: TraitItemId) -> &'hir TraitItem<'hir> {
-        unreachable!();
+        *self
     }
     fn hir_impl_item(&self, _: ImplItemId) -> &'hir ImplItem<'hir> {
-        unreachable!();
+        *self
     }
     fn hir_foreign_item(&self, _: ForeignItemId) -> &'hir ForeignItem<'hir> {
-        unreachable!();
+        *self
     }
 }
 
-pub mod nested_filter {
-    use super::HirTyCtxt;
+/// Specifies what nested things a visitor wants to visit. By "nested
+/// things", we are referring to bits of HIR that are not directly embedded
+/// within one another but rather indirectly, through a table in the crate.
+/// This is done to control dependencies during incremental compilation: the
+/// non-inline bits of HIR can be tracked and hashed separately.
+///
+/// The most common choice is `OnlyBodies`, which will cause the visitor to
+/// visit fn bodies for fns that it encounters, and closure bodies, but
+/// skip over nested item-like things.
+///
+/// See the [module level documentation](self) for more details on the overall
+/// visit strategy.
+pub trait NestedFilter<'hir> {
+    type MaybeTyCtxt: HirTyCtxt<'hir>;
 
-    /// Specifies what nested things a visitor wants to visit. By "nested
-    /// things", we are referring to bits of HIR that are not directly embedded
-    /// within one another but rather indirectly, through a table in the crate.
-    /// This is done to control dependencies during incremental compilation: the
-    /// non-inline bits of HIR can be tracked and hashed separately.
-    ///
-    /// The most common choice is `OnlyBodies`, which will cause the visitor to
-    /// visit fn bodies for fns that it encounters, and closure bodies, but
-    /// skip over nested item-like things.
-    ///
-    /// See the comments at [`rustc_hir::intravisit`] for more details on the overall
-    /// visit strategy.
-    pub trait NestedFilter<'hir> {
-        type MaybeTyCtxt: HirTyCtxt<'hir>;
-
-        /// Whether the visitor visits nested "item-like" things.
-        /// E.g., item, impl-item.
-        const INTER: bool;
-        /// Whether the visitor visits "intra item-like" things.
-        /// E.g., function body, closure, `AnonConst`
-        const INTRA: bool;
-    }
-
-    /// Do not visit any nested things. When you add a new
-    /// "non-nested" thing, you will want to audit such uses to see if
-    /// they remain valid.
-    ///
-    /// Use this if you are only walking some particular kind of tree
-    /// (i.e., a type, or fn signature) and you don't want to thread a
-    /// `tcx` around.
-    pub struct None(());
-    impl NestedFilter<'_> for None {
-        type MaybeTyCtxt = !;
-        const INTER: bool = false;
-        const INTRA: bool = false;
-    }
+    /// Whether the visitor visits nested "item-like" things.
+    /// E.g., item, impl-item.
+    const INTER: bool;
+    /// Whether the visitor visits "intra item-like" things.
+    /// E.g., function body, closure, `AnonConst`
+    const INTRA: bool;
 }
 
-use nested_filter::NestedFilter;
+/// Do not visit any nested things. When you add a new
+/// "non-nested" thing, you will want to audit such uses to see if
+/// they remain valid.
+///
+/// Use this if you are only walking some particular kind of tree
+/// (i.e., a type, or fn signature) and you don't want to thread a
+/// `tcx` around.
+pub struct IgnoreNested(());
+impl NestedFilter<'_> for IgnoreNested {
+    type MaybeTyCtxt = !;
+    const INTER: bool = false;
+    const INTRA: bool = false;
+}
 
 /// Each method of the Visitor trait is a hook to be potentially
 /// overridden. Each method's default implementation recursively visits
@@ -220,52 +210,42 @@ pub trait Visitor<'v>: Sized {
     /// `visit_nested_XXX` methods. If a new `visit_nested_XXX` variant is
     /// added in the future, it will cause a panic which can be detected
     /// and fixed appropriately.
-    type NestedFilter: NestedFilter<'v> = nested_filter::None;
+    type NestedFilter: NestedFilter<'v> = IgnoreNested;
 
     /// The result type of the `visit_*` methods. Can be either `()`,
     /// or `ControlFlow<T>`.
     type Result: VisitorResult = ();
-
-    #[inline]
-    fn visit_if_delayed(&self, _: LocalDefId) -> bool {
-        true
-    }
 
     /// If `type NestedFilter` is set to visit nested items, this method
     /// must also be overridden to provide a map to retrieve nested items.
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
         panic!(
             "maybe_tcx must be implemented or consider using \
-            `type NestedFilter = nested_filter::None` (the default)"
+            `type NestedFilter = Skip` (the default)"
         );
     }
 
     /// Invoked when a nested item is encountered. By default, when
-    /// `Self::NestedFilter` is `nested_filter::None`, this method does
+    /// `Self::NestedFilter` is `Skip`, this method does
     /// nothing. **You probably don't want to override this method** --
     /// instead, override [`Self::NestedFilter`] or use the "shallow" or
     /// "deep" visit patterns described at
-    /// [`rustc_hir::intravisit`]. The only reason to override
+    /// [`intravisit`](self). The only reason to override
     /// this method is if you want a nested pattern but cannot supply a
     /// `TyCtxt`; see `maybe_tcx` for advice.
     fn visit_nested_item(&mut self, id: ItemId) -> Self::Result {
-        if self.should_visit_maybe_delayed_inter(id.owner_id.def_id) {
+        if Self::NestedFilter::INTER {
             let item = self.maybe_tcx().hir_item(id);
             try_visit!(self.visit_item(item));
         }
         Self::Result::output()
     }
 
-    // Now delayed owners are only delegations, which are either item, trait item or impl item.
-    fn should_visit_maybe_delayed_inter(&mut self, id: LocalDefId) -> bool {
-        Self::NestedFilter::INTER && self.visit_if_delayed(id)
-    }
-
     /// Like `visit_nested_item()`, but for trait items. See
     /// `visit_nested_item()` for advice on when to override this
     /// method.
     fn visit_nested_trait_item(&mut self, id: TraitItemId) -> Self::Result {
-        if self.should_visit_maybe_delayed_inter(id.owner_id.def_id) {
+        if Self::NestedFilter::INTER {
             let item = self.maybe_tcx().hir_trait_item(id);
             try_visit!(self.visit_trait_item(item));
         }
@@ -276,7 +256,7 @@ pub trait Visitor<'v>: Sized {
     /// `visit_nested_item()` for advice on when to override this
     /// method.
     fn visit_nested_impl_item(&mut self, id: ImplItemId) -> Self::Result {
-        if self.should_visit_maybe_delayed_inter(id.owner_id.def_id) {
+        if Self::NestedFilter::INTER {
             let item = self.maybe_tcx().hir_impl_item(id);
             try_visit!(self.visit_impl_item(item));
         }
@@ -357,7 +337,7 @@ pub trait Visitor<'v>: Sized {
     fn visit_pat_expr(&mut self, expr: &'v PatExpr<'v>) -> Self::Result {
         walk_pat_expr(self, expr)
     }
-    fn visit_lit(&mut self, _hir_id: HirId, _lit: Lit, _negated: bool) -> Self::Result {
+    fn visit_lit(&mut self, _hir_id: HirId, _lit: Lit, _is_negated_pat: bool) -> Self::Result {
         Self::Result::output()
     }
     fn visit_anon_const(&mut self, c: &'v AnonConst) -> Self::Result {
@@ -545,7 +525,7 @@ pub fn walk_param<'v, V: Visitor<'v>>(visitor: &mut V, param: &'v Param<'v>) -> 
 }
 
 pub fn walk_item<'v, V: Visitor<'v>>(visitor: &mut V, item: &'v Item<'v>) -> V::Result {
-    let Item { owner_id: _, kind, span: _, vis_span: _, has_delayed_lints: _, eii: _ } = item;
+    let Item { owner_id: _, kind, span: _, vis_span: _, eii: _ } = item;
     try_visit!(visitor.visit_id(item.hir_id()));
     match *kind {
         ItemKind::ExternCrate(orig_name, ident) => {
@@ -628,15 +608,19 @@ pub fn walk_item<'v, V: Visitor<'v>>(visitor: &mut V, item: &'v Item<'v>) -> V::
             try_visit!(visitor.visit_generics(generics));
             try_visit!(visitor.visit_variant_data(struct_definition));
         }
-        ItemKind::Trait(
-            _constness,
-            _is_auto,
-            _safety,
+        ItemKind::Trait {
+            impl_restriction,
+            constness: _,
+            is_auto: _,
+            safety: _,
             ident,
-            ref generics,
+            generics,
             bounds,
-            trait_item_refs,
-        ) => {
+            items: trait_item_refs,
+        } => {
+            if let RestrictionKind::Restricted(path) = &impl_restriction.kind {
+                walk_list!(visitor, visit_path_segment, path.segments);
+            }
             try_visit!(visitor.visit_ident(ident));
             try_visit!(visitor.visit_generics(generics));
             walk_list!(visitor, visit_param_bound, bounds);
@@ -671,8 +655,7 @@ pub fn walk_foreign_item<'v, V: Visitor<'v>>(
     visitor: &mut V,
     foreign_item: &'v ForeignItem<'v>,
 ) -> V::Result {
-    let ForeignItem { ident, kind, owner_id: _, span: _, vis_span: _, has_delayed_lints: _ } =
-        foreign_item;
+    let ForeignItem { ident, kind, owner_id: _, span: _, vis_span: _ } = foreign_item;
     try_visit!(visitor.visit_id(foreign_item.hir_id()));
     try_visit!(visitor.visit_ident(*ident));
 
@@ -904,6 +887,7 @@ pub fn walk_expr<'v, V: Visitor<'v>>(visitor: &mut V, expression: &'v Expr<'v>) 
             fn_arg_span: _,
             kind: _,
             constness: _,
+            explicit_captures: _,
         }) => {
             walk_list!(visitor, visit_generic_param, bound_generic_params);
             try_visit!(visitor.visit_fn(FnKind::Closure, fn_decl, body, *span, def_id));
@@ -1064,6 +1048,12 @@ pub fn walk_ty<'v, V: Visitor<'v>>(visitor: &mut V, typ: &'v Ty<'v, AmbigArg>) -
             visit_opt!(visitor, visit_ident, *variant);
             try_visit!(visitor.visit_ident(*field));
         }
+        TyKind::View(ty, fields) => {
+            try_visit!(visitor.visit_ty_unambig(ty));
+            for field in fields {
+                try_visit!(visitor.visit_ident(*field));
+            }
+        }
     }
     V::Result::output()
 }
@@ -1099,7 +1089,7 @@ pub fn walk_const_arg<'v, V: Visitor<'v>>(
     try_visit!(visitor.visit_id(*hir_id));
     match kind {
         ConstArgKind::Tup(exprs) => {
-            walk_list!(visitor, visit_const_arg, *exprs);
+            walk_list!(visitor, visit_const_arg_unambig, *exprs);
             V::Result::output()
         }
         ConstArgKind::Struct(qpath, field_exprs) => {
@@ -1210,10 +1200,6 @@ pub fn walk_where_predicate<'v, V: Visitor<'v>>(
             try_visit!(visitor.visit_lifetime(lifetime));
             walk_list!(visitor, visit_param_bound, bounds);
         }
-        WherePredicateKind::EqPredicate(WhereEqPredicate { ref lhs_ty, ref rhs_ty }) => {
-            try_visit!(visitor.visit_ty_unambig(lhs_ty));
-            try_visit!(visitor.visit_ty_unambig(rhs_ty));
-        }
     }
     V::Result::output()
 }
@@ -1222,8 +1208,7 @@ pub fn walk_fn_decl<'v, V: Visitor<'v>>(
     visitor: &mut V,
     function_declaration: &'v FnDecl<'v>,
 ) -> V::Result {
-    let FnDecl { inputs, output, c_variadic: _, implicit_self: _, lifetime_elision_allowed: _ } =
-        function_declaration;
+    let FnDecl { inputs, output, fn_decl_kind: _ } = function_declaration;
     walk_list!(visitor, visit_ty_unambig, *inputs);
     visitor.visit_fn_ret_ty(output)
 }
@@ -1273,22 +1258,14 @@ pub fn walk_trait_item<'v, V: Visitor<'v>>(
     visitor: &mut V,
     trait_item: &'v TraitItem<'v>,
 ) -> V::Result {
-    let TraitItem {
-        ident,
-        generics,
-        ref defaultness,
-        ref kind,
-        span,
-        owner_id: _,
-        has_delayed_lints: _,
-    } = *trait_item;
+    let TraitItem { ident, generics, ref defaultness, ref kind, span, owner_id: _ } = *trait_item;
     let hir_id = trait_item.hir_id();
     try_visit!(visitor.visit_ident(ident));
     try_visit!(visitor.visit_generics(&generics));
     try_visit!(visitor.visit_defaultness(&defaultness));
     try_visit!(visitor.visit_id(hir_id));
     match *kind {
-        TraitItemKind::Const(ref ty, default, _) => {
+        TraitItemKind::Const(ref ty, default) => {
             try_visit!(visitor.visit_ty_unambig(ty));
             visit_opt!(visitor, visit_const_item_rhs, default);
         }
@@ -1323,15 +1300,8 @@ pub fn walk_impl_item<'v, V: Visitor<'v>>(
     visitor: &mut V,
     impl_item: &'v ImplItem<'v>,
 ) -> V::Result {
-    let ImplItem {
-        owner_id: _,
-        ident,
-        ref generics,
-        ref impl_kind,
-        ref kind,
-        span: _,
-        has_delayed_lints: _,
-    } = *impl_item;
+    let ImplItem { owner_id: _, ident, ref generics, ref impl_kind, ref kind, span: _ } =
+        *impl_item;
 
     try_visit!(visitor.visit_ident(ident));
     try_visit!(visitor.visit_generics(generics));
@@ -1430,8 +1400,21 @@ pub fn walk_struct_def<'v, V: Visitor<'v>>(
 
 pub fn walk_field_def<'v, V: Visitor<'v>>(
     visitor: &mut V,
-    FieldDef { hir_id, ident, ty, default, span: _, vis_span: _, def_id: _, safety: _ }: &'v FieldDef<'v>,
+    FieldDef {
+        hir_id,
+        ident,
+        ty,
+        default,
+        span: _,
+        vis_span: _,
+        mut_restriction,
+        def_id: _,
+        safety: _,
+    }: &'v FieldDef<'v>,
 ) -> V::Result {
+    if let RestrictionKind::Restricted(path) = mut_restriction.kind {
+        walk_list!(visitor, visit_path_segment, path.segments);
+    }
     try_visit!(visitor.visit_id(*hir_id));
     try_visit!(visitor.visit_ident(*ident));
     visit_opt!(visitor, visit_anon_const, default);
@@ -1499,7 +1482,8 @@ pub fn walk_path_segment<'v, V: Visitor<'v>>(
     visitor: &mut V,
     segment: &'v PathSegment<'v>,
 ) -> V::Result {
-    let PathSegment { ident, hir_id, res: _, args, infer_args: _ } = segment;
+    let PathSegment { ident, hir_id, res: _, args, infer_args: _, delegation_child_segment: _ } =
+        segment;
     try_visit!(visitor.visit_ident(*ident));
     try_visit!(visitor.visit_id(*hir_id));
     visit_opt!(visitor, visit_generic_args, *args);

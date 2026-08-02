@@ -4,6 +4,7 @@ COPY scripts/cross-apt-packages.sh /scripts/
 RUN sh /scripts/cross-apt-packages.sh
 
 COPY scripts/crosstool-ng.sh /scripts/
+COPY scripts/crosstool-ng-sha256-20260705.diff /scripts/
 RUN sh /scripts/crosstool-ng.sh
 
 COPY scripts/rustbuild-setup.sh /scripts/
@@ -50,7 +51,7 @@ ENV RUST_CONFIGURE_ARGS="--enable-extended \
       --enable-profiler \
       --enable-sanitizers \
       --disable-docs \
-      --set rust.jemalloc \
+      --set build.allocator=jemalloc \
       --set rust.lto=thin \
       --set rust.codegen-units=1"
 

@@ -2,8 +2,8 @@ use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::lint::LintExpectation;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
-use rustc_session::lint::LintExpectationId;
 use rustc_session::lint::builtin::UNFULFILLED_LINT_EXPECTATIONS;
+use rustc_session::lint::{LintExpectationId, StableLintExpectationId};
 use rustc_span::Symbol;
 
 use crate::lints::{Expectation, ExpectationNote};
@@ -12,32 +12,17 @@ pub(crate) fn provide(providers: &mut Providers) {
     *providers = Providers { lint_expectations, check_expectations, ..*providers };
 }
 
-fn lint_expectations(tcx: TyCtxt<'_>, (): ()) -> Vec<(LintExpectationId, LintExpectation)> {
+fn lint_expectations(tcx: TyCtxt<'_>, (): ()) -> Vec<(StableLintExpectationId, LintExpectation)> {
     let krate = tcx.hir_crate_items(());
 
     let mut expectations = Vec::new();
 
     for owner in krate.owners() {
-        // Deduplicate expectations
-        let mut inner_expectations = Vec::new();
         let lints = tcx.shallow_lint_levels_on(owner);
-        for expectation in &lints.expectations {
-            let canonicalized = canonicalize_id(&expectation.0);
-            if !inner_expectations.iter().any(|(id, _)| canonicalize_id(id) == canonicalized) {
-                inner_expectations.push(expectation.clone());
-            }
-        }
-        expectations.extend(inner_expectations);
+        expectations.extend_from_slice(&lints.expectations);
     }
 
     expectations
-}
-
-fn canonicalize_id(expect_id: &LintExpectationId) -> (rustc_span::AttrId, u16) {
-    match *expect_id {
-        LintExpectationId::Unstable { attr_id, lint_index, .. } => (attr_id, lint_index),
-        LintExpectationId::Stable { attr_id, lint_index, .. } => (attr_id, lint_index),
-    }
 }
 
 fn check_expectations(tcx: TyCtxt<'_>, tool_filter: Option<Symbol>) {
@@ -45,16 +30,23 @@ fn check_expectations(tcx: TyCtxt<'_>, tool_filter: Option<Symbol>) {
     let fulfilled_expectations = tcx.dcx().steal_fulfilled_expectation_ids();
 
     // Turn a `LintExpectationId` into a `(AttrId, lint_index)` pair.
+    let canonicalize_id = |expect_id: &LintExpectationId| {
+        let (attr_id, lint_index) = match *expect_id {
+            LintExpectationId::Unstable(id) => (id.attr_id, id.lint_index),
+            LintExpectationId::Stable(id) => {
+                // We are an `eval_always` query, so looking at the attribute's `AttrId` is ok.
+                (tcx.hir_attrs(id.hir_id)[id.attr_index as usize].id(), id.lint_index)
+            }
+        };
+        (attr_id, lint_index)
+    };
+
     let fulfilled_expectations: FxHashSet<_> =
         fulfilled_expectations.iter().map(canonicalize_id).collect();
 
     for (expect_id, expectation) in lint_expectations {
-        // This check will always be true, since `lint_expectations` only holds stable ids
-        let LintExpectationId::Stable { hir_id, .. } = expect_id else {
-            unreachable!("at this stage all `LintExpectationId`s are stable");
-        };
-
-        let expect_id = canonicalize_id(expect_id);
+        let hir_id = expect_id.hir_id;
+        let expect_id = canonicalize_id(&LintExpectationId::Stable(*expect_id));
 
         if !fulfilled_expectations.contains(&expect_id)
             && tool_filter.is_none_or(|filter| expectation.lint_tool == Some(filter))
@@ -63,7 +55,7 @@ fn check_expectations(tcx: TyCtxt<'_>, tool_filter: Option<Symbol>) {
             let note = expectation.is_unfulfilled_lint_expectations;
             tcx.emit_node_span_lint(
                 UNFULFILLED_LINT_EXPECTATIONS,
-                *hir_id,
+                hir_id,
                 expectation.emission_span,
                 Expectation { rationale, note },
             );

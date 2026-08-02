@@ -4,20 +4,17 @@
 use std::cmp::{self, Ordering};
 
 use hir_def::{attrs::AttrFlags, signatures::FunctionSignature};
-use hir_expand::name::Name;
-use intern::sym;
-use rustc_type_ir::inherent::{AdtDef, IntoKind, SliceLike, Ty as _};
+use rustc_abi::ExternAbi;
+use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _};
 use stdx::never;
 
 use crate::{
-    InferenceResult,
     display::DisplayTarget,
     drop::{DropGlue, has_drop_glue},
     mir::eval::{
-        Address, AdtId, Arc, Evaluator, FunctionId, GenericArgs, HasModule, HirDisplay,
-        InternedClosure, Interval, IntervalAndTy, IntervalOrOwned, ItemContainerId, Layout, Locals,
-        Lookup, MirEvalError, MirSpan, Mutability, Result, Ty, TyKind, from_bytes, not_supported,
-        pad16,
+        Address, AdtId, Arc, Evaluator, FunctionId, GenericArgs, HasModule, HirDisplay, Interval,
+        IntervalAndTy, IntervalOrOwned, ItemContainerId, Layout, Locals, Lookup, MirEvalError,
+        MirSpan, Mutability, Result, Ty, TyKind, from_bytes, not_supported, pad16,
     },
     next_solver::Region,
 };
@@ -31,13 +28,13 @@ enum EvalLangItem {
     DropInPlace,
 }
 
-impl<'db> Evaluator<'db> {
+impl<'a, 'db> Evaluator<'a, 'db> {
     pub(super) fn detect_and_exec_special_function(
         &mut self,
         def: FunctionId,
         args: &[IntervalAndTy<'db>],
         generic_args: GenericArgs<'db>,
-        locals: &Locals,
+        locals: &Locals<'a, 'db>,
         destination: Interval,
         span: MirSpan,
     ) -> Result<'db, bool> {
@@ -62,7 +59,9 @@ impl<'db> Evaluator<'db> {
             );
         }
         let is_extern_c = match def.lookup(self.db).container {
-            hir_def::ItemContainerId::ExternBlockId(block) => block.abi(self.db) == Some(sym::C),
+            hir_def::ItemContainerId::ExternBlockId(block) => {
+                matches!(block.abi(self.db), ExternAbi::C { .. })
+            }
             _ => false,
         };
         if is_extern_c {
@@ -134,7 +133,7 @@ impl<'db> Evaluator<'db> {
         def: FunctionId,
         args: &[IntervalAndTy<'db>],
         self_ty: Ty<'db>,
-        locals: &Locals,
+        locals: &Locals<'a, 'db>,
         destination: Interval,
         span: MirSpan,
     ) -> Result<'db, ()> {
@@ -147,19 +146,14 @@ impl<'db> Evaluator<'db> {
                 return destination
                     .write_from_interval(self, Interval { addr, size: destination.size });
             }
-            TyKind::Closure(id, subst) => {
-                let [arg] = args else {
-                    not_supported!("wrong arg count for clone");
-                };
-                let addr = Address::from_bytes(arg.get(self)?)?;
-                let InternedClosure(owner, _) = self.db.lookup_intern_closure(id.0);
-                let infer = InferenceResult::of(self.db, owner);
-                let (captures, _) = infer.closure_info(id.0);
-                let layout = self.layout(self_ty)?;
-                let db = self.db;
-                let ty_iter = captures.iter().map(|c| c.ty(db, subst));
-                self.exec_clone_for_fields(ty_iter, layout, addr, def, locals, destination, span)?;
-            }
+            TyKind::Closure(_, closure_args) => self.exec_clone(
+                def,
+                args,
+                closure_args.as_closure().tupled_upvars_ty(),
+                locals,
+                destination,
+                span,
+            )?,
             TyKind::Tuple(subst) => {
                 let [arg] = args else {
                     not_supported!("wrong arg count for clone");
@@ -197,7 +191,7 @@ impl<'db> Evaluator<'db> {
         layout: Arc<Layout>,
         addr: Address,
         def: FunctionId,
-        locals: &Locals,
+        locals: &Locals<'a, 'db>,
         destination: Interval,
         span: MirSpan,
     ) -> Result<'db, ()> {
@@ -303,7 +297,7 @@ impl<'db> Evaluator<'db> {
         it: EvalLangItem,
         generic_args: GenericArgs<'db>,
         args: &[IntervalAndTy<'db>],
-        locals: &Locals,
+        locals: &Locals<'a, 'db>,
         span: MirSpan,
     ) -> Result<'db, Vec<u8>> {
         use EvalLangItem::*;
@@ -375,7 +369,7 @@ impl<'db> Evaluator<'db> {
         id: i64,
         args: &[IntervalAndTy<'db>],
         destination: Interval,
-        _locals: &Locals,
+        _locals: &Locals<'a, 'db>,
         _span: MirSpan,
     ) -> Result<'db, ()> {
         match id {
@@ -406,7 +400,7 @@ impl<'db> Evaluator<'db> {
         args: &[IntervalAndTy<'db>],
         _generic_args: GenericArgs<'db>,
         destination: Interval,
-        locals: &Locals,
+        locals: &Locals<'a, 'db>,
         span: MirSpan,
     ) -> Result<'db, ()> {
         match as_str {
@@ -518,7 +512,7 @@ impl<'db> Evaluator<'db> {
             "sched_getaffinity" => {
                 let [_pid, _set_size, set] = args else {
                     return Err(MirEvalError::InternalError(
-                        "libc::write args are not provided".into(),
+                        "sched_getaffinity args are not provided".into(),
                     ));
                 };
                 let set = Address::from_bytes(set.get(self)?)?;
@@ -530,9 +524,7 @@ impl<'db> Evaluator<'db> {
             }
             "getenv" => {
                 let [name] = args else {
-                    return Err(MirEvalError::InternalError(
-                        "libc::write args are not provided".into(),
-                    ));
+                    return Err(MirEvalError::InternalError("getenv args are not provided".into()));
                 };
                 let mut name_buf = vec![];
                 let name = {
@@ -572,7 +564,7 @@ impl<'db> Evaluator<'db> {
         args: &[IntervalAndTy<'db>],
         generic_args: GenericArgs<'db>,
         destination: Interval,
-        locals: &Locals,
+        locals: &Locals<'a, 'db>,
         span: MirSpan,
         needs_override: bool,
     ) -> Result<'db, bool> {
@@ -741,9 +733,7 @@ impl<'db> Evaluator<'db> {
                 let size = self.size_of_sized(ty, locals, "size_of arg")?;
                 destination.write_from_bytes(self, &size.to_le_bytes()[0..destination.size])
             }
-            // FIXME: `min_align_of` was renamed to `align_of` in Rust 1.89
-            // (https://github.com/rust-lang/rust/pull/142410)
-            "min_align_of" | "align_of" => {
+            "align_of" => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
                         "align_of generic arg is not provided".into(),
@@ -771,9 +761,7 @@ impl<'db> Evaluator<'db> {
                     destination.write_from_bytes(self, &size.to_le_bytes())
                 }
             }
-            // FIXME: `min_align_of_val` was renamed to `align_of_val` in Rust 1.89
-            // (https://github.com/rust-lang/rust/pull/142410)
-            "min_align_of_val" | "align_of_val" => {
+            "align_of_val" => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
                         "align_of_val generic arg is not provided".into(),
@@ -1070,12 +1058,15 @@ impl<'db> Evaluator<'db> {
                 let ans = ptr + offset * size;
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
-            "assert_inhabited" | "assert_zero_valid" | "assert_uninit_valid" | "assume" => {
+            "assert_inhabited"
+            | "assert_zero_valid"
+            | "assert_uninit_valid"
+            | "assert_mem_uninitialized_valid" => {
                 // FIXME: We should actually implement these checks
                 Ok(())
             }
             "forget" => {
-                // We don't call any drop glue yet, so there is nothing here
+                // FIXME
                 Ok(())
             }
             "transmute" | "transmute_unchecked" => {
@@ -1108,7 +1099,9 @@ impl<'db> Evaluator<'db> {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError("cttz arg is not provided".into()));
                 };
-                let result = u128::from_le_bytes(pad16(arg.get(self)?, false)).trailing_zeros();
+                let arg: &[u8] = arg.get(self)?;
+                let bit_count = arg.len() as u32 * 8;
+                let result = u128::from_le_bytes(pad16(arg, false)).trailing_zeros().min(bit_count);
                 destination
                     .write_from_bytes(self, &(result as u128).to_le_bytes()[0..destination.size])
             }
@@ -1211,11 +1204,7 @@ impl<'db> Evaluator<'db> {
                     let addr = tuple.interval.addr.offset(offset);
                     args.push(IntervalAndTy::new(addr, field, self, locals)?);
                 }
-                if let Some(target) = self.lang_items().FnOnce
-                    && let Some(def) = target
-                        .trait_items(self.db)
-                        .method_by_name(&Name::new_symbol_root(sym::call_once))
-                {
+                if let Some(def) = self.lang_items().FnOnce_call_once {
                     self.exec_fn_trait(
                         def,
                         &args,
@@ -1344,6 +1333,93 @@ impl<'db> Evaluator<'db> {
                 .write_from_interval(self, meta.interval)?;
                 Ok(())
             }
+            "fabs" => {
+                let [arg] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "fabs intrinsic signature doesn't match fn (T) -> T".into(),
+                    ));
+                };
+                let mut bytes = arg.get(self)?.to_vec();
+                if let Some(sign_byte) = bytes.last_mut() {
+                    *sign_byte &= 0x7f;
+                }
+                destination.write_from_bytes(self, &bytes)
+            }
+            "unreachable" => {
+                return Err(MirEvalError::UndefinedBehavior(
+                    "`unreachable` intrinsic executed".to_owned(),
+                ));
+            }
+            "const_allocate" => {
+                let [size, align] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "const_allocate args are not provided".into(),
+                    ));
+                };
+                let size = from_bytes!(usize, size.get(self)?);
+                let align = from_bytes!(usize, align.get(self)?);
+                let result = self.heap_allocate(size, align)?;
+                destination.write_from_bytes(self, &result.to_bytes())
+            }
+            "const_deallocate" => Ok(()),
+            "caller_location" => {
+                let Some(location_adt) = self.lang_items().PanicLocation else {
+                    not_supported!("`caller_location` requires the `panic_location` lang item");
+                };
+                let location_ty = self.db.ty(location_adt.into()).skip_binder();
+                let TyKind::Adt(_, subst) = location_ty.kind() else {
+                    return Err(MirEvalError::InternalError(
+                        "`panic_location` lang item is not an ADT".into(),
+                    ));
+                };
+                let layout = self.layout(location_ty)?;
+                let (file, line, col) = self.caller_location_fields(locals.body.owner, span);
+                let file_len = file.len();
+                let file_addr = self.heap_allocate(file_len + 1, 1)?;
+                self.write_memory(file_addr, file.as_bytes())?;
+                let ptr_size = self.ptr_size();
+                let field_types = self.db.field_types(location_adt.into());
+                let mut line_col = [line, col].into_iter();
+                let mut fields = Vec::with_capacity(field_types.iter().count());
+                for (_, field) in field_types.iter() {
+                    let field_ty = field.ty().instantiate(self.interner(), subst).skip_norm_wip();
+                    let bytes =
+                        if matches!(field_ty.kind(), TyKind::Uint(rustc_type_ir::UintTy::U32)) {
+                            line_col.next().unwrap_or(0).to_le_bytes().to_vec()
+                        } else {
+                            let size =
+                                self.size_of_sized(field_ty, locals, "caller_location field")?;
+                            if size == ptr_size * 2 {
+                                // The string slice pointing at the file name: (data pointer, length).
+                                let mut bytes = file_addr.to_bytes()[..ptr_size].to_vec();
+                                bytes.extend_from_slice(&file_len.to_le_bytes()[..ptr_size]);
+                                bytes
+                            } else {
+                                vec![0; size]
+                            }
+                        };
+                    fields.push(IntervalOrOwned::Owned(bytes));
+                }
+                let location = self.construct_with_layout(
+                    layout.size.bytes_usize(),
+                    &layout,
+                    None,
+                    fields.into_iter(),
+                )?;
+                let location_addr =
+                    self.heap_allocate(layout.size.bytes_usize(), layout.align.bytes() as usize)?;
+                self.write_memory(location_addr, &location)?;
+                destination.write_from_bytes(self, &location_addr.to_bytes()[..ptr_size])
+            }
+            "box_new" => {
+                let ty = generic_args.type_at(0);
+                let Some((size, align)) = self.size_align_of(ty, locals)? else {
+                    not_supported!("unsized box initialization");
+                };
+                let addr = self.heap_allocate(size, align)?;
+                self.copy_from_interval(addr, args[0].interval)?;
+                destination.write_from_bytes(self, &addr.to_bytes()[..self.ptr_size()])
+            }
             _ if needs_override => not_supported!("intrinsic {name} is not implemented"),
             _ => return Ok(false),
         }
@@ -1354,7 +1430,7 @@ impl<'db> Evaluator<'db> {
         &mut self,
         ty: Ty<'db>,
         metadata: Interval,
-        locals: &Locals,
+        locals: &Locals<'a, 'db>,
     ) -> Result<'db, (usize, usize)> {
         Ok(match ty.kind() {
             TyKind::Str => (from_bytes!(usize, metadata.get(self)?), 1),
@@ -1369,7 +1445,7 @@ impl<'db> Evaluator<'db> {
                 "dyn concrete type",
             )?,
             TyKind::Adt(adt_def, subst) => {
-                let id = adt_def.def_id().0;
+                let id = adt_def.def_id();
                 let layout = self.layout_adt(id, subst)?;
                 let id = match id {
                     AdtId::StructId(s) => s,
@@ -1381,8 +1457,9 @@ impl<'db> Evaluator<'db> {
                     .next_back()
                     .unwrap()
                     .1
-                    .get()
-                    .instantiate(self.interner(), subst);
+                    .ty()
+                    .instantiate(self.interner(), subst)
+                    .skip_norm_wip();
                 let sized_part_size =
                     layout.fields.offset(field_types.iter().count() - 1).bytes_usize();
                 let sized_part_align = layout.align.bytes() as usize;
@@ -1413,7 +1490,7 @@ impl<'db> Evaluator<'db> {
         args: &[IntervalAndTy<'db>],
         generic_args: GenericArgs<'db>,
         destination: Interval,
-        locals: &Locals,
+        locals: &Locals<'a, 'db>,
         _span: MirSpan,
     ) -> Result<'db, ()> {
         // We are a single threaded runtime with no UB checking and no optimization, so

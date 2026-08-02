@@ -1680,7 +1680,7 @@ impl<T: ?Sized> Pin<&'static mut T> {
 
 #[stable(feature = "pin", since = "1.33.0")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-impl<Ptr: [const] Deref> const Deref for Pin<Ptr> {
+const impl<Ptr: [const] Deref> Deref for Pin<Ptr> {
     type Target = Ptr::Target;
     fn deref(&self) -> &Ptr::Target {
         Pin::get_ref(Pin::as_ref(self))
@@ -1723,7 +1723,7 @@ mod helper {
 
     #[unstable(feature = "pin_derefmut_internals", issue = "none")]
     #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-    impl<Ptr: [const] super::DerefMut> const PinDerefMutHelper for PinHelper<Ptr>
+    const impl<Ptr: [const] super::DerefMut> PinDerefMutHelper for PinHelper<Ptr>
     where
         Ptr::Target: crate::marker::Unpin,
     {
@@ -1739,7 +1739,7 @@ mod helper {
 #[stable(feature = "pin", since = "1.33.0")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
 #[cfg(not(doc))]
-impl<Ptr> const DerefMut for Pin<Ptr>
+const impl<Ptr> DerefMut for Pin<Ptr>
 where
     Ptr: [const] Deref,
     helper::PinHelper<Ptr>: [const] helper::PinDerefMutHelper<Target = Self::Target>,
@@ -1765,7 +1765,7 @@ where
 #[stable(feature = "pin", since = "1.33.0")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
 #[cfg(doc)]
-impl<Ptr> const DerefMut for Pin<Ptr>
+const impl<Ptr> DerefMut for Pin<Ptr>
 where
     Ptr: [const] DerefMut,
     <Ptr as Deref>::Target: Unpin,
@@ -2021,14 +2021,82 @@ unsafe impl<T: PinCoerceUnsized> PinCoerceUnsized for Pin<T> {}
 /// [`Box::pin`]: ../../std/boxed/struct.Box.html#method.pin
 #[stable(feature = "pin_macro", since = "1.68.0")]
 #[rustc_macro_transparency = "semiopaque"]
-#[allow_internal_unstable(super_let)]
+#[allow_internal_unstable(pin_macro_internals, super_let)]
 #[rustc_diagnostic_item = "pin_macro"]
 // `super` gets removed by rustfmt
 #[rustfmt::skip]
+#[diagnostic::opaque]
 pub macro pin($value:expr $(,)?) {
     {
-        super let mut pinned = $value;
+        super let mut pinned: $crate::pin::PinMacroHelper<_> = $crate::pin::PinMacroHelper { value: $value };
+
         // SAFETY: The value is pinned: it is the local above which cannot be named outside this macro.
-        unsafe { $crate::pin::Pin::new_unchecked(&mut pinned) }
+        //
+        // In order to make sure that the above local is passed to the below function call
+        // without any coercions in between, we wrap the user-provided value in the
+        // `PinMacroHelper` type, which we know doesn't implement `DerefMut`. Without such
+        // a wrapper, a user might cause a deref coercion on `&mut pinned`, causing the
+        // `Pin::new_unchecked` call to pin the wrong thing, which is unsound.
+        // See <https://github.com/rust-lang/rust/issues/153438>.
+        //
+        // To verify that there are no problematic coercions in the below line, we enumerate
+        // the list of all possible kinds of coercions that currently exist in the language,
+        // and verify that they can't be used to coerce a `&mut PinMacroHelper<T>` into a
+        // `&mut PinMacroHelper<U>` (as enforced by the above type annotation on `pinned`,
+        // and the type signature of `pin_new_unchecked_in_helper`), where `T` and `U` are
+        // different types:
+        //
+        // * Subtype coercions: `&mut` is invariant over the type being referenced, so subtype
+        //   coercion can only change the lifetime of the `&mut` reference itself, which poses
+        //   no problems.
+        // * Coercions that change the kind of references/pointers: We have the following kinds
+        //   of coercions, none of which can produce a `&mut`: `&mut`-to-`&`, `*mut`-to-`*const`,
+        //   `&`-to-`*const`, `&mut`-to-`*mut`.
+        // * Deref coercions: Does not apply here, since `PinMacroHelper` does not implement
+        //   `Deref` or `DerefMut`. And since `PinMacroHelper` is not a fundamental type, users
+        //   cannot add any such implementations to the type.
+        // * Unsize coercions: Does not apply here, since unsize coercions can only produce a
+        //   reference/pointer to an unsized type, and `PinMacroHelper` is always `Sized`.
+        // * Coercions from function items or non-capturing closures to function pointers:
+        //   Does not apply here. `&mut _` is not a function item or closure.
+        // * Never-to-any coercions: If this coercion applies, then we're in unreachable code,
+        //   so whatever we do can't possibly cause unsoundness.
+        //
+        // Furthermore, if we ever add more kinds of coercions to the language, it seems
+        // extremely unlikely that user code would be allowed to define new coercions
+        // on a stdlib-defined type such as `PinMacroHelper`.
+        //
+        // I have not verified whether it is possible to cause a coercion in the `let`
+        // statement above, before assigning to the `pinned` variable. However, even if
+        // such a coercion were possible, it would not affect the soundness of the macro,
+        // since the soundness argument only relies on the type of `pinned` being
+        // `PinMacroHelper<_>`, which is enforced by the type annotation.
+        unsafe { $crate::pin::pin_new_unchecked_in_helper(&mut pinned) }
     }
+}
+
+/// Helper for `pin!` to enforce its type signature.
+/// See <https://github.com/rust-lang/rust/issues/153438>.
+#[unstable(feature = "pin_macro_internals", issue = "none")]
+#[doc(hidden)]
+#[expect(missing_debug_implementations, reason = "this type is only used by the `pin!` macro")]
+#[rustc_diagnostic_item = "PinMacroHelper"]
+pub struct PinMacroHelper<T> {
+    pub value: T,
+}
+
+/// Helper for `pin!` to enforce its type signature.
+/// See <https://github.com/rust-lang/rust/issues/153438>.
+///
+/// # Safety
+/// Calling this function has the same safety requirements as calling
+/// `Pin::new_unchecked` on `&mut pinned.value`
+#[unstable(feature = "pin_macro_internals", issue = "none")]
+#[doc(hidden)]
+#[inline]
+pub const unsafe fn pin_new_unchecked_in_helper<'a, T>(
+    pinned: &'a mut PinMacroHelper<T>,
+) -> Pin<&'a mut T> {
+    // SAFETY: Ensured by the caller.
+    unsafe { Pin::new_unchecked(&mut pinned.value) }
 }

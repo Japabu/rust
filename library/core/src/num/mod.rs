@@ -2,6 +2,7 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
+use crate::convert::{BoundedCastFromInt, CheckedCastFromInt};
 use crate::panic::const_panic;
 use crate::str::FromStr;
 use crate::ub_checks::assert_unsafe_precondition;
@@ -240,6 +241,39 @@ macro_rules! midpoint_impl {
     };
 }
 
+macro_rules! widening_mul_impl {
+    ($SelfT:ty, $WideT:ty) => {
+        /// Widening multiplication. Computes `self * rhs`, widening to a larger integer.
+        ///
+        /// The returned value is always exact and can never overflow.
+        ///
+        /// Note that this method is semantically equivalent to [`carrying_mul`] with a
+        /// carry of zero, with the latter instead returning a tuple denoting the low and
+        /// high parts of the result. Consider using it instead if you need
+        /// interoperability with other big int helper functions, or if this method isn't
+        /// available for a given type.
+        ///
+        /// [`carrying_mul`]: Self::carrying_mul
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(widening_mul)]
+        ///
+        #[doc = concat!("assert_eq!(", stringify!($SelfT), "::MAX.widening_mul(0_", stringify!($SelfT), "), 0);")]
+        #[doc = concat!("assert_eq!(", stringify!($SelfT), "::MAX.widening_mul(", stringify!($SelfT), "::MAX), ", stringify!($SelfT), "::MAX as ", stringify!($WideT), " * ", stringify!($SelfT), "::MAX as ", stringify!($WideT), ");")]
+        /// ```
+        #[unstable(feature = "widening_mul", issue = "152016")]
+        #[rustc_const_unstable(feature = "widening_mul", issue = "152016")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        pub const fn widening_mul(self, rhs: Self) -> $WideT {
+            self as $WideT * rhs as $WideT
+        }
+    }
+}
+
 macro_rules! widening_carryless_mul_impl {
     ($SelfT:ty, $WideT:ty) => {
         /// Performs a widening carry-less multiplication.
@@ -360,6 +394,7 @@ impl i8 {
         bound_condition = "",
     }
     midpoint_impl! { i8, i16, signed }
+    widening_mul_impl! { i8, i16 }
 }
 
 impl i16 {
@@ -384,6 +419,7 @@ impl i16 {
         bound_condition = "",
     }
     midpoint_impl! { i16, i32, signed }
+    widening_mul_impl! { i16, i32 }
 }
 
 impl i32 {
@@ -408,6 +444,7 @@ impl i32 {
         bound_condition = "",
     }
     midpoint_impl! { i32, i64, signed }
+    widening_mul_impl! { i32, i64 }
 }
 
 impl i64 {
@@ -432,6 +469,7 @@ impl i64 {
         bound_condition = "",
     }
     midpoint_impl! { i64, signed }
+    widening_mul_impl! { i64, i128 }
 }
 
 impl i128 {
@@ -460,6 +498,7 @@ impl i128 {
     midpoint_impl! { i128, signed }
 }
 
+#[doc(auto_cfg = false)]
 #[cfg(target_pointer_width = "16")]
 impl isize {
     int_impl! {
@@ -485,6 +524,7 @@ impl isize {
     midpoint_impl! { isize, i32, signed }
 }
 
+#[doc(auto_cfg = false)]
 #[cfg(target_pointer_width = "32")]
 impl isize {
     int_impl! {
@@ -510,6 +550,7 @@ impl isize {
     midpoint_impl! { isize, i64, signed }
 }
 
+#[doc(auto_cfg = false)]
 #[cfg(target_pointer_width = "64")]
 impl isize {
     int_impl! {
@@ -565,6 +606,7 @@ impl u8 {
         bound_condition = "",
     }
     midpoint_impl! { u8, u16, unsigned }
+    widening_mul_impl! { u8, u16 }
     widening_carryless_mul_impl! { u8, u16 }
     carrying_carryless_mul_impl! { u8, u16 }
 
@@ -986,7 +1028,8 @@ impl u8 {
         matches!(*self, b'0'..=b'9') | matches!(*self, b'A'..=b'F') | matches!(*self, b'a'..=b'f')
     }
 
-    /// Checks if the value is an ASCII punctuation character:
+    /// Checks if the value is an ASCII punctuation or symbol character
+    /// (i.e. not alphanumeric, whitespace, or control):
     ///
     /// - U+0021 ..= U+002F `! " # $ % & ' ( ) * + , - . /`, or
     /// - U+003A ..= U+0040 `: ; < = > ? @`, or
@@ -1027,7 +1070,8 @@ impl u8 {
             | matches!(*self, b'{'..=b'~')
     }
 
-    /// Checks if the value is an ASCII graphic character:
+    /// Checks if the value is an ASCII graphic character
+    /// (i.e. not whitespace or control):
     /// U+0021 '!' ..= U+007E '~'.
     ///
     /// # Examples
@@ -1065,6 +1109,9 @@ impl u8 {
     /// U+0020 SPACE, U+0009 HORIZONTAL TAB, U+000A LINE FEED,
     /// U+000C FORM FEED, or U+000D CARRIAGE RETURN.
     ///
+    /// **Warning:** Because the list above excludes U+000B VERTICAL TAB,
+    /// `b.is_ascii_whitespace()` is **not** equivalent to `char::from(b).is_whitespace()`.
+    ///
     /// Rust uses the WhatWG Infra Standard's [definition of ASCII
     /// whitespace][infra-aw]. There are several other definitions in
     /// wide use. For instance, [the POSIX locale][pct] includes
@@ -1078,8 +1125,8 @@ impl u8 {
     /// before using this function.
     ///
     /// [infra-aw]: https://infra.spec.whatwg.org/#ascii-whitespace
-    /// [pct]: https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap07.html#tag_07_03_01
-    /// [bfs]: https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html#tag_18_06_05
+    /// [pct]: https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/V1_chap07.html#tag_07_03_01
+    /// [bfs]: https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html#tag_19_06_05
     ///
     /// # Examples
     ///
@@ -1207,6 +1254,7 @@ impl u16 {
         bound_condition = "",
     }
     midpoint_impl! { u16, u32, unsigned }
+    widening_mul_impl! { u16, u32 }
     widening_carryless_mul_impl! { u16, u32 }
     carrying_carryless_mul_impl! { u16, u32 }
 
@@ -1262,6 +1310,7 @@ impl u32 {
         bound_condition = "",
     }
     midpoint_impl! { u32, u64, unsigned }
+    widening_mul_impl! { u32, u64 }
     widening_carryless_mul_impl! { u32, u64 }
     carrying_carryless_mul_impl! { u32, u64 }
 }
@@ -1293,6 +1342,7 @@ impl u64 {
         bound_condition = "",
     }
     midpoint_impl! { u64, u128, unsigned }
+    widening_mul_impl! { u64, u128 }
     widening_carryless_mul_impl! { u64, u128 }
     carrying_carryless_mul_impl! { u64, u128 }
 }
@@ -1329,6 +1379,7 @@ impl u128 {
     carrying_carryless_mul_impl! { u128, u256 }
 }
 
+#[doc(auto_cfg = false)]
 #[cfg(target_pointer_width = "16")]
 impl usize {
     uint_impl! {
@@ -1360,6 +1411,7 @@ impl usize {
     carrying_carryless_mul_impl! { usize, u32 }
 }
 
+#[doc(auto_cfg = false)]
 #[cfg(target_pointer_width = "32")]
 impl usize {
     uint_impl! {
@@ -1391,6 +1443,7 @@ impl usize {
     carrying_carryless_mul_impl! { usize, u64 }
 }
 
+#[doc(auto_cfg = false)]
 #[cfg(target_pointer_width = "64")]
 impl usize {
     uint_impl! {
@@ -1522,10 +1575,10 @@ pub const fn can_not_overflow<T>(radix: u32, is_signed_ty: bool, digits: &[u8]) 
 #[cfg_attr(panic = "immediate-abort", inline)]
 #[cold]
 #[track_caller]
-const fn from_ascii_radix_panic(radix: u32) -> ! {
+const fn from_ascii_bytes_radix_panic(radix: u32) -> ! {
     const_panic!(
-        "from_ascii_radix: radix must lie in the range `[2, 36]`",
-        "from_ascii_radix: radix must lie in the range `[2, 36]` - found {radix}",
+        "from_ascii_bytes_radix: radix must lie in the range `[2, 36]`",
+        "from_ascii_bytes_radix: radix must lie in the range `[2, 36]` - found {radix}",
         radix: u32 = radix,
     )
 }
@@ -1534,7 +1587,7 @@ macro_rules! from_str_int_impl {
     ($signedness:ident $($int_ty:ty)+) => {$(
         #[stable(feature = "rust1", since = "1.0.0")]
         #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-        impl const FromStr for $int_ty {
+        const impl FromStr for $int_ty {
             type Err = ParseIntError;
 
             /// Parses an integer from a string slice with decimal digits.
@@ -1623,7 +1676,7 @@ macro_rules! from_str_int_impl {
             #[rustc_const_stable(feature = "const_int_from_str", since = "1.82.0")]
             #[inline]
             pub const fn from_str_radix(src: &str, radix: u32) -> Result<$int_ty, ParseIntError> {
-                <$int_ty>::from_ascii_radix(src.as_bytes(), radix)
+                <$int_ty>::from_ascii_bytes_radix_impl(src.as_bytes(), radix)
             }
 
             /// Parses an integer from an ASCII-byte slice with decimal digits.
@@ -1647,18 +1700,22 @@ macro_rules! from_str_int_impl {
             /// ```
             /// #![feature(int_from_ascii)]
             ///
-            #[doc = concat!("assert_eq!(", stringify!($int_ty), "::from_ascii(b\"+10\"), Ok(10));")]
+            #[doc = concat!("assert_eq!(", stringify!($int_ty), "::from_ascii_bytes(b\"+10\"), Ok(10));")]
             /// ```
             /// Trailing space returns error:
             /// ```
             /// # #![feature(int_from_ascii)]
             /// #
-            #[doc = concat!("assert!(", stringify!($int_ty), "::from_ascii(b\"1 \").is_err());")]
+            #[doc = concat!("assert!(", stringify!($int_ty), "::from_ascii_bytes(b\"1 \").is_err());")]
             /// ```
             #[unstable(feature = "int_from_ascii", issue = "134821")]
+            #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
             #[inline]
-            pub const fn from_ascii(src: &[u8]) -> Result<$int_ty, ParseIntError> {
-                <$int_ty>::from_ascii_radix(src, 10)
+            pub const fn from_ascii_bytes<T>(src: T) -> Result<$int_ty, ParseIntError>
+            where
+                T: [const] AsRef<[u8]> + [const] crate::marker::Destruct
+            {
+                <$int_ty>::from_ascii_bytes_radix(src.as_ref(), 10)
             }
 
             /// Parses an integer from an ASCII-byte slice with digits in a given base.
@@ -1691,22 +1748,31 @@ macro_rules! from_str_int_impl {
             /// ```
             /// #![feature(int_from_ascii)]
             ///
-            #[doc = concat!("assert_eq!(", stringify!($int_ty), "::from_ascii_radix(b\"A\", 16), Ok(10));")]
+            #[doc = concat!("assert_eq!(", stringify!($int_ty), "::from_ascii_bytes_radix(b\"A\", 16), Ok(10));")]
             /// ```
             /// Trailing space returns error:
             /// ```
             /// # #![feature(int_from_ascii)]
             /// #
-            #[doc = concat!("assert!(", stringify!($int_ty), "::from_ascii_radix(b\"1 \", 10).is_err());")]
+            #[doc = concat!("assert!(", stringify!($int_ty), "::from_ascii_bytes_radix(b\"1 \", 10).is_err());")]
             /// ```
             #[unstable(feature = "int_from_ascii", issue = "134821")]
+            #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
             #[inline]
-            pub const fn from_ascii_radix(src: &[u8], radix: u32) -> Result<$int_ty, ParseIntError> {
+            pub const fn from_ascii_bytes_radix<T>(src: T, radix: u32) -> Result<$int_ty, ParseIntError>
+            where
+                T: [const] AsRef<[u8]> + [const] crate::marker::Destruct
+            {
+                <$int_ty>::from_ascii_bytes_radix_impl(src.as_ref(), radix)
+            }
+
+            #[inline]
+            pub(super) const fn from_ascii_bytes_radix_impl(src: &[u8], radix: u32) -> Result<$int_ty, ParseIntError> {
                 use self::IntErrorKind::*;
                 use self::ParseIntError as PIE;
 
                 if 2 > radix || radix > 36 {
-                    from_ascii_radix_panic(radix);
+                    from_ascii_bytes_radix_panic(radix);
                 }
 
                 if src.is_empty() {
@@ -1796,12 +1862,3 @@ macro_rules! from_str_int_impl {
 
 from_str_int_impl! { signed isize i8 i16 i32 i64 i128 }
 from_str_int_impl! { unsigned usize u8 u16 u32 u64 u128 }
-
-macro_rules! impl_sealed {
-    ($($t:ty)*) => {$(
-        /// Allows extension traits within `core`.
-        #[unstable(feature = "sealed", issue = "none")]
-        impl crate::sealed::Sealed for $t {}
-    )*}
-}
-impl_sealed! { isize i8 i16 i32 i64 i128 usize u8 u16 u32 u64 u128 }

@@ -109,7 +109,9 @@ impl Ty {
 /// Represents a pattern in the type system
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum Pattern {
-    Range { start: Option<TyConst>, end: Option<TyConst>, include_end: bool },
+    Range { start: TyConst, end: TyConst, include_end: bool },
+    NotNull,
+    Or(Vec<Pattern>),
 }
 
 /// Represents a constant in the type system
@@ -210,6 +212,13 @@ impl MirConst {
     pub fn try_from_uint(value: u128, uint_ty: UintTy) -> Result<MirConst, Error> {
         with(|cx| cx.try_new_const_uint(value, uint_ty))
     }
+
+    /// Build a new constant that represents the given floating point number.
+    /// The value is the binary representation of the float constant.
+    /// Example: `try_from_float(2.5_f32.to_bits() as u128, FloatTy::F32)`.
+    pub fn try_from_float(value: u128, float_ty: FloatTy) -> Result<MirConst, Error> {
+        with(|cx| cx.try_new_const_float(value, float_ty))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -284,6 +293,11 @@ impl Span {
     /// distributed.
     pub fn diagnostic(&self) -> String {
         with(|c| c.span_to_string(*self))
+    }
+
+    /// Create a `&'static core::panic::Location<'static>` constant from this span.
+    pub(crate) fn as_caller_location(&self) -> MirConst {
+        with(|c| c.span_as_caller_location(*self))
     }
 }
 
@@ -710,10 +724,30 @@ impl FnDef {
         self.as_intrinsic().is_some()
     }
 
+    /// Get the constness of this function definition.
+    pub fn constness(&self) -> Constness {
+        with(|cx| cx.constness(*self))
+    }
+
+    /// Get the asyncness of this function definition.
+    pub fn asyncness(&self) -> Asyncness {
+        with(|cx| cx.asyncness(*self))
+    }
+
     /// Get the function signature for this function definition.
     pub fn fn_sig(&self) -> PolyFnSig {
         let kind = self.ty().kind();
         kind.fn_sig().unwrap()
+    }
+
+    /// Get the generics of this function definition.
+    pub fn generics_of(&self) -> Generics {
+        with(|cx| cx.generics_of(self.0))
+    }
+
+    /// Get the associated item information if this function is one.
+    pub fn associated_item(&self) -> Option<AssocItem> {
+        with(|cx| cx.associated_item(self.0))
     }
 }
 
@@ -851,6 +885,16 @@ impl AdtDef {
     pub fn discriminant_for_variant(&self, idx: VariantIdx) -> Discr {
         with(|cx| cx.adt_discr_for_variant(*self, idx))
     }
+
+    /// Get the generics of this ADT definition.
+    pub fn generics_of(&self) -> Generics {
+        with(|cx| cx.generics_of(self.0))
+    }
+
+    /// Retrieve the inherent implementations for this ADT.
+    pub fn inherent_impls(&self) -> Vec<ImplDef> {
+        with(|cx| cx.inherent_impls(*self))
+    }
 }
 
 pub struct Discr {
@@ -883,28 +927,23 @@ impl VariantDef {
     pub fn fields(&self) -> Vec<FieldDef> {
         with(|cx| cx.variant_fields(*self))
     }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct FieldDef {
-    /// The field definition.
-    pub(crate) def: DefId,
-
-    /// The field name.
-    pub name: Symbol,
-}
-
-impl FieldDef {
-    /// Retrieve the type of this field instantiating and normalizing it with the given arguments.
-    ///
-    /// This will assume the type can be instantiated with these arguments.
-    pub fn ty_with_args(&self, args: &GenericArgs) -> Ty {
-        with(|cx| cx.def_ty_with_args(self.def, args))
+    /// Returns the variant index.
+    pub fn idx(&self) -> VariantIdx {
+        self.idx
     }
 
-    /// Retrieve the type of this field.
-    pub fn ty(&self) -> Ty {
-        with(|cx| cx.def_ty(self.def))
+    /// Returns the `AdtDef` which this variant comes from.
+    pub fn adt_def(&self) -> AdtDef {
+        self.adt_def
+    }
+}
+
+crate_def_with_ty! {
+    #[derive(Serialize)]
+    pub FieldDef {
+        /// The field name.
+        pub name: Symbol,
     }
 }
 
@@ -963,7 +1002,7 @@ crate_def_with_ty! {
     pub ConstDef;
 }
 
-crate_def! {
+crate_def_with_ty! {
     /// A trait impl definition.
     #[derive(Serialize)]
     pub ImplDef;
@@ -977,6 +1016,11 @@ impl ImplDef {
 
     pub fn associated_items(&self) -> AssocItems {
         with(|cx| cx.associated_items(self.def_id()))
+    }
+
+    /// Get the generics of this implementation.
+    pub fn generics_of(&self) -> Generics {
+        with(|cx| cx.generics_of(self.0))
     }
 }
 
@@ -1103,6 +1147,30 @@ impl FnSig {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum Constness {
+    Const { always: bool },
+    NotConst,
+}
+
+impl Constness {
+    pub fn is_const(self) -> bool {
+        matches!(self, Constness::Const { always: false })
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum Asyncness {
+    Async,
+    NotAsync,
+}
+
+impl Asyncness {
+    pub fn is_async(self) -> bool {
+        matches!(self, Asyncness::Async)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Serialize)]
 pub enum Abi {
     Rust,
@@ -1131,8 +1199,10 @@ pub enum Abi {
     RiscvInterruptM,
     RiscvInterruptS,
     RustPreserveNone,
+    RustTail,
     RustInvalid,
     Custom,
+    Swift,
 }
 
 /// A binder represents a possibly generic type and its bound vars.
@@ -1396,12 +1466,12 @@ impl TraitDecl {
         with(|cx| cx.generics_of(self.def_id.0))
     }
 
-    pub fn predicates_of(&self) -> GenericPredicates {
-        with(|cx| cx.predicates_of(self.def_id.0))
+    pub fn clauses_of(&self) -> GenericClauses {
+        with(|cx| cx.clauses_of(self.def_id.0))
     }
 
-    pub fn explicit_predicates_of(&self) -> GenericPredicates {
-        with(|cx| cx.explicit_predicates_of(self.def_id.0))
+    pub fn explicit_clauses_of(&self) -> GenericClauses {
+        with(|cx| cx.explicit_clauses_of(self.def_id.0))
     }
 }
 
@@ -1480,9 +1550,9 @@ pub struct GenericParamDef {
     pub kind: GenericParamDefKind,
 }
 
-pub struct GenericPredicates {
+pub struct GenericClauses {
     pub parent: Option<TraitDef>,
-    pub predicates: Vec<(PredicateKind, Span)>,
+    pub clauses: Vec<(ClauseKind, Span)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1493,7 +1563,6 @@ pub enum PredicateKind {
     Coerce(CoercePredicate),
     ConstEquate(TyConst, TyConst),
     Ambiguous,
-    AliasRelate(TermKind, TermKind, AliasRelationDirection),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1524,12 +1593,6 @@ pub struct SubtypePredicate {
 pub struct CoercePredicate {
     pub a: Ty,
     pub b: Ty,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub enum AliasRelationDirection {
-    Equate,
-    Subtype,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

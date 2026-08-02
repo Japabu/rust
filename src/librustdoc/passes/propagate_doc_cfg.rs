@@ -1,8 +1,9 @@
 //! Propagates [`#[doc(cfg(...))]`](https://github.com/rust-lang/rust/issues/43781) to child items.
 
 use rustc_data_structures::fx::FxHashMap;
-use rustc_hir::Attribute;
 use rustc_hir::attrs::{AttributeKind, DocAttribute};
+use rustc_hir::{Attribute, find_attr};
+use rustc_span::{ExpnKind, MacroKind};
 
 use crate::clean::inline::{load_attrs, merge_attrs};
 use crate::clean::{CfgInfo, Crate, Item, ItemId, ItemKind};
@@ -51,22 +52,64 @@ fn add_only_cfg_attributes(attrs: &mut Vec<Attribute>, new_attrs: &[Attribute]) 
     }
 }
 
+/// This function goes through the attributes list (`new_attrs`) and extracts the attributes that
+/// affect the cfg state propagated to detached items.
+fn add_cfg_state_attributes(attrs: &mut Vec<Attribute>, new_attrs: &[Attribute]) {
+    for attr in new_attrs {
+        if let Attribute::Parsed(AttributeKind::Doc(d)) = attr
+            && (!d.cfg.is_empty() || !d.auto_cfg.is_empty() || !d.auto_cfg_change.is_empty())
+        {
+            let mut new_attr = DocAttribute::default();
+            new_attr.cfg = d.cfg.clone();
+            new_attr.auto_cfg = d.auto_cfg.clone();
+            new_attr.auto_cfg_change = d.auto_cfg_change.clone();
+            attrs.push(Attribute::Parsed(AttributeKind::Doc(Box::new(new_attr))));
+        } else if let Attribute::Parsed(AttributeKind::CfgTrace(..)) = attr {
+            // If it's a `cfg()` attribute, we keep it.
+            attrs.push(attr.clone());
+        }
+    }
+}
+
 impl CfgPropagator<'_, '_> {
     // Some items need to merge their attributes with their parents' otherwise a few of them
     // (mostly `cfg` ones) will be missing.
     fn merge_with_parent_attributes(&mut self, item: &mut Item) {
         let mut attrs = Vec::new();
-        // We only need to merge an item attributes with its parent's in case it's an impl as an
+        // We need to merge an item attributes with its parent's in case it's an impl as an
         // impl might not be defined in the same module as the item it implements.
         //
+        // Same if it's an inlined item: we need to get the full original `cfg`.
+        //
         // Otherwise, `cfg_info` already tracks everything we need so nothing else to do!
-        if matches!(item.kind, ItemKind::ImplItem(_))
-            && let Some(mut next_def_id) = item.item_id.as_local_def_id()
+        if matches!(item.kind, ItemKind::ImplItem(_)) || item.inline_stmt_id.is_some() {
+            if let Some(mut next_def_id) = item.item_id.as_local_def_id() {
+                while let Some(parent_def_id) = self.cx.tcx.opt_local_parent(next_def_id) {
+                    let x = load_attrs(self.cx.tcx, parent_def_id.to_def_id());
+                    add_only_cfg_attributes(&mut attrs, x);
+                    next_def_id = parent_def_id;
+                }
+            }
+        }
+        // We also need to merge an item attributes with its parent's in case it's a macro with
+        // the `#[macro_export]` attribute, because it might not be defined at crate root.
+        else if matches!(item.kind, ItemKind::MacroItem(_, _))
+            && item.inner.attrs.other_attrs.iter().any(|attr| {
+                matches!(
+                    attr,
+                    rustc_hir::Attribute::Parsed(
+                        rustc_hir::attrs::AttributeKind::MacroExport { .. }
+                    )
+                )
+            })
         {
-            while let Some(parent_def_id) = self.cx.tcx.opt_local_parent(next_def_id) {
-                let x = load_attrs(self.cx.tcx, parent_def_id.to_def_id());
-                add_only_cfg_attributes(&mut attrs, x);
-                next_def_id = parent_def_id;
+            for parent_def_id in &item.cfg_parent_ids_for_detached_item(self.cx.tcx) {
+                let mut parent_attrs = Vec::new();
+                add_cfg_state_attributes(
+                    &mut parent_attrs,
+                    load_attrs(self.cx.tcx, parent_def_id.to_def_id()),
+                );
+                merge_attrs(self.cx.tcx, &[], Some((&parent_attrs, None)), &mut self.cfg_info);
             }
         }
 
@@ -91,8 +134,40 @@ impl DocFolder for CfgPropagator<'_, '_> {
         {
             self.cfg_info = cfg_info;
         }
-
         if let ItemKind::PlaceholderImplItem = item.kind {
+            if let Some(impl_def_id) = item.item_id.as_def_id() {
+                let tcx = self.cx.tcx;
+                let expn_data = tcx.expn_that_defined(impl_def_id).expn_data();
+                if matches!(expn_data.kind, ExpnKind::Macro(MacroKind::Derive, _))
+                    // This impl block comes from a `derive` expansion, so we want to retrieve
+                    // the `cfg_attr` if any.
+                    && let Some(self_ty_def_id) = tcx
+                        .type_of(impl_def_id)
+                        .instantiate_identity()
+                        .skip_norm_wip()
+                        .ty_adt_def()
+                        .map(|adt| adt.did())
+                    && let self_ty_attrs = load_attrs(tcx, self_ty_def_id)
+                    && let Some(cfgs_attr_trace) =
+                        find_attr!(self_ty_attrs, CfgAttrTrace(cfgs) => cfgs)
+                    && !cfgs_attr_trace.is_empty()
+                {
+                    // We retrieve the `cfg_attr` of the `derive` this `impl` comes from.
+                    let derive_span = expn_data.call_site;
+                    let attrs_iter = Attribute::Parsed(AttributeKind::CfgTrace(
+                        cfgs_attr_trace
+                            .iter()
+                            .filter(|(_, span)| span.contains(derive_span))
+                            .cloned()
+                            .collect(),
+                    ));
+                    crate::clean::extract_cfg_from_attrs(
+                        std::iter::once(&attrs_iter),
+                        tcx,
+                        &mut self.cfg_info,
+                    );
+                }
+            }
             // If we have a placeholder impl, we store the current `cfg` "context" to be used
             // on the actual impl later on (the impls are generated after we go through the whole
             // AST so they're stored in the `krate` object at the end).

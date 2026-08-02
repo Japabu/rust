@@ -4,11 +4,12 @@ use rustc_span::Symbol;
 use rustc_target::callconv::FnAbi;
 
 use self::shims::unix::linux::mem::EvalContextExt as _;
-use self::shims::unix::linux_like::epoll::EvalContextExt as _;
 use self::shims::unix::linux_like::eventfd::EvalContextExt as _;
 use self::shims::unix::linux_like::syscall::syscall;
 use crate::machine::{SIGRTMAX, SIGRTMIN};
 use crate::shims::unix::foreign_items::EvalContextExt as _;
+use crate::shims::unix::linux_like::epoll::EvalContextExt as _;
+use crate::shims::unix::linux_like::thread::prctl;
 use crate::shims::unix::*;
 use crate::*;
 
@@ -113,6 +114,43 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let result = this.posix_fallocate(fd, offset, len)?;
                 this.write_scalar(result, dest)?;
             }
+
+            "fallocate" => {
+                let [fd, mode, offset, len] = this.check_shim_sig(
+                    shim_sig!(extern "C" fn(i32, i32, libc::off_t, libc::off_t) -> i32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+
+                let fd = this.read_scalar(fd)?.to_i32()?;
+                let mode = this.read_scalar(mode)?.to_i32()?;
+                // We don't support platforms which have libc::off_t bigger than 64 bits.
+                let offset =
+                    i64::try_from(this.read_scalar(offset)?.to_int(offset.layout.size)?).unwrap();
+                let len = i64::try_from(this.read_scalar(len)?.to_int(len.layout.size)?).unwrap();
+
+                let result = this.linux_fallocate(fd, mode, offset, len)?;
+                this.write_scalar(result, dest)?;
+            }
+
+            "fallocate64" => {
+                let [fd, mode, offset, len] = this.check_shim_sig(
+                    shim_sig!(extern "C" fn(i32, i32, libc::off64_t, libc::off64_t) -> i32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+
+                let fd = this.read_scalar(fd)?.to_i32()?;
+                let mode = this.read_scalar(mode)?.to_i32()?;
+                let offset = this.read_scalar(offset)?.to_i64()?;
+                let len = this.read_scalar(len)?.to_i64()?;
+
+                let result = this.linux_fallocate(fd, mode, offset, len)?;
+                this.write_scalar(result, dest)?;
+            }
+
             "readdir64" => {
                 let [dirp] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 this.readdir(dirp, dest)?;
@@ -124,7 +162,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_scalar(result, dest)?;
             }
             "statx" => {
-                // FIXME: This does not have a direct test (#3179).
                 let [dirfd, pathname, flags, mask, statxbuf] =
                     this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let result = this.linux_statx(dirfd, pathname, flags, mask, statxbuf)?;
@@ -199,6 +236,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let result = this.unix_gettid(link_name.as_str())?;
                 this.write_scalar(result, dest)?;
             }
+            "prctl" => prctl(this, link_name, abi, args, dest)?,
 
             // Dynamically invoked syscalls
             "syscall" => {
@@ -247,6 +285,17 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let [_thread, _attr] =
                     this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 this.write_null(dest)?;
+            }
+            "gnu_get_libc_version"
+                if this.frame_in_std()
+                    && this.tcx.sess.target.env == rustc_target::spec::Env::Gnu =>
+            {
+                let [] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                // We have to be at least version 2.26 so that std does not call `res_init`.
+                // This returns a C string, so we have to add a null terminator.
+                let version = "2.26\0";
+                let version = this.allocate_str_dedup(version)?;
+                this.write_pointer(version.ptr(), dest)?;
             }
 
             _ => return interp_ok(EmulateItemResult::NotSupported),

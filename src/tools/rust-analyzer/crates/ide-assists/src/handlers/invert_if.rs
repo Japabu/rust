@@ -26,7 +26,7 @@ use crate::{
 //     if y { B } else { A }
 // }
 // ```
-pub(crate) fn invert_if(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn invert_if(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let if_keyword = ctx
         .find_token_syntax_at_offset(T![if])
         .or_else(|| ctx.find_token_syntax_at_offset(T![else]))?;
@@ -111,6 +111,15 @@ mod tests {
             invert_if,
             "fn f() { i$0f cond { 3 * 2 } else { 1 } }",
             "fn f() { if !cond { 1 } else { 3 * 2 } }",
+        )
+    }
+
+    #[test]
+    fn invert_if_general_case_needs_paren() {
+        check_assist(
+            invert_if,
+            "fn f() { i$0f cond as bool { 3 * 2 } else { 1 } }",
+            "fn f() { if !(cond as bool) { 1 } else { 3 * 2 } }",
         )
     }
 

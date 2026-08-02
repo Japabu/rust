@@ -1,24 +1,26 @@
 use std::hash::Hash;
 use std::mem::ManuallyDrop;
 
+use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::hash_table::{Entry, HashTable};
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_data_structures::sync::{DynSend, DynSync};
-use rustc_data_structures::{outline, sharded, sync};
+use rustc_data_structures::{defer, outline, sharded, sync};
 use rustc_errors::FatalError;
 use rustc_middle::dep_graph::{DepGraphData, DepNodeKey, SerializedDepNodeIndex};
 use rustc_middle::query::{
-    ActiveKeyStatus, Cycle, EnsureMode, QueryCache, QueryJob, QueryJobId, QueryKey, QueryLatch,
-    QueryMode, QueryState, QueryVTable,
+    ActiveKeyStatus, Cycle, QueryCache, QueryJob, QueryJobId, QueryKey, QueryLatch, QueryMode,
+    QueryState, QueryVTable,
 };
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::verify_ich::incremental_verify_ich;
 use rustc_span::{DUMMY_SP, Span};
-use tracing::warn;
+use tracing::debug;
 
 use crate::dep_graph::{DepNode, DepNodeIndex};
+use crate::handle_cycle_error;
 use crate::job::{QueryJobInfo, QueryJobMap, create_cycle_error, find_cycle_in_stack};
-use crate::plumbing::{current_query_job, loadable_from_disk, next_job_id, start_query};
+use crate::plumbing::{current_query_job, next_job_id, start_query};
 use crate::query_impl::for_each_query_vtable;
 
 #[inline]
@@ -99,7 +101,12 @@ fn collect_active_query_jobs_inner<'tcx, C>(
             for shard in query.state.active.try_lock_shards() {
                 match shard {
                     Some(shard) => collect_shard_jobs(&shard),
-                    None => warn!("Failed to collect active jobs for query `{}`!", query.name),
+                    // This collection is best-effort (it is only used to print the query
+                    // stack on panic), so a contended shard is expected and fine to skip.
+                    // Emitting this at `warn!` would leak nondeterministically into the
+                    // panic output under the parallel front-end, where another thread may
+                    // still hold a shard lock, so keep it at `debug!`.
+                    None => debug!("Failed to collect active jobs for query `{}`!", query.name),
                 }
             }
         }
@@ -114,8 +121,29 @@ fn handle_cycle<'tcx, C: QueryCache>(
     key: C::Key,
     cycle: Cycle<'tcx>,
 ) -> C::Value {
-    let error = create_cycle_error(tcx, &cycle);
-    (query.handle_cycle_error_fn)(tcx, key, cycle, error)
+    let nested;
+    {
+        let mut nesting = tcx.query_system.cycle_handler_nesting.lock();
+        nested = match *nesting {
+            0 => false,
+            1 => true,
+            _ => {
+                // Don't print further nested errors to avoid cases of infinite recursion
+                tcx.dcx().delayed_bug("doubly nested cycle error").raise_fatal()
+            }
+        };
+        *nesting += 1;
+    }
+    let _guard = defer(|| *tcx.query_system.cycle_handler_nesting.lock() -= 1);
+
+    let error = create_cycle_error(tcx, &cycle, nested);
+
+    if nested {
+        // Avoid custom handlers and only use the robust `create_cycle_error` for nested cycle errors
+        handle_cycle_error::default(error)
+    } else {
+        (query.handle_cycle_error_fn)(tcx, key, cycle, error)
+    }
 }
 
 /// Guard object representing the responsibility to execute a query job and
@@ -225,7 +253,7 @@ fn wait_for_query<'tcx, C: QueryCache>(
     let query_blocked_prof_timer = tcx.prof.query_blocked();
 
     // With parallel queries we might just have to wait on some other thread.
-    let result = latch.wait_on(tcx, current, span);
+    let result = latch.wait_on(current, span);
 
     match result {
         Ok(()) => {
@@ -272,7 +300,7 @@ fn try_execute_query<'tcx, C: QueryCache, const INCR: bool>(
     // re-executing the query since `try_start` only checks that the query is not currently
     // executing, but another thread may have already completed the query and stores it result
     // in the query cache.
-    if tcx.sess.threads() > 1 {
+    if tcx.sess.opts.jobs.frontend.is_some() {
         if let Some((value, index)) = query.cache.lookup(&key) {
             tcx.prof.query_cache_hit(index.into());
             return (value, Some(index));
@@ -447,8 +475,7 @@ fn execute_job_incr<'tcx, C: QueryCache>(
         dep_graph_data.with_task(
             dep_node,
             tcx,
-            (query, key),
-            |tcx, (query, key)| (query.invoke_provider_fn)(tcx, key),
+            || (query.invoke_provider_fn)(tcx, key),
             query.hash_value_fn,
         )
     });
@@ -456,6 +483,20 @@ fn execute_job_incr<'tcx, C: QueryCache>(
     prof_timer.finish_with_query_invocation_id(dep_node_index.into());
 
     (result, dep_node_index)
+}
+
+/// Whether a value loaded from the on-disk cache should have its fingerprint
+/// verified with `incremental_verify_ich`. If `-Zincremental-verify-ich` is
+/// specified, re-hash results from the cache and make sure that they have the
+/// expected fingerprint.
+///
+/// If not, we still seek to verify a subset of fingerprints loaded from disk.
+/// Re-hashing results is fairly expensive, so we can't currently afford to
+/// verify every hash. This subset should still give us some coverage of
+/// potential bugs.
+pub(crate) fn should_verify_loaded_value(tcx: TyCtxt<'_>, prev_fingerprint: Fingerprint) -> bool {
+    prev_fingerprint.split().1.as_u64().is_multiple_of(32)
+        || tcx.sess.opts.unstable_opts.incremental_verify_ich
 }
 
 /// Given that the dep node for this query+key is green, obtain a value for it
@@ -477,35 +518,33 @@ fn load_from_disk_or_invoke_provider_green<'tcx, C: QueryCache>(
     debug_assert!(dep_graph_data.is_index_green(prev_index));
 
     // First try to load the result from the on-disk cache. Some things are never cached on disk.
-    let value;
-    let verify;
-    match (query.try_load_from_disk_fn)(tcx, key, prev_index, dep_node_index) {
-        Some(loaded_value) => {
+    let try_value = if query.will_cache_on_disk_for_key(key) {
+        let prof_timer = tcx.prof.incr_cache_loading();
+        let value = (query.try_load_from_disk_fn)(tcx, prev_index);
+        prof_timer.finish_with_query_invocation_id(dep_node_index.into());
+        value
+    } else {
+        None
+    };
+    let (value, verify) = match try_value {
+        Some(value) => {
             if std::intrinsics::unlikely(tcx.sess.opts.unstable_opts.query_dep_graph) {
                 dep_graph_data.mark_debug_loaded_from_disk(*dep_node)
             }
 
-            value = loaded_value;
-
             let prev_fingerprint = dep_graph_data.prev_value_fingerprint_of(prev_index);
-            // If `-Zincremental-verify-ich` is specified, re-hash results from
-            // the cache and make sure that they have the expected fingerprint.
-            //
-            // If not, we still seek to verify a subset of fingerprints loaded
-            // from disk. Re-hashing results is fairly expensive, so we can't
-            // currently afford to verify every hash. This subset should still
-            // give us some coverage of potential bugs.
-            verify = prev_fingerprint.split().1.as_u64().is_multiple_of(32)
-                || tcx.sess.opts.unstable_opts.incremental_verify_ich;
+            let verify = should_verify_loaded_value(tcx, prev_fingerprint);
+
+            (value, verify)
         }
         None => {
             // We could not load a result from the on-disk cache, so recompute. The dep-graph for
             // this computation is already in-place, so we can just call the query provider.
             let prof_timer = tcx.prof.query_provider();
-            value = tcx.dep_graph.with_ignore(|| (query.invoke_provider_fn)(tcx, key));
+            let value = tcx.dep_graph.with_ignore(|| (query.invoke_provider_fn)(tcx, key));
             prof_timer.finish_with_query_invocation_id(dep_node_index.into());
 
-            verify = true;
+            (value, true)
         }
     };
 
@@ -532,7 +571,7 @@ fn load_from_disk_or_invoke_provider_green<'tcx, C: QueryCache>(
     value
 }
 
-/// Checks whether a `tcx.ensure_ok()` or `tcx.ensure_done()` query call can
+/// Checks whether a `tcx.ensure_ok()` query call can
 /// return early without actually trying to execute.
 ///
 /// This only makes sense during incremental compilation, because it relies
@@ -542,9 +581,7 @@ fn load_from_disk_or_invoke_provider_green<'tcx, C: QueryCache>(
 fn ensure_can_skip_execution<'tcx, C: QueryCache>(
     query: &'tcx QueryVTable<'tcx, C>,
     tcx: TyCtxt<'tcx>,
-    key: C::Key,
     dep_node: DepNode,
-    ensure_mode: EnsureMode,
 ) -> bool {
     // Queries with `eval_always` should never skip execution.
     if query.eval_always {
@@ -561,25 +598,15 @@ fn ensure_can_skip_execution<'tcx, C: QueryCache>(
             // in-memory cache, or another query down the line will.
             false
         }
-        Some((serialized_dep_node_index, dep_node_index)) => {
+        Some((_, dep_node_index)) => {
             tcx.dep_graph.read_index(dep_node_index);
             tcx.prof.query_cache_hit(dep_node_index.into());
-            match ensure_mode {
-                // In ensure-ok mode, we can skip execution for this key if the
-                // node is green. It must have succeeded in the previous
-                // session, and therefore would succeed in the current session
-                // if executed.
-                EnsureMode::Ok => true,
 
-                // In ensure-done mode, we can only skip execution for this key
-                // if there's a disk-cached value available to load later if
-                // needed, which guarantees the query provider will never run
-                // for this key.
-                EnsureMode::Done => {
-                    (query.will_cache_on_disk_for_key_fn)(key)
-                        && loadable_from_disk(tcx, serialized_dep_node_index)
-                }
-            }
+            // We can skip execution for this key if the
+            // node is green. It must have succeeded in the previous
+            // session, and therefore would succeed in the current session
+            // if executed.
+            true
         }
     }
 }
@@ -608,9 +635,9 @@ pub(super) fn execute_query_incr_inner<'tcx, C: QueryCache>(
 ) -> Option<C::Value> {
     let dep_node = DepNode::construct(tcx, query.dep_kind, &key);
 
-    // Check if query execution can be skipped, for `ensure_ok` or `ensure_done`.
-    if let QueryMode::Ensure { ensure_mode } = mode
-        && ensure_can_skip_execution(query, tcx, key, dep_node, ensure_mode)
+    // Check if query execution can be skipped, for `ensure_ok`.
+    if let QueryMode::EnsureOk = mode
+        && ensure_can_skip_execution(query, tcx, dep_node)
     {
         return None;
     }

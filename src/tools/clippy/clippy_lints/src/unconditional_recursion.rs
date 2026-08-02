@@ -101,6 +101,7 @@ fn get_hir_ty_def_id<'tcx>(tcx: TyCtxt<'tcx>, hir_ty: rustc_hir::Ty<'tcx>) -> Op
 
             match ty.kind() {
                 ty::Alias(
+                    _,
                     proj @ ty::AliasTy {
                         kind: ty::Projection { .. },
                         ..
@@ -376,7 +377,7 @@ impl UnconditionalRecursion {
         method_def_id: LocalDefId,
     ) {
         // We're only interested into static methods.
-        if decl.implicit_self.has_implicit_self() {
+        if decl.implicit_self().has_implicit_self() {
             return;
         }
         // We don't check trait implementations.

@@ -10,19 +10,23 @@ use rustc_const_eval::interpret::{
     ImmTy, InterpCx, InterpResult, Projectable, Scalar, format_interp_error, interp_ok,
 };
 use rustc_data_structures::fx::FxHashSet;
-use rustc_hir::HirId;
 use rustc_hir::def::DefKind;
+use rustc_hir::{HirId, find_attr};
 use rustc_index::IndexVec;
 use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::bug;
 use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::layout::{LayoutError, LayoutOf, LayoutOfHelpers, TyAndLayout};
-use rustc_middle::ty::{self, ConstInt, ScalarInt, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{
+    self, ConstInt, GenericArgKind, GenericParamDefKind, ScalarInt, Ty, TyCtxt, TypeVisitableExt,
+    Unnormalized,
+};
+use rustc_session::lint::builtin::UNCONDITIONAL_PANIC;
 use rustc_span::Span;
 use tracing::{debug, instrument, trace};
 
-use crate::errors::{AssertLint, AssertLintKind};
+use crate::diagnostics::{AssertLint, AssertLintKind, ConstNIsZero};
 
 pub(super) struct KnownPanicsLint;
 
@@ -261,7 +265,10 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         // that the `PostAnalysisNormalize` pass has happened and that the body's consts
         // are normalized, so any call to resolve before that needs to be
         // manually normalized.
-        let val = self.tcx.try_normalize_erasing_regions(self.typing_env, c.const_).ok()?;
+        let val = self
+            .tcx
+            .try_normalize_erasing_regions(self.typing_env, Unnormalized::new_wip(c.const_))
+            .ok()?;
 
         self.use_ecx(|this| this.ecx.eval_mir_constant(&val, c.span, None))?
             .as_mplace_or_imm()
@@ -412,14 +419,14 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                 trace!("checking UnaryOp(op = {:?}, arg = {:?})", op, arg);
                 self.check_unary_op(*op, arg, location)?;
             }
-            Rvalue::BinaryOp(op, box (left, right)) => {
+            Rvalue::BinaryOp(op, (left, right)) => {
                 trace!("checking BinaryOp(op = {:?}, left = {:?}, right = {:?})", op, left, right);
                 self.check_binary_op(*op, left, right, location)?;
             }
 
             // Do not try creating references (#67862)
-            Rvalue::RawPtr(_, place) | Rvalue::Ref(_, _, place) => {
-                trace!("skipping RawPtr | Ref for {:?}", place);
+            Rvalue::RawPtr(_, place) | Rvalue::Ref(_, _, place) | Rvalue::Reborrow(_, _, place) => {
+                trace!("skipping RawPtr | Ref | Reborrow for {:?}", place);
 
                 // This may be creating mutable references or immutable references to cells.
                 // If that happens, the pointed to value could be mutated via that reference.
@@ -546,13 +553,13 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         let val: Value<'_> = match *rvalue {
             ThreadLocalRef(_) => return None,
 
-            Use(ref operand) | WrapUnsafeBinder(ref operand, _) => {
+            Use(ref operand, _) | WrapUnsafeBinder(ref operand, _) => {
                 self.eval_operand(operand)?.into()
             }
 
-            CopyForDeref(place) => self.eval_place(place)?.into(),
+            CopyForDeref(place) | Reborrow(_, _, place) => self.eval_place(place)?.into(),
 
-            BinaryOp(bin_op, box (ref left, ref right)) => {
+            BinaryOp(bin_op, (ref left, ref right)) => {
                 let left = self.eval_operand(left)?;
                 let left = self.use_ecx(|this| this.ecx.read_immediate(&left))?;
 
@@ -560,7 +567,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                 let right = self.use_ecx(|this| this.ecx.read_immediate(&right))?;
 
                 let val = self.use_ecx(|this| this.ecx.binary_op(bin_op, &left, &right))?;
-                if matches!(val.layout.backend_repr, BackendRepr::ScalarPair(..)) {
+                if matches!(val.layout.backend_repr, BackendRepr::ScalarPair { .. }) {
                     // FIXME `Value` should properly support pairs in `Immediate`... but currently
                     // it does not.
                     let (val, overflow) = val.to_pair(&self.ecx);
@@ -626,7 +633,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                     // so bail out if the target is not one.
                     match (value.layout.backend_repr, to.backend_repr) {
                         (BackendRepr::Scalar(..), BackendRepr::Scalar(..)) => {}
-                        (BackendRepr::ScalarPair(..), BackendRepr::ScalarPair(..)) => {}
+                        (BackendRepr::ScalarPair { .. }, BackendRepr::ScalarPair { .. }) => {}
                         _ => return None,
                     }
 
@@ -765,6 +772,38 @@ impl<'tcx> Visitor<'tcx> for ConstPropagator<'_, 'tcx> {
                 }
                 // We failed to evaluate the discriminant, fallback to visiting all successors.
             }
+            TerminatorKind::Call { func, args: _, .. } => {
+                if let Some((def_id, generic_args)) = func.const_fn_def() {
+                    for (index, arg) in generic_args.iter().enumerate() {
+                        if let GenericArgKind::Const(ct) = arg.kind() {
+                            let generics = self.tcx.generics_of(def_id);
+                            let param_def = generics.param_at(index, self.tcx);
+
+                            if let GenericParamDefKind::Const { .. } = param_def.kind
+                                && find_attr!(self.tcx, param_def.def_id, RustcPanicsWhenZero)
+                                && let Some(0) = ct.try_to_target_usize(self.tcx)
+                            {
+                                // We managed to figure-out that the value of a
+                                // `#[rustc_panics_when_zero]` const-generic parameter is zero.
+                                //
+                                // Let's report it as an unconditional panic.
+                                let source_info = self.body.source_info(location);
+                                if let Some(lint_root) = self.lint_root(*source_info) {
+                                    self.tcx.emit_node_span_lint(
+                                        UNCONDITIONAL_PANIC,
+                                        lint_root,
+                                        source_info.span,
+                                        ConstNIsZero {
+                                            const_param_span: source_info.span,
+                                            const_param_name: param_def.name,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // None of these have Operands to const-propagate.
             TerminatorKind::Goto { .. }
             | TerminatorKind::UnwindResume
@@ -777,7 +816,6 @@ impl<'tcx> Visitor<'tcx> for ConstPropagator<'_, 'tcx> {
             | TerminatorKind::CoroutineDrop
             | TerminatorKind::FalseEdge { .. }
             | TerminatorKind::FalseUnwind { .. }
-            | TerminatorKind::Call { .. }
             | TerminatorKind::InlineAsm { .. } => {}
         }
 
@@ -952,7 +990,9 @@ impl<'tcx> Visitor<'tcx> for CanConstProp {
                 self.can_const_prop[local] = ConstPropMode::NoPropagation;
             }
             MutatingUse(MutatingUseContext::Projection)
-            | NonMutatingUse(NonMutatingUseContext::Projection) => bug!("visit_place should not pass {context:?} for {local:?}"),
+            | NonMutatingUse(NonMutatingUseContext::Projection) => {
+                bug!("visit_place should not pass {context:?} for {local:?}")
+            }
         }
     }
 }

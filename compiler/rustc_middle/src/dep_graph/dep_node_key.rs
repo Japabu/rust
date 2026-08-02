@@ -1,13 +1,12 @@
 use std::fmt::Debug;
 
 use rustc_data_structures::fingerprint::Fingerprint;
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
-use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE, LocalDefId, LocalModDefId, ModDefId};
+use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE, LocalDefId, LocalModId, ModId};
 use rustc_hir::definitions::DefPathHash;
 use rustc_hir::{HirId, ItemLocalId, OwnerId};
 
 use crate::dep_graph::{DepNode, KeyFingerprintStyle};
-use crate::ich::StableHashingContext;
 use crate::ty::TyCtxt;
 
 /// Trait for query keys as seen by dependency-node tracking.
@@ -30,7 +29,7 @@ pub trait DepNodeKey<'tcx>: Debug + Sized {
 // Blanket impl of `DepNodeKey`, which is specialized by other impls elsewhere.
 impl<'tcx, T> DepNodeKey<'tcx> for T
 where
-    T: for<'a> HashStable<StableHashingContext<'a>> + Debug,
+    T: StableHash + Debug,
 {
     #[inline(always)]
     default fn key_fingerprint_style() -> KeyFingerprintStyle {
@@ -41,7 +40,7 @@ where
     default fn to_fingerprint(&self, tcx: TyCtxt<'tcx>) -> Fingerprint {
         tcx.with_stable_hashing_context(|mut hcx| {
             let mut hasher = StableHasher::new();
-            self.hash_stable(&mut hcx, &mut hasher);
+            self.stable_hash(&mut hcx, &mut hasher);
             hasher.finish()
         })
     }
@@ -195,7 +194,7 @@ impl<'tcx> DepNodeKey<'tcx> for HirId {
     }
 }
 
-impl<'tcx> DepNodeKey<'tcx> for ModDefId {
+impl<'tcx> DepNodeKey<'tcx> for ModId {
     #[inline(always)]
     fn key_fingerprint_style() -> KeyFingerprintStyle {
         KeyFingerprintStyle::DefPathHash
@@ -208,11 +207,11 @@ impl<'tcx> DepNodeKey<'tcx> for ModDefId {
 
     #[inline(always)]
     fn try_recover_key(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
-        DefId::try_recover_key(tcx, dep_node).map(ModDefId::new_unchecked)
+        DefId::try_recover_key(tcx, dep_node).map(ModId::new_unchecked)
     }
 }
 
-impl<'tcx> DepNodeKey<'tcx> for LocalModDefId {
+impl<'tcx> DepNodeKey<'tcx> for LocalModId {
     #[inline(always)]
     fn key_fingerprint_style() -> KeyFingerprintStyle {
         KeyFingerprintStyle::DefPathHash
@@ -225,6 +224,6 @@ impl<'tcx> DepNodeKey<'tcx> for LocalModDefId {
 
     #[inline(always)]
     fn try_recover_key(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
-        LocalDefId::try_recover_key(tcx, dep_node).map(LocalModDefId::new_unchecked)
+        LocalDefId::try_recover_key(tcx, dep_node).map(LocalModId::new_unchecked)
     }
 }

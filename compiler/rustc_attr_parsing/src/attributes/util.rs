@@ -1,19 +1,18 @@
 use std::num::IntErrorKind;
 
-use rustc_ast::LitKind;
-use rustc_ast::attr::AttributeExt;
+use rustc_ast::{LitKind, ast};
+use rustc_data_structures::Limit;
 use rustc_feature::is_builtin_attr_name;
-use rustc_hir::RustcVersion;
-use rustc_hir::limit::Limit;
+use rustc_hir::attrs::RustcVersion;
 use rustc_span::Symbol;
 
-use crate::context::{AcceptContext, Stage};
+use crate::context::AcceptContext;
 use crate::parser::{ArgParser, NameValueParser};
 use crate::session_diagnostics::LimitInvalid;
 
 /// Parse a rustc version number written inside string literal in an attribute,
 /// like appears in `since = "1.0.0"`. Suffixes like "-dev" and "-nightly" are
-/// not accepted in this position, unlike when parsing CFG_RELEASE.
+/// not accepted in this position, unlike when parsing `CFG_RELEASE`.
 pub fn parse_version(s: Symbol) -> Option<RustcVersion> {
     let mut components = s.as_str().split('-');
     let d = components.next()?;
@@ -27,30 +26,22 @@ pub fn parse_version(s: Symbol) -> Option<RustcVersion> {
     Some(RustcVersion { major, minor, patch })
 }
 
-pub fn is_builtin_attr(attr: &impl AttributeExt) -> bool {
-    attr.is_doc_comment().is_some() || attr.name().is_some_and(|name| is_builtin_attr_name(name))
+pub fn is_builtin_attr(attr: &ast::AttrItem) -> bool {
+    attr.name().is_some_and(|name| is_builtin_attr_name(name))
 }
 
 /// Parse a single integer.
 ///
 /// Used by attributes that take a single integer as argument, such as
-/// `#[link_ordinal]` and `#[rustc_layout_scalar_valid_range_start]`.
+/// `#[link_ordinal]`.
 /// `cx` is the context given to the attribute.
 /// `args` is the parser for the attribute arguments.
-pub(crate) fn parse_single_integer<S: Stage>(
-    cx: &mut AcceptContext<'_, '_, S>,
+pub(crate) fn parse_single_integer(
+    cx: &mut AcceptContext<'_, '_>,
     args: &ArgParser,
 ) -> Option<u128> {
-    let Some(list) = args.list() else {
-        let attr_span = cx.attr_span;
-        cx.adcx().expected_list(attr_span, args);
-        return None;
-    };
-    let Some(single) = list.single() else {
-        cx.adcx().expected_single_argument(list.span);
-        return None;
-    };
-    let Some(lit) = single.lit() else {
+    let single = cx.expect_single_element_list(args, cx.attr_span)?;
+    let Some(lit) = single.as_lit() else {
         cx.adcx().expected_integer_literal(single.span());
         return None;
     };
@@ -61,12 +52,9 @@ pub(crate) fn parse_single_integer<S: Stage>(
     Some(num.0)
 }
 
-impl<S: Stage> AcceptContext<'_, '_, S> {
+impl AcceptContext<'_, '_> {
     pub(crate) fn parse_limit_int(&mut self, nv: &NameValueParser) -> Option<Limit> {
-        let Some(limit) = nv.value_as_str() else {
-            self.adcx().expected_string_literal(nv.value_span, Some(nv.value_as_lit()));
-            return None;
-        };
+        let limit = self.expect_string_literal(nv)?;
 
         let error_str = match limit.as_str().parse() {
             Ok(i) => return Some(Limit::new(i)),
@@ -82,7 +70,7 @@ impl<S: Stage> AcceptContext<'_, '_, S> {
                 IntErrorKind::Zero => {
                     panic!("zero is a valid `limit` so should have returned Ok() when parsing")
                 }
-                kind => panic!("unimplemented IntErrorKind variant: {:?}", kind),
+                kind => panic!("unimplemented IntErrorKind variant: {kind:?}"),
             },
         };
 

@@ -160,6 +160,12 @@ impl<'a> IntoIterator for &'a LlvmConfigOutput {
     }
 }
 
+fn is_libstdcxx_cxx11_abi_flag(flag: &str) -> bool {
+    flag == "-D_GLIBCXX_USE_CXX11_ABI"
+        || flag.starts_with("-D_GLIBCXX_USE_CXX11_ABI=")
+        || flag == "-U_GLIBCXX_USE_CXX11_ABI"
+}
+
 fn main() {
     if cfg!(feature = "check_only") {
         return;
@@ -255,6 +261,14 @@ fn main() {
             continue;
         }
 
+        // This is a libstdc++ implementation detail for the C++ library that
+        // built the runnable llvm-config. When cross-compiling, target LLVM may
+        // have been built against a target libstdc++ with a different default.
+        // Let the target compiler/toolchain select its ABI instead.
+        if is_crossed && is_libstdcxx_cxx11_abi_flag(flag.as_ref()) {
+            continue;
+        }
+
         if flag.starts_with("-flto") {
             continue;
         }
@@ -271,6 +285,15 @@ fn main() {
         }
 
         cfg.flag(&*flag);
+    }
+
+    // Remap ci-llvm include paths in debug info for reproducible builds.
+    if let Some(maps) = tracked_env_var_os("RUSTC_DEBUGINFO_MAP")
+        && let Some(maps_str) = maps.to_str()
+    {
+        for map in maps_str.split('\t') {
+            cfg.flag_if_supported(&format!("-ffile-prefix-map={map}"));
+        }
     }
 
     for component in &components {
@@ -401,6 +424,16 @@ fn main() {
         if name == "LLVMLineEditor" {
             continue;
         }
+
+        // On apple-darwin, llvm-config reports the versioned shared library name such as LLVM-22-..., but
+        // the distributed toolchain ships libLLVM.dylib. Normalize the link name here.
+        let name =
+            if target.contains("apple-darwin") && llvm_kind == "dylib" && name.starts_with("LLVM-")
+            {
+                "LLVM"
+            } else {
+                name
+            };
 
         let kind = if name.starts_with("LLVM") {
             llvm_kind

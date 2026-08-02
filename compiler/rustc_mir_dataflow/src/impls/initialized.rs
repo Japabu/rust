@@ -4,10 +4,7 @@ use rustc_abi::VariantIdx;
 use rustc_index::Idx;
 use rustc_index::bit_set::{DenseBitSet, MixedBitSet};
 use rustc_middle::bug;
-use rustc_middle::mir::{
-    self, Body, CallReturnPlaces, Location, SwitchTargetValue, TerminatorEdges,
-};
-use rustc_middle::ty::util::Discr;
+use rustc_middle::mir::{self, Body, CallReturnPlaces, Location, TerminatorEdges};
 use rustc_middle::ty::{self, TyCtxt};
 use smallvec::SmallVec;
 use tracing::{debug, instrument};
@@ -15,37 +12,22 @@ use tracing::{debug, instrument};
 use crate::drop_flag_effects::{DropFlagState, InactiveVariants};
 use crate::move_paths::{HasMoveData, InitIndex, InitKind, LookupResult, MoveData, MovePathIndex};
 use crate::{
-    Analysis, GenKill, MaybeReachable, drop_flag_effects, drop_flag_effects_for_function_entry,
-    drop_flag_effects_for_location, on_all_children_bits, on_lookup_result_bits,
+    Analysis, GenKill, MaybeReachable, SwitchTargetIndex, drop_flag_effects,
+    drop_flag_effects_for_function_entry, drop_flag_effects_for_location, on_all_children_bits,
+    on_lookup_result_bits,
 };
 
 // Used by both `MaybeInitializedPlaces` and `MaybeUninitializedPlaces`.
 pub struct MaybePlacesSwitchIntData<'tcx> {
     enum_place: mir::Place<'tcx>,
-    discriminants: Vec<(VariantIdx, Discr<'tcx>)>,
-    index: usize,
-}
 
-impl<'tcx> MaybePlacesSwitchIntData<'tcx> {
-    /// Creates a `SmallVec` mapping each target in `targets` to its `VariantIdx`.
-    fn variants(&mut self, targets: &mir::SwitchTargets) -> SmallVec<[VariantIdx; 4]> {
-        self.index = 0;
-        targets.all_values().iter().map(|value| self.next_discr(value.get())).collect()
-    }
-
-    // The discriminant order in the `SwitchInt` targets should match the order yielded by
-    // `AdtDef::discriminants`. We rely on this to match each discriminant in the targets to its
-    // corresponding variant in linear time.
-    fn next_discr(&mut self, value: u128) -> VariantIdx {
-        // An out-of-bounds abort will occur if the discriminant ordering isn't as described above.
-        loop {
-            let (variant, discr) = self.discriminants[self.index];
-            self.index += 1;
-            if discr.val == value {
-                return variant;
-            }
-        }
-    }
+    // Variant indices targeted by the SwitchInt. For example, if you have:
+    // ```
+    // enum E { A = 1, B = 3, C = 5, D = 7 }
+    // ```
+    // and a `SwitchInt(A -> bb1, C -> bb2, _ -> bb3)`, this vec will contain `[0, 2]` because
+    // those are the variant indices for `A` and `C`.
+    variants: SmallVec<[VariantIdx; 4]>,
 }
 
 impl<'tcx> MaybePlacesSwitchIntData<'tcx> {
@@ -53,6 +35,7 @@ impl<'tcx> MaybePlacesSwitchIntData<'tcx> {
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         block: mir::BasicBlock,
+        targets: &mir::SwitchTargets,
         discr: &mir::Operand<'tcx>,
     ) -> Option<Self> {
         let Some(discr) = discr.place() else { return None };
@@ -71,16 +54,30 @@ impl<'tcx> MaybePlacesSwitchIntData<'tcx> {
         let block_data = &body[block];
         for statement in block_data.statements.iter().rev() {
             match statement.kind {
-                mir::StatementKind::Assign(box (lhs, mir::Rvalue::Discriminant(enum_place)))
+                mir::StatementKind::Assign((lhs, mir::Rvalue::Discriminant(enum_place)))
                     if lhs == discr =>
                 {
                     match enum_place.ty(body, tcx).ty.kind() {
                         ty::Adt(enum_def, _) => {
-                            return Some(MaybePlacesSwitchIntData {
-                                enum_place,
-                                discriminants: enum_def.discriminants(tcx).collect(),
-                                index: 0,
-                            });
+                            // For each value in the SwitchInt, find the VariantIdx for the variant
+                            // with that value. This works because `discriminant_vals` and
+                            // `targets.all_values()` are guaranteed to list variants in the same
+                            // AdtDef order. (If that ever changes the `expect` will panic.)
+                            let mut discriminants = enum_def.discriminants(tcx);
+                            let variants = targets
+                                .all_values()
+                                .iter()
+                                .map(|value| {
+                                    // On each call to this closure `find` only consumes part of
+                                    // the `discriminants` iterator.
+                                    discriminants
+                                        .find(|(_, discr)| discr.val == value.get())
+                                        .expect("SwitchInt vals should match a variant")
+                                        .0
+                                })
+                                .collect();
+
+                            return Some(MaybePlacesSwitchIntData { enum_place, variants });
                         }
 
                         // `Rvalue::Discriminant` is also used to get the active yield point for a
@@ -231,7 +228,6 @@ pub struct MaybeUninitializedPlaces<'a, 'tcx> {
     move_data: &'a MoveData<'tcx>,
 
     mark_inactive_variants_as_uninit: bool,
-    include_inactive_in_otherwise: bool,
     skip_unreachable_unwind: DenseBitSet<mir::BasicBlock>,
 }
 
@@ -242,7 +238,6 @@ impl<'a, 'tcx> MaybeUninitializedPlaces<'a, 'tcx> {
             body,
             move_data,
             mark_inactive_variants_as_uninit: false,
-            include_inactive_in_otherwise: false,
             skip_unreachable_unwind: DenseBitSet::new_empty(body.basic_blocks.len()),
         }
     }
@@ -254,13 +249,6 @@ impl<'a, 'tcx> MaybeUninitializedPlaces<'a, 'tcx> {
     /// checker, where this information gets propagated along `FakeEdge`s.
     pub fn mark_inactive_variants_as_uninit(mut self) -> Self {
         self.mark_inactive_variants_as_uninit = true;
-        self
-    }
-
-    /// Ensures definitely inactive variants are included in the set of uninitialized places for
-    /// blocks reached through an `otherwise` edge.
-    pub fn include_inactive_in_otherwise(mut self) -> Self {
-        self.include_inactive_in_otherwise = true;
         self
     }
 
@@ -411,14 +399,8 @@ impl<'tcx> Analysis<'tcx> for MaybeInitializedPlaces<'_, 'tcx> {
         // the result of `is_unwind_dead`.
         let mut edges = terminator.edges();
         if self.skip_unreachable_unwind
-            && let mir::TerminatorKind::Drop {
-                target,
-                unwind,
-                place,
-                replace: _,
-                drop: _,
-                async_fut: _,
-            } = terminator.kind
+            && let mir::TerminatorKind::Drop { target, unwind, place, replace: _, drop: _ } =
+                terminator.kind
             && matches!(unwind, mir::UnwindAction::Cleanup(_))
             && self.is_unwind_dead(place, state)
         {
@@ -452,26 +434,28 @@ impl<'tcx> Analysis<'tcx> for MaybeInitializedPlaces<'_, 'tcx> {
     fn get_switch_int_data(
         &self,
         block: mir::BasicBlock,
+        targets: &mir::SwitchTargets,
         discr: &mir::Operand<'tcx>,
     ) -> Option<Self::SwitchIntData> {
         if !self.tcx.sess.opts.unstable_opts.precise_enum_drop_elaboration {
             return None;
         }
 
-        MaybePlacesSwitchIntData::new(self.tcx, self.body, block, discr)
+        MaybePlacesSwitchIntData::new(self.tcx, self.body, block, targets, discr)
     }
 
     fn apply_switch_int_edge_effect(
         &self,
-        data: &mut Self::SwitchIntData,
         state: &mut Self::Domain,
-        value: SwitchTargetValue,
-        targets: &mir::SwitchTargets,
+        data: &mut Self::SwitchIntData,
+        target_idx: SwitchTargetIndex,
     ) {
-        let inactive_variants = match value {
-            SwitchTargetValue::Normal(value) => InactiveVariants::Active(data.next_discr(value)),
-            SwitchTargetValue::Otherwise if self.exclude_inactive_in_otherwise => {
-                InactiveVariants::Inactives(data.variants(targets))
+        let inactive_variants = match target_idx {
+            SwitchTargetIndex::Normal(target_idx) => {
+                InactiveVariants::Active(data.variants[target_idx])
+            }
+            SwitchTargetIndex::Otherwise if self.exclude_inactive_in_otherwise => {
+                InactiveVariants::Inactives(data.variants.clone())
             }
             _ => return,
         };
@@ -568,6 +552,7 @@ impl<'tcx> Analysis<'tcx> for MaybeUninitializedPlaces<'_, 'tcx> {
     fn get_switch_int_data(
         &self,
         block: mir::BasicBlock,
+        targets: &mir::SwitchTargets,
         discr: &mir::Operand<'tcx>,
     ) -> Option<Self::SwitchIntData> {
         if !self.tcx.sess.opts.unstable_opts.precise_enum_drop_elaboration {
@@ -578,22 +563,20 @@ impl<'tcx> Analysis<'tcx> for MaybeUninitializedPlaces<'_, 'tcx> {
             return None;
         }
 
-        MaybePlacesSwitchIntData::new(self.tcx, self.body, block, discr)
+        MaybePlacesSwitchIntData::new(self.tcx, self.body, block, targets, discr)
     }
 
     fn apply_switch_int_edge_effect(
         &self,
-        data: &mut Self::SwitchIntData,
         state: &mut Self::Domain,
-        value: SwitchTargetValue,
-        targets: &mir::SwitchTargets,
+        data: &mut Self::SwitchIntData,
+        target_idx: SwitchTargetIndex,
     ) {
-        let inactive_variants = match value {
-            SwitchTargetValue::Normal(value) => InactiveVariants::Active(data.next_discr(value)),
-            SwitchTargetValue::Otherwise if self.include_inactive_in_otherwise => {
-                InactiveVariants::Inactives(data.variants(targets))
+        let inactive_variants = match target_idx {
+            SwitchTargetIndex::Normal(target_idx) => {
+                InactiveVariants::Active(data.variants[target_idx])
             }
-            _ => return,
+            SwitchTargetIndex::Otherwise => InactiveVariants::Inactives(data.variants.clone()),
         };
 
         // Mark all move paths that correspond to variants other than this one as maybe
@@ -659,10 +642,9 @@ impl<'tcx> Analysis<'tcx> for EverInitializedPlaces<'_, 'tcx> {
         terminator: &'mir mir::Terminator<'tcx>,
         location: Location,
     ) -> TerminatorEdges<'mir, 'tcx> {
-        let (body, move_data) = (self.body, self.move_data());
-        let term = body[location.block].terminator();
+        let move_data = self.move_data();
         let init_loc_map = &move_data.init_loc_map;
-        debug!(?term);
+        debug!(?terminator);
         debug!("initializes move_indexes {:?}", init_loc_map[location]);
         state.gen_all(
             init_loc_map[location]

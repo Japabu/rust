@@ -226,13 +226,11 @@ pub const trait Iterator {
         Self: Sized + [const] Destruct,
         Self::Item: [const] Destruct,
     {
-        // FIXME(const-hack): revert this to a const closure
-        #[rustc_const_unstable(feature = "const_iter", issue = "92476")]
-        #[rustc_inherit_overflow_checks]
-        const fn plus_one<T: [const] Destruct>(accum: usize, _elem: T) -> usize {
-            accum + 1
-        }
-        self.fold(0, plus_one)
+        self.fold(
+            0,
+            #[rustc_inherit_overflow_checks]
+            const |accum, _elem| accum + 1,
+        )
     }
 
     /// Consumes the iterator, returning the last element.
@@ -1653,14 +1651,7 @@ pub const trait Iterator {
     ///
     /// # Panics
     ///
-    /// Panics if `N` is zero. This check will most probably get changed to a
-    /// compile time error before this method gets stabilized.
-    ///
-    /// ```should_panic
-    /// #![feature(iter_map_windows)]
-    ///
-    /// let iter = std::iter::repeat(0).map_windows(|&[]| ());
-    /// ```
+    /// Panics if `N` is zero.
     ///
     /// # Examples
     ///
@@ -1770,7 +1761,10 @@ pub const trait Iterator {
     /// ```
     #[inline]
     #[unstable(feature = "iter_map_windows", issue = "87155")]
-    fn map_windows<F, R, const N: usize>(self, f: F) -> MapWindows<Self, F, N>
+    fn map_windows<F, R, #[rustc_panics_when_zero] const N: usize>(
+        self,
+        f: F,
+    ) -> MapWindows<Self, F, N>
     where
         Self: Sized,
         F: FnMut(&[Self::Item; N]) -> R,
@@ -3632,7 +3626,7 @@ pub const trait Iterator {
     /// ```
     #[track_caller]
     #[unstable(feature = "iter_array_chunks", issue = "100450")]
-    fn array_chunks<const N: usize>(self) -> ArrayChunks<Self, N>
+    fn array_chunks<#[rustc_panics_when_zero] const N: usize>(self) -> ArrayChunks<Self, N>
     where
         Self: Sized,
     {
@@ -3676,7 +3670,7 @@ pub const trait Iterator {
         Sum::sum(self)
     }
 
-    /// Iterates over the entire iterator, multiplying all the elements
+    /// Iterates over the entire iterator, multiplying all the elements.
     ///
     /// An empty iterator returns the one value of the type.
     ///

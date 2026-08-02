@@ -1,4 +1,4 @@
-use hir_def::{GenericDefId, HasModule, signatures::FunctionSignature};
+use hir_def::{HasModule, signatures::FunctionSignature};
 use hir_expand::EditionedFileId;
 use span::Edition;
 use syntax::{TextRange, TextSize};
@@ -15,7 +15,7 @@ use crate::{
 
 use super::{MirEvalError, interpret_mir};
 
-fn eval_main(db: &TestDB, file_id: EditionedFileId) -> Result<(String, String), MirEvalError> {
+fn eval_main(db: &TestDB, file_id: EditionedFileId) -> Result<(String, String), MirEvalError<'_>> {
     crate::attach_db(db, || {
         let interner = DbInterner::new_no_crate(db);
         let module_id = db.module_for_file(file_id.file_id(db));
@@ -41,7 +41,7 @@ fn eval_main(db: &TestDB, file_id: EditionedFileId) -> Result<(String, String), 
                 func_id.into(),
                 GenericArgs::empty(interner).store(),
                 crate::ParamEnvAndCrate {
-                    param_env: db.trait_environment(GenericDefId::from(func_id).into()),
+                    param_env: db.trait_environment(func_id.into()),
                     krate: func_id.krate(db),
                 }
                 .store(),
@@ -123,7 +123,7 @@ fn check_panic(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected_panic: 
 
 fn check_error_with(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
-    expect_err: impl FnOnce(MirEvalError) -> bool,
+    expect_err: impl FnOnce(MirEvalError<'_>) -> bool,
 ) {
     let (db, file_ids) = TestDB::with_many_files(ra_fixture);
     crate::attach_db(&db, || {
@@ -224,6 +224,28 @@ fn main() {
     if s != 15 {
         should_not_reach();
     }
+}
+    "#,
+    );
+}
+
+#[test]
+fn drop_glue_for_type_without_drop_impl_does_not_recurse() {
+    check_pass(
+        r#"
+//- minicore: drop, pin
+
+struct HasDrop;
+impl Drop for HasDrop {
+    fn drop(&mut self) {}
+}
+
+struct WithDropGlue {
+    field: HasDrop,
+}
+
+fn main() {
+    let _c = WithDropGlue { field: HasDrop };
 }
     "#,
     );
@@ -355,6 +377,35 @@ fn main() {
     drop_in_place(p);
 }
     "#,
+    );
+}
+
+#[test]
+fn drop_glue_for_trait_object() {
+    check_panic(
+        r#"
+//- minicore: manually_drop, coerce_unsized, fmt, panic, drop, pin
+use core::mem::ManuallyDrop;
+use core::ptr::drop_in_place;
+
+struct X;
+impl Drop for X {
+    fn drop(&mut self) {
+        panic!("concrete drop ran");
+    }
+}
+
+trait T {}
+impl T for X {}
+
+fn main() {
+    let mut x = ManuallyDrop::new(X);
+    let p = &mut x as *mut ManuallyDrop<X> as *mut X;
+    let obj: &mut dyn T = unsafe { &mut *p };
+    drop_in_place(obj);
+}
+    "#,
+        "concrete drop ran",
     );
 }
 
@@ -1029,6 +1080,75 @@ fn main() {
     let x1 = format_args!("");
     let x2 = format_args!("{}", x1);
     let x3 = format_args!("{} {}", x1, x2);
+}
+"#,
+    );
+}
+
+#[test]
+fn fabs_intrinsic() {
+    check_pass(
+        r#"
+//- minicore: copy, panic
+pub unsafe trait FloatPrimitive: Sized + Copy {}
+unsafe impl FloatPrimitive for f32 {}
+unsafe impl FloatPrimitive for f64 {}
+
+#[rustc_intrinsic]
+fn fabs<T: FloatPrimitive>(x: T) -> T;
+
+fn should_not_reach() { panic!() }
+
+fn main() {
+    if fabs(-3.5f32) != 3.5f32 {
+        should_not_reach();
+    }
+    if fabs(3.5f32) != 3.5f32 {
+        should_not_reach();
+    }
+    if fabs(-3.5f64) != 3.5f64 {
+        should_not_reach();
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn unreachable_intrinsic() {
+    check_error_with(
+        r#"
+#[rustc_intrinsic]
+fn unreachable() -> !;
+
+fn main() {
+    unreachable();
+}
+"#,
+        |e| {
+            let mut err = &e;
+            while let MirEvalError::InFunction(inner, _) = err {
+                err = inner;
+            }
+            matches!(err, MirEvalError::UndefinedBehavior(_))
+        },
+    );
+}
+
+#[test]
+fn caller_location_intrinsic() {
+    check_pass(
+        r#"
+//- minicore: panic_location
+fn should_not_reach() {
+    panic!()
+}
+
+fn main() {
+    let loc = core::panic::Location::caller();
+    if loc.line() != 1 || loc.column() != 1 {
+        should_not_reach();
+    }
 }
 "#,
     );

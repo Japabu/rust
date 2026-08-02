@@ -14,6 +14,7 @@ use rustc_mir_dataflow::{
 use rustc_span::Span;
 use tracing::{debug, instrument};
 
+use crate::PassPolicy;
 use crate::elaborate_drop::{DropElaborator, DropFlagMode, DropStyle, Unwind, elaborate_drop};
 use crate::patch::MirPatch;
 
@@ -68,7 +69,6 @@ impl<'tcx> crate::MirPass<'tcx> for ElaborateDrops {
             let dead_unwinds = compute_dead_unwinds(body, &mut inits);
 
             let uninits = MaybeUninitializedPlaces::new(tcx, body, &env.move_data)
-                .include_inactive_in_otherwise()
                 .mark_inactive_variants_as_uninit()
                 .skipping_unreachable_unwind(dead_unwinds)
                 .iterate_to_fixpoint(tcx, body, Some("elaborate_drops"))
@@ -88,8 +88,9 @@ impl<'tcx> crate::MirPass<'tcx> for ElaborateDrops {
         elaborate_patch.apply(body);
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _sess: &rustc_session::Session) -> PassPolicy {
+        // Implements MIR drop semantics.
+        PassPolicy::Required
     }
 }
 
@@ -160,10 +161,6 @@ impl<'a, 'tcx> DropElaborator<'a, 'tcx> for ElaborateDropsCtxt<'a, 'tcx> {
 
     fn allow_async_drops(&self) -> bool {
         true
-    }
-
-    fn terminator_loc(&self, bb: BasicBlock) -> Location {
-        self.patch.terminator_loc(self.body, bb)
     }
 
     #[instrument(level = "debug", skip(self), ret)]
@@ -336,8 +333,7 @@ impl<'a, 'tcx> ElaborateDropsCtxt<'a, 'tcx> {
         // This function should mirror what `collect_drop_flags` does.
         for (bb, data) in self.body.basic_blocks.iter_enumerated() {
             let terminator = data.terminator();
-            let TerminatorKind::Drop { place, target, unwind, replace, drop, async_fut: _ } =
-                terminator.kind
+            let TerminatorKind::Drop { place, target, unwind, replace, drop } = terminator.kind
             else {
                 continue;
             };
@@ -403,11 +399,14 @@ impl<'a, 'tcx> ElaborateDropsCtxt<'a, 'tcx> {
     }
 
     fn constant_bool(&self, span: Span, val: bool) -> Rvalue<'tcx> {
-        Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
-            span,
-            user_ty: None,
-            const_: Const::from_bool(self.tcx, val),
-        })))
+        Rvalue::Use(
+            Operand::Constant(Box::new(ConstOperand {
+                span,
+                user_ty: None,
+                const_: Const::from_bool(self.tcx, val),
+            })),
+            WithRetag::Yes,
+        )
     }
 
     fn set_drop_flag(&mut self, loc: Location, path: MovePathIndex, val: DropFlagState) {

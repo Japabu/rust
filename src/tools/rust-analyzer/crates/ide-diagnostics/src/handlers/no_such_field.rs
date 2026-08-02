@@ -1,7 +1,9 @@
 use either::Either;
-use hir::{HasSource, HirDisplay, Semantics, VariantId, db::ExpandDatabase};
+use hir::{HasSource, HirDisplay, InFile, Semantics, VariantId};
 use ide_db::text_edit::TextEdit;
-use ide_db::{EditionedFileId, RootDatabase, source_change::SourceChange};
+use ide_db::{
+    EditionedFileId, RootDatabase, helpers::is_editable_crate, source_change::SourceChange,
+};
 use syntax::{
     AstNode,
     ast::{self, edit::IndentLevel, make},
@@ -15,7 +17,7 @@ use crate::{
 // Diagnostic: no-such-field
 //
 // This diagnostic is triggered if created structure does not have field provided in record.
-pub(crate) fn no_such_field(ctx: &DiagnosticsContext<'_>, d: &hir::NoSuchField) -> Diagnostic {
+pub(crate) fn no_such_field(ctx: &DiagnosticsContext<'_, '_>, d: &hir::NoSuchField) -> Diagnostic {
     let (code, message) = if d.private.is_some() {
         ("E0451", "field is private")
     } else if let VariantId::EnumVariantId(_) = d.variant {
@@ -30,9 +32,9 @@ pub(crate) fn no_such_field(ctx: &DiagnosticsContext<'_>, d: &hir::NoSuchField) 
         .with_fixes(fixes(ctx, d))
 }
 
-fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::NoSuchField) -> Option<Vec<Assist>> {
+fn fixes(ctx: &DiagnosticsContext<'_, '_>, d: &hir::NoSuchField) -> Option<Vec<Assist>> {
     // FIXME: quickfix for pattern
-    let root = ctx.sema.db.parse_or_expand(d.field.file_id);
+    let root = d.field.file_id.parse_or_expand(ctx.sema.db);
     match &d.field.value.to_node(&root) {
         Either::Left(node) => {
             if let Some(private_field) = d.private {
@@ -85,7 +87,10 @@ fn missing_record_expr_field_fixes(
             record_field_list(fields)?
         }
     };
-    let def_file_id = def_file_id.original_file(sema.db);
+
+    if !is_editable_crate(module.krate(sema.db), sema.db) {
+        return None;
+    }
 
     let new_field_type = sema.type_of_expr(&record_expr_field.expr()?)?.adjusted();
     if new_field_type.is_unknown() {
@@ -97,37 +102,35 @@ fn missing_record_expr_field_fixes(
         make::ty(&new_field_type.display_source_code(sema.db, module.into(), true).ok()?),
     );
 
-    let (indent, offset, postfix, needs_comma) =
-        if let Some(last_field) = record_fields.fields().last() {
-            let indent = IndentLevel::from_node(last_field.syntax());
-            let offset = last_field.syntax().text_range().end();
-            let needs_comma = !last_field.to_string().ends_with(',');
-            (indent, offset, String::new(), needs_comma)
-        } else {
-            let indent = IndentLevel::from_node(record_fields.syntax());
-            let offset = record_fields.l_curly_token()?.text_range().end();
-            let postfix = if record_fields.syntax().text().contains_char('\n') {
-                ",".into()
-            } else {
-                format!(",\n{indent}")
-            };
-            (indent + 1, offset, postfix, false)
-        };
+    let after = if let Some(last_field) = record_fields.fields().last() {
+        last_field.syntax().last_token()?
+    } else {
+        record_fields.l_curly_token()?
+    };
+    let hir::FileRange { file_id, range } =
+        InFile::new(def_file_id, after.text_range()).original_node_file_range_opt(sema.db)?.0;
+    let origin = sema.parse(file_id).syntax().covering_element(range);
+    let indent = IndentLevel::from_element(&origin);
 
-    let mut new_field = new_field.to_string();
+    let (comma, indent, postfix) = match after.kind() {
+        syntax::SyntaxKind::L_CURLY => {
+            let newline = !after.next_token().is_some_and(|it| it.text().contains('\n'));
+            ("", indent + 1, if newline { format!(",\n{indent}") } else { ",".into() })
+        }
+        _ => (",", indent, String::new()),
+    };
+
     // FIXME: check submodule instead of FileId
-    if usage_file_id != def_file_id && !matches!(def_id, hir::Variant::EnumVariant(_)) {
-        new_field = format!("pub(crate) {new_field}");
-    }
-    new_field = format!("\n{indent}{new_field}{postfix}");
-
-    if needs_comma {
-        new_field = format!(",{new_field}");
-    }
+    let vis = if usage_file_id != file_id && !matches!(def_id, hir::Variant::EnumVariant(_)) {
+        "pub(crate) "
+    } else {
+        ""
+    };
+    let new_field = format!("{comma}\n{indent}{vis}{new_field}{postfix}");
 
     let source_change = SourceChange::from_text_edit(
-        def_file_id.file_id(sema.db),
-        TextEdit::insert(offset, new_field),
+        file_id.file_id(sema.db),
+        TextEdit::insert(range.end(), new_field),
     );
 
     return Some(vec![fix(
@@ -446,6 +449,80 @@ fn main() {
         0$0: 0
     }
 }
+"#,
+        )
+    }
+
+    #[test]
+    fn test_add_field_macro_defined_struct() {
+        check_fix(
+            r#"
+macro_rules! identity { ($($t:tt)*) => { $($t)* }; }
+identity! {
+    struct S {
+        a: i32
+    }
+}
+fn f() { let _ = S { a: 1, b$0: false }; }
+"#,
+            r#"
+macro_rules! identity { ($($t:tt)*) => { $($t)* }; }
+identity! {
+    struct S {
+        a: i32,
+        b: bool
+    }
+}
+fn f() { let _ = S { a: 1, b: false }; }
+"#,
+        );
+    }
+
+    #[test]
+    fn test_add_field_macro_defined_struct_large_offset() {
+        // Regression test: we should handle macro definitions whose offset is larger than
+        // the max position in main.rs.
+        check_fix(
+            r#"
+//- /main.rs
+#[macro_use]
+mod m;
+make_items!();
+fn f() { let _ = S { a: 1, bbb$0: 2 }; }
+//- /m.rs
+macro_rules! make_items {
+    () => {
+        pub struct Padding {
+            pub p0: i32, pub p1: i32, pub p2: i32,
+            pub p3: i32, pub p4: i32, pub p5: i32,
+        }
+        pub struct S { pub a: i32 }
+    };
+}
+"#,
+            r#"
+macro_rules! make_items {
+    () => {
+        pub struct Padding {
+            pub p0: i32, pub p1: i32, pub p2: i32,
+            pub p3: i32, pub p4: i32, pub p5: i32,
+        }
+        pub struct S { pub a: i32,
+        pub(crate) bbb: i32 }
+    };
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn no_such_field_no_fix_for_struct_in_library_crate() {
+        check_no_fix(
+            r#"
+//- /lib.rs crate:lib new_source_root:library
+pub struct S { pub a: i32 }
+//- /main.rs crate:main deps:lib new_source_root:local
+fn f() { let _ = lib::S { a: 1, b$0: false }; }
 "#,
         )
     }

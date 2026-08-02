@@ -10,7 +10,6 @@
 //! This test can't cover every lint from Clippy, rustdoc and potentially other
 //! tools that will be developed. This therefore only tests a small subset of lints
 #![expect(rustdoc::missing_crate_level_docs)]
-#![allow(clippy::needless_ifs)]
 
 mod rustc_ok {
     //! See <https://doc.rust-lang.org/rustc/lints/index.html>
@@ -36,6 +35,8 @@ mod rustc_warn {
 
         #[expect(invalid_nan_comparisons)]
         //~^ ERROR: this lint expectation is unfulfilled
+        //~| NOTE: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+        //~| ERROR: this lint expectation is unfulfilled
         let _b = x == 5;
     }
 }

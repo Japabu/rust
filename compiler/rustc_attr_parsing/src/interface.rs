@@ -1,39 +1,55 @@
+//! API for other crates to parse attributes themselves.
 use std::convert::identity;
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustc_ast as ast;
 use rustc_ast::token::DocFragmentKind;
-use rustc_ast::{AttrItemKind, AttrStyle, NodeId, Safety};
-use rustc_data_structures::fx::FxIndexSet;
-use rustc_errors::DiagCtxtHandle;
-use rustc_feature::{AttributeTemplate, Features};
+use rustc_ast::{AttrStyle, CRATE_NODE_ID, NodeId, Safety};
+use rustc_data_structures::sync::{DynSend, DynSync};
+use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, Level, MultiSpan};
+use rustc_feature::{BUILTIN_ATTRIBUTE_MAP, Features};
 use rustc_hir::attrs::AttributeKind;
-use rustc_hir::lints::AttributeLintKind;
 use rustc_hir::{AttrArgs, AttrItem, AttrPath, Attribute, HashIgnoredAttrId, Target};
+use rustc_lint_defs::RegisteredTools;
 use rustc_session::Session;
 use rustc_session::lint::LintId;
-use rustc_span::{DUMMY_SP, Ident, Span, Symbol, sym};
+use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span, Symbol, sym};
 
-use crate::context::{AcceptContext, FinalizeContext, FinalizeFn, SharedContext, Stage};
-use crate::early_parsed::{EARLY_PARSED_ATTRIBUTES, EarlyParsedState};
+use crate::attributes::AttributeSafety;
+use crate::context::{
+    ATTRIBUTE_PARSERS, AcceptContext, FinalizeCheckContext, FinalizeCheckFn, FinalizeContext,
+    FinalizeFn, FinalizeOutput, SharedContext,
+};
 use crate::parser::{AllowExprMetavar, ArgParser, PathParser, RefPathParser};
 use crate::session_diagnostics::ParsedDescription;
-use crate::{Early, Late, OmitDoc, ShouldEmit};
+use crate::synthetic::SyntheticAttrState;
+use crate::{AttributeTemplate, OmitDoc, ShouldEmit};
+
+pub struct EmitAttribute(
+    pub  Box<
+        dyn for<'a> FnOnce(DiagCtxtHandle<'a>, Level, &Session) -> Diag<'a, ()>
+            + DynSend
+            + DynSync
+            + 'static,
+    >,
+);
 
 /// Context created once, for example as part of the ast lowering
 /// context, through which all attributes can be lowered.
-pub struct AttributeParser<'sess, S: Stage = Late> {
-    pub(crate) tools: Option<&'sess FxIndexSet<Ident>>,
+pub struct AttributeParser<'sess> {
+    pub(crate) attr_tools: Option<&'sess RegisteredTools>,
     pub(crate) features: Option<&'sess Features>,
     pub(crate) sess: &'sess Session,
-    pub(crate) stage: S,
+    pub(crate) should_emit: ShouldEmit,
 
-    /// *Only* parse attributes with this symbol.
+    /// *Only* parse attributes that passes this filter.
     ///
-    /// Used in cases where we want the lowering infrastructure for parse just a single attribute.
-    parse_only: Option<Symbol>,
+    /// Used in cases where we want the lowering infrastructure for parse just limited attributes.
+    parse_filter: Option<&'sess dyn Fn(&ast::Attribute) -> bool>,
 }
 
-impl<'sess> AttributeParser<'sess, Early> {
+impl<'sess> AttributeParser<'sess> {
     /// This method allows you to parse attributes *before* you have access to features or tools.
     /// One example where this is necessary, is to parse `feature` attributes themselves for
     /// example.
@@ -42,55 +58,59 @@ impl<'sess> AttributeParser<'sess, Early> {
     /// `rustc_ast_lowering`. Some attributes require access to features to parse, which would
     /// crash if you tried to do so through [`parse_limited`](Self::parse_limited).
     ///
-    /// To make sure use is limited, supply a `Symbol` you'd like to parse. Only attributes with
-    /// that symbol are picked out of the list of instructions and parsed. Those are returned.
+    /// To make sure use is limited, supply a filter. Only attributes that passes the filter are
+    /// picked out of the list of instructions and parsed. Those are returned.
     ///
     /// No diagnostics will be emitted when parsing limited. Lints are not emitted at all, while
     /// errors will be emitted as a delayed bugs. in other words, we *expect* attributes parsed
     /// with `parse_limited` to be reparsed later during ast lowering where we *do* emit the errors
     ///
-    /// Due to this function not taking in RegisteredTools (`FxIndexSet<Ident>`), *do not* use this for parsing any lint attributes
+    /// Due to this function not taking in `RegisteredTools`, *do not* use this for parsing any lint attributes
     pub fn parse_limited(
         sess: &'sess Session,
         attrs: &[ast::Attribute],
-        sym: Symbol,
-        target_span: Span,
-        target_node_id: NodeId,
-        features: Option<&'sess Features>,
+        parse_filter: &dyn Fn(&ast::Attribute) -> bool,
     ) -> Option<Attribute> {
         Self::parse_limited_should_emit(
             sess,
             attrs,
-            sym,
-            target_span,
-            target_node_id,
-            Target::Crate, // Does not matter, we're not going to emit errors anyways
-            features,
+            parse_filter,
+            // Because we're not emitting warnings/errors, the target should not matter
+            DUMMY_SP,
+            None,
             ShouldEmit::Nothing,
         )
+    }
+
+    /// This does the same as `parse_limited`, except that it takes a fixed symbol instead of a
+    /// filter.
+    pub fn parse_limited_sym(
+        sess: &'sess Session,
+        attrs: &[ast::Attribute],
+        sym: &'static [Symbol],
+    ) -> Option<Attribute> {
+        Self::parse_limited(sess, attrs, &|attr| attr.path_matches(sym))
     }
 
     /// This does the same as `parse_limited`, except it has a `should_emit` parameter which allows it to emit errors.
     /// Usually you want `parse_limited`, which emits no errors.
     ///
-    /// Due to this function not taking in RegisteredTools (`FxIndexSet<Ident>`), *do not* use this for parsing any lint attributes
+    /// Due to this function not taking in `RegisteredTools`, *do not* use this for parsing any lint attributes
     pub fn parse_limited_should_emit(
         sess: &'sess Session,
         attrs: &[ast::Attribute],
-        sym: Symbol,
+        parse_filter: &dyn Fn(&ast::Attribute) -> bool,
         target_span: Span,
-        target_node_id: NodeId,
-        target: Target,
         features: Option<&'sess Features>,
         should_emit: ShouldEmit,
     ) -> Option<Attribute> {
         let mut parsed = Self::parse_limited_all(
             sess,
             attrs,
-            Some(sym),
-            target,
+            Some(parse_filter),
+            Target::Crate,
             target_span,
-            target_node_id,
+            CRATE_NODE_ID,
             features,
             should_emit,
             None,
@@ -99,58 +119,54 @@ impl<'sess> AttributeParser<'sess, Early> {
         parsed.pop()
     }
 
+    /// This does the same as `parse_limited_should_emit`, except that it takes a fixed symbol
+    /// instead of a filter.
+    pub fn parse_limited_sym_should_emit(
+        sess: &'sess Session,
+        attrs: &[ast::Attribute],
+        sym: &'static [Symbol],
+        target_span: Span,
+        features: Option<&'sess Features>,
+        should_emit: ShouldEmit,
+    ) -> Option<Attribute> {
+        Self::parse_limited_should_emit(
+            sess,
+            attrs,
+            &|attr| attr.path_matches(sym),
+            target_span,
+            features,
+            should_emit,
+        )
+    }
+
     /// This method allows you to parse a list of attributes *before* `rustc_ast_lowering`.
     /// This can be used for attributes that would be removed before `rustc_ast_lowering`, such as attributes on macro calls.
     ///
     /// Try to use this as little as possible. Attributes *should* be lowered during
     /// `rustc_ast_lowering`. Some attributes require access to features to parse, which would
     /// crash if you tried to do so through [`parse_limited_all`](Self::parse_limited_all).
-    /// Therefore, if `parse_only` is None, then features *must* be provided.
-    pub fn parse_limited_all<'a>(
+    /// Therefore, if `parse_filter` is None, then features *must* be provided.
+    pub fn parse_limited_all(
         sess: &'sess Session,
-        attrs: impl IntoIterator<Item = &'a ast::Attribute>,
-        parse_only: Option<Symbol>,
+        attrs: &[ast::Attribute],
+        parse_filter: Option<&dyn Fn(&ast::Attribute) -> bool>,
         target: Target,
         target_span: Span,
         target_node_id: NodeId,
         features: Option<&'sess Features>,
-        emit_errors: ShouldEmit,
-        tools: Option<&'sess FxIndexSet<Ident>>,
+        should_emit: ShouldEmit,
+        attr_tools: Option<&'sess RegisteredTools>,
     ) -> Vec<Attribute> {
-        let mut p = Self { features, tools, parse_only, sess, stage: Early { emit_errors } };
+        let mut p = AttributeParser { features, attr_tools, parse_filter, sess, should_emit };
         p.parse_attribute_list(
             attrs,
             target_span,
             target,
             OmitDoc::Skip,
             std::convert::identity,
-            |lint_id, span, kind| sess.psess.buffer_lint(lint_id.lint, span, target_node_id, kind),
-        )
-    }
-
-    /// This method provides the same functionality as [`parse_limited_all`](Self::parse_limited_all) except filtered,
-    /// making sure that only allow-listed symbols are parsed
-    pub fn parse_limited_all_filtered<'a>(
-        sess: &'sess Session,
-        attrs: impl IntoIterator<Item = &'a ast::Attribute>,
-        filter: &[Symbol],
-        target: Target,
-        target_span: Span,
-        target_node_id: NodeId,
-        features: Option<&'sess Features>,
-        emit_errors: ShouldEmit,
-        tools: &'sess FxIndexSet<Ident>,
-    ) -> Vec<Attribute> {
-        Self::parse_limited_all(
-            sess,
-            attrs.into_iter().filter(|attr| attr.has_any_name(filter)),
-            None,
-            target,
-            target_span,
-            target_node_id,
-            features,
-            emit_errors,
-            Some(tools),
+            |lint_id, span, kind| {
+                sess.psess.dyn_buffer_lint_sess(lint_id.lint, span, target_node_id, kind.0)
+            },
         )
     }
 
@@ -164,19 +180,17 @@ impl<'sess> AttributeParser<'sess, Early> {
         target: Target,
         features: Option<&'sess Features>,
         emit_errors: ShouldEmit,
-        parse_fn: fn(cx: &mut AcceptContext<'_, '_, Early>, item: &ArgParser) -> Option<T>,
+        parse_fn: fn(cx: &mut AcceptContext<'_, '_>, item: &ArgParser) -> Option<T>,
         template: &AttributeTemplate,
         allow_expr_metavar: AllowExprMetavar,
+        expected_safety: AttributeSafety,
     ) -> Option<T> {
-        let ast::AttrKind::Normal(normal_attr) = &attr.kind else {
-            panic!("parse_single called on a doc attr")
-        };
-        let parts =
-            normal_attr.item.path.segments.iter().map(|seg| seg.ident.name).collect::<Vec<_>>();
+        let attr_item = attr.get_normal_item();
+        let parts = attr_item.path.segments.iter().map(|seg| seg.ident.name).collect::<Vec<_>>();
 
-        let path = AttrPath::from_ast(&normal_attr.item.path, identity);
+        let path = AttrPath::from_ast(&attr_item.path, identity);
         let args = ArgParser::from_attr_args(
-            &normal_attr.item.args.unparsed_ref().unwrap(),
+            &attr_item.args,
             &parts,
             &sess.psess,
             emit_errors,
@@ -185,10 +199,11 @@ impl<'sess> AttributeParser<'sess, Early> {
         Self::parse_single_args(
             sess,
             attr.span,
-            normal_attr.item.span(),
+            attr_item.span,
             attr.style,
             path,
-            Some(normal_attr.item.unsafety),
+            Some(attr_item.unsafety),
+            expected_safety,
             ParsedDescription::Attribute,
             target_span,
             target_node_id,
@@ -210,56 +225,71 @@ impl<'sess> AttributeParser<'sess, Early> {
         attr_style: AttrStyle,
         attr_path: AttrPath,
         attr_safety: Option<Safety>,
+        expected_safety: AttributeSafety,
         parsed_description: ParsedDescription,
         target_span: Span,
         target_node_id: NodeId,
         target: Target,
         features: Option<&'sess Features>,
-        emit_errors: ShouldEmit,
+        should_emit: ShouldEmit,
         args: &I,
-        parse_fn: fn(cx: &mut AcceptContext<'_, '_, Early>, item: &I) -> T,
+        parse_fn: fn(cx: &mut AcceptContext<'_, '_>, item: &I) -> T,
         template: &AttributeTemplate,
     ) -> T {
-        let mut parser =
-            Self { features, tools: None, parse_only: None, sess, stage: Early { emit_errors } };
-        let mut emit_lint = |lint_id: LintId, span: Span, kind: AttributeLintKind| {
-            sess.psess.buffer_lint(lint_id.lint, span, target_node_id, kind)
+        let mut parser = Self { features, attr_tools: None, parse_filter: None, sess, should_emit };
+        let mut emit_lint = |lint_id: LintId, span: MultiSpan, kind: EmitAttribute| {
+            sess.psess.dyn_buffer_lint_sess(lint_id.lint, span, target_node_id, kind.0)
         };
         if let Some(safety) = attr_safety {
-            parser.check_attribute_safety(&attr_path, inner_span, safety, &mut emit_lint)
+            parser.check_attribute_safety(
+                &attr_path,
+                inner_span,
+                safety,
+                expected_safety,
+                &mut emit_lint,
+            );
         }
-        let attr_id = sess.psess.attr_id_generator.mk_attr_id();
-        let mut cx: AcceptContext<'_, 'sess, Early> = AcceptContext {
+        let mut cx: AcceptContext<'_, 'sess> = AcceptContext {
             shared: SharedContext {
                 cx: &mut parser,
                 target_span,
                 target,
                 emit_lint: &mut emit_lint,
+                #[cfg(debug_assertions)]
+                has_lint_been_emitted: AtomicBool::new(false),
             },
             attr_span,
             inner_span,
             attr_style,
             parsed_description,
             template,
+            attr_safety: attr_safety.unwrap_or(Safety::Default),
             attr_path,
-            attr_id,
+            #[cfg(debug_assertions)]
+            has_target_been_checked: false,
         };
         parse_fn(&mut cx, args)
     }
 }
 
-impl<'sess, S: Stage> AttributeParser<'sess, S> {
+impl<'sess> AttributeParser<'sess> {
     pub fn new(
         sess: &'sess Session,
         features: &'sess Features,
-        tools: &'sess FxIndexSet<Ident>,
-        stage: S,
+        attr_tools: &'sess RegisteredTools,
+        should_emit: ShouldEmit,
     ) -> Self {
-        Self { features: Some(features), tools: Some(tools), parse_only: None, sess, stage }
+        Self {
+            features: Some(features),
+            attr_tools: Some(attr_tools),
+            parse_filter: None,
+            sess,
+            should_emit,
+        }
     }
 
     pub(crate) fn sess(&self) -> &'sess Session {
-        &self.sess
+        self.sess
     }
 
     pub(crate) fn features(&self) -> &'sess Features {
@@ -274,34 +304,33 @@ impl<'sess, S: Stage> AttributeParser<'sess, S> {
         self.sess().dcx()
     }
 
+    pub(crate) fn emit_err(&self, diag: impl for<'x> Diagnostic<'x>) -> ErrorGuaranteed {
+        self.should_emit.emit_err(self.sess.dcx().create_err(diag))
+    }
+
     /// Parse a list of attributes.
     ///
     /// `target_span` is the span of the thing this list of attributes is applied to,
     /// and when `omit_doc` is set, doc attributes are filtered out.
-    pub fn parse_attribute_list<'a>(
+    pub fn parse_attribute_list(
         &mut self,
-        attrs: impl IntoIterator<Item = &'a ast::Attribute>,
+        attrs: &[ast::Attribute],
         target_span: Span,
         target: Target,
         omit_doc: OmitDoc,
         lower_span: impl Copy + Fn(Span) -> Span,
-        mut emit_lint: impl FnMut(LintId, Span, AttributeLintKind),
+        mut emit_lint: impl FnMut(LintId, MultiSpan, EmitAttribute),
     ) -> Vec<Attribute> {
         let mut attributes = Vec::new();
-        // We store the attributes we intend to discard at the end of this function in order to
-        // check they are applied to the right target and error out if necessary. In practice, we
-        // end up dropping only derive attributes and derive helpers, both being fully processed
-        // at macro expansion.
-        let mut dropped_attributes = Vec::new();
         let mut attr_paths: Vec<RefPathParser<'_>> = Vec::new();
-        let mut early_parsed_state = EarlyParsedState::default();
+        let mut synthetic_attr_state = SyntheticAttrState::default();
 
-        let mut finalizers: Vec<&FinalizeFn<S>> = Vec::new();
+        let mut finalizers: Vec<FinalizeFn> = Vec::with_capacity(attrs.len());
 
-        for attr in attrs.into_iter() {
+        for attr in attrs {
             // If we're only looking for a single attribute, skip all the ones we don't care about.
-            if let Some(expected) = self.parse_only {
-                if !attr.has_name(expected) {
+            if let Some(filter) = self.parse_filter {
+                if !filter(attr) {
                     continue;
                 }
             }
@@ -330,35 +359,34 @@ impl<'sess, S: Stage> AttributeParser<'sess, S> {
                         comment: *symbol,
                     }));
                 }
+                ast::AttrKind::Synthetic(synthetic) => {
+                    synthetic_attr_state.accept_synthetic_attr(attr_span, lower_span, synthetic);
+                }
                 ast::AttrKind::Normal(n) => {
                     attr_paths.push(PathParser(&n.item.path));
                     let attr_path = AttrPath::from_ast(&n.item.path, lower_span);
-
-                    let args = match &n.item.args {
-                        AttrItemKind::Unparsed(args) => args,
-                        AttrItemKind::Parsed(parsed) => {
-                            early_parsed_state
-                                .accept_early_parsed_attribute(attr_span, lower_span, parsed);
-                            continue;
-                        }
-                    };
-
-                    self.check_attribute_safety(
-                        &attr_path,
-                        lower_span(n.item.span()),
-                        n.item.unsafety,
-                        &mut emit_lint,
-                    );
-
                     let parts =
                         n.item.path.segments.iter().map(|seg| seg.ident.name).collect::<Vec<_>>();
+                    let inner_span = lower_span(n.item.span);
 
-                    if let Some(accept) = S::parsers().accepters.get(parts.as_slice()) {
+                    if let Some(accept) = ATTRIBUTE_PARSERS.accepters.get(parts.as_slice()) {
+                        self.check_attribute_safety(
+                            &attr_path,
+                            inner_span,
+                            n.item.unsafety,
+                            accept.safety,
+                            &mut emit_lint,
+                        );
+                        self.check_attribute_stability(&attr_path, attr_span, accept.stability);
+                        if let [part] = parts.as_slice() {
+                            debug_assert!(BUILTIN_ATTRIBUTE_MAP.contains(part));
+                        }
+
                         let Some(args) = ArgParser::from_attr_args(
-                            args,
+                            &n.item.args,
                             &parts,
                             &self.sess.psess,
-                            self.stage.should_emit(),
+                            self.should_emit,
                             AllowExprMetavar::No,
                         ) else {
                             continue;
@@ -395,76 +423,135 @@ impl<'sess, S: Stage> AttributeParser<'sess, S> {
                             continue;
                         }
 
-                        let mut cx: AcceptContext<'_, 'sess, S> = AcceptContext {
+                        let mut cx: AcceptContext<'_, 'sess> = AcceptContext {
                             shared: SharedContext {
                                 cx: self,
                                 target_span,
                                 target,
                                 emit_lint: &mut emit_lint,
+                                #[cfg(debug_assertions)]
+                                has_lint_been_emitted: AtomicBool::new(false),
                             },
                             attr_span,
-                            inner_span: lower_span(n.item.span()),
+                            inner_span,
                             attr_style: attr.style,
                             parsed_description: ParsedDescription::Attribute,
                             template: &accept.template,
+                            attr_safety: n.item.unsafety,
                             attr_path: attr_path.clone(),
-                            attr_id: attr.id,
+                            #[cfg(debug_assertions)]
+                            has_target_been_checked: false,
                         };
 
                         (accept.accept_fn)(&mut cx, &args);
-                        finalizers.push(&accept.finalizer);
+                        finalizers.push(accept.finalizer);
 
-                        if !matches!(cx.stage.should_emit(), ShouldEmit::Nothing) {
-                            Self::check_target(&accept.allowed_targets, target, &mut cx);
+                        Self::check_target(&accept.allowed_targets, "", &mut cx);
+                        #[cfg(debug_assertions)]
+                        if !cx.shared.has_lint_been_emitted.load(Ordering::Relaxed) {
+                            cx.shared.cx.check_args_used(attr, &args)
                         }
                     } else {
                         let attr = AttrItem {
                             path: attr_path.clone(),
-                            args: self
-                                .lower_attr_args(n.item.args.unparsed_ref().unwrap(), lower_span),
+                            args: self.lower_attr_args(&n.item.args, lower_span),
                             id: HashIgnoredAttrId { attr_id: attr.id },
                             style: attr.style,
                             span: attr_span,
                         };
 
-                        if !matches!(self.stage.should_emit(), ShouldEmit::Nothing)
+                        self.check_attribute_safety(
+                            &attr_path,
+                            inner_span,
+                            n.item.unsafety,
+                            AttributeSafety::Normal,
+                            &mut emit_lint,
+                        );
+
+                        if !matches!(self.should_emit, ShouldEmit::Nothing)
                             && target == Target::Crate
                         {
-                            self.check_invalid_crate_level_attr_item(&attr, n.item.span());
+                            self.check_invalid_crate_level_attr_item(&attr, inner_span);
                         }
 
-                        let attr = Attribute::Unparsed(Box::new(attr));
-
-                        if self
-                            .tools
-                            .is_some_and(|tools| tools.iter().any(|tool| tool.name == parts[0]))
-                        {
-                            attributes.push(attr);
-                        } else {
-                            dropped_attributes.push(attr);
-                        }
-                    }
+                        attributes.push(Attribute::Unparsed(Box::new(attr)));
+                    };
                 }
             }
         }
 
-        early_parsed_state.finalize_early_parsed_attributes(&mut attributes);
+        synthetic_attr_state.finalize_synthetic_attrs(&mut attributes);
+
+        // First, run all finalizers to produce the parsed attributes. Cross-attribute
+        // checks that need to inspect the fully parsed attributes are deferred until all
+        // finalizers have run (see below), since the parsed attributes are not yet all
+        // available here.
+        let mut deferred_checks: Vec<(FinalizeCheckFn, Span)> = Vec::new();
         for f in &finalizers {
-            if let Some(attr) = f(&mut FinalizeContext {
-                shared: SharedContext { cx: self, target_span, target, emit_lint: &mut emit_lint },
+            let FinalizeOutput { attr, deferred_check } = f(&mut FinalizeContext {
+                shared: SharedContext {
+                    cx: self,
+                    target_span,
+                    target,
+                    emit_lint: &mut emit_lint,
+                    #[cfg(debug_assertions)]
+                    has_lint_been_emitted: AtomicBool::new(false),
+                },
                 all_attrs: &attr_paths,
-            }) {
+            });
+            if let Some(attr) = attr {
                 attributes.push(Attribute::Parsed(attr));
+            }
+            if let Some(deferred_check) = deferred_check {
+                deferred_checks.push(deferred_check);
             }
         }
 
-        if !matches!(self.stage.should_emit(), ShouldEmit::Nothing)
-            && target == Target::WherePredicate
-        {
-            self.check_invalid_where_predicate_attrs(attributes.iter().chain(&dropped_attributes));
+        // Now that all attributes have been parsed, run the deferred checks. These can
+        // inspect the fully parsed attributes via `FinalizeCheckContext::parsed_attrs`.
+        for (check, attr_span) in deferred_checks {
+            check(
+                &FinalizeCheckContext {
+                    shared: SharedContext {
+                        cx: self,
+                        target_span,
+                        target,
+                        emit_lint: &mut emit_lint,
+                        #[cfg(debug_assertions)]
+                        has_lint_been_emitted: AtomicBool::new(false),
+                    },
+                    all_attrs: &attr_paths,
+                    parsed_attrs: &attributes,
+                },
+                attr_span,
+            );
+        }
+
+        if !matches!(self.should_emit, ShouldEmit::Nothing) && target == Target::WherePredicate {
+            self.check_invalid_where_predicate_attrs(attributes.iter());
         }
 
         attributes
+    }
+
+    #[cfg(debug_assertions)]
+    /// Checks whether all `ArgParser`s were observed by an attribute parser at least once
+    /// This check exists because otherwise it is too easy to accidentally ignore the arguments of an attribute
+    fn check_args_used(&self, attr: &ast::Attribute, args: &ArgParser) {
+        if let ArgParser::List(items) = args {
+            for item in items.mixed() {
+                if let crate::parser::MetaItemOrLitParser::MetaItemParser(item) = item {
+                    if !item.are_args_checked() {
+                        self.dcx().span_delayed_bug(
+                            item.span(),
+                            "attribute args were not properly checked",
+                        );
+                        return;
+                    }
+                    self.check_args_used(attr, item.args());
+                }
+            }
+        }
     }
 
     /// Returns whether there is a parser for an attribute with this name
@@ -472,14 +559,13 @@ impl<'sess, S: Stage> AttributeParser<'sess, S> {
         /// The list of attributes that are parsed attributes,
         /// even though they don't have a parser in `Late::parsers()`
         const SPECIAL_ATTRIBUTES: &[&[Symbol]] = &[
-            // Cfg attrs are removed after being early-parsed, so don't need to be in the parser list
+            // Cfg attrs are removed after being converted into synthetic attrs and don't need to
+            // be in the parser list.
             &[sym::cfg],
             &[sym::cfg_attr],
         ];
 
-        Late::parsers().accepters.contains_key(path)
-            || EARLY_PARSED_ATTRIBUTES.contains(&path)
-            || SPECIAL_ATTRIBUTES.contains(&path)
+        ATTRIBUTE_PARSERS.accepters.contains_key(path) || SPECIAL_ATTRIBUTES.contains(&path)
     }
 
     fn lower_attr_args(&self, args: &ast::AttrArgs, lower_span: impl Fn(Span) -> Span) -> AttrArgs {

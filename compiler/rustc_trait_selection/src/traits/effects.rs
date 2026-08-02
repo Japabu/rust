@@ -8,7 +8,7 @@ use rustc_middle::span_bug;
 use rustc_middle::traits::query::NoSolution;
 use rustc_middle::ty::elaborate::elaborate;
 use rustc_middle::ty::fast_reject::DeepRejectCtxt;
-use rustc_middle::ty::{self, Ty, TypingMode};
+use rustc_middle::ty::{self, Ty, Unnormalized};
 use thin_vec::{ThinVec, thin_vec};
 
 use super::SelectionContext;
@@ -25,7 +25,7 @@ pub fn evaluate_host_effect_obligation<'tcx>(
     selcx: &mut SelectionContext<'_, 'tcx>,
     obligation: &HostEffectObligation<'tcx>,
 ) -> Result<ThinVec<PredicateObligation<'tcx>>, EvaluationFailure> {
-    if selcx.infcx.typing_mode() == TypingMode::Coherence {
+    if selcx.typing_mode().is_coherence() {
         span_bug!(
             obligation.cause.span,
             "should not select host obligation in old solver in intercrate mode"
@@ -104,7 +104,7 @@ fn match_candidate<'tcx>(
             obligation.param_env,
             obligation.cause.clone(),
             obligation.recursion_depth,
-            candidate,
+            Unnormalized::new_wip(candidate),
             &mut nested,
         );
     }
@@ -179,6 +179,7 @@ fn evaluate_host_effect_from_conditionally_const_item_bounds<'tcx>(
 
     let mut consider_ty = obligation.predicate.self_ty();
     while let ty::Alias(
+        _,
         alias_ty @ ty::AliasTy {
             kind: kind @ (ty::Projection { def_id } | ty::Opaque { def_id }),
             ..
@@ -190,6 +191,7 @@ fn evaluate_host_effect_from_conditionally_const_item_bounds<'tcx>(
                 tcx,
                 tcx.explicit_implied_const_bounds(def_id)
                     .iter_instantiated_copied(tcx, alias_ty.args)
+                    .map(Unnormalized::skip_norm_wip)
                     .map(|(trait_ref, _)| {
                         trait_ref.to_host_effect_clause(tcx, obligation.predicate.constness)
                     }),
@@ -217,7 +219,7 @@ fn evaluate_host_effect_from_conditionally_const_item_bounds<'tcx>(
                     if candidate.is_some() {
                         return Err(EvaluationFailure::Ambiguous);
                     } else {
-                        candidate = Some((data, alias_ty));
+                        candidate = Some((data, alias_ty, def_id));
                     }
                 }
             }
@@ -230,18 +232,25 @@ fn evaluate_host_effect_from_conditionally_const_item_bounds<'tcx>(
         consider_ty = alias_ty.self_ty();
     }
 
-    if let Some((data, alias_ty)) = candidate {
+    if let Some((data, alias_ty, def_id)) = candidate {
         Ok(match_candidate(selcx, obligation, data, true, |selcx, nested| {
             // An alias bound only holds if we also check the const conditions
             // of the alias, so we need to register those, too.
-            let const_conditions = normalize_with_depth_to(
-                selcx,
-                obligation.param_env,
-                obligation.cause.clone(),
-                obligation.recursion_depth,
-                tcx.const_conditions(alias_ty.kind.def_id()).instantiate(tcx, alias_ty.args),
-                nested,
-            );
+            let const_conditions = tcx.const_conditions(def_id).instantiate(tcx, alias_ty.args);
+            let const_conditions: Vec<_> = const_conditions
+                .into_iter()
+                .map(|(trait_ref, span)| {
+                    let trait_ref = normalize_with_depth_to(
+                        selcx,
+                        obligation.param_env,
+                        obligation.cause.clone(),
+                        obligation.recursion_depth,
+                        trait_ref,
+                        nested,
+                    );
+                    (trait_ref, span)
+                })
+                .collect();
             nested.extend(const_conditions.into_iter().map(|(trait_ref, _)| {
                 obligation
                     .with(tcx, trait_ref.to_host_effect_clause(tcx, obligation.predicate.constness))
@@ -266,13 +275,18 @@ fn evaluate_host_effect_from_item_bounds<'tcx>(
 
     let mut consider_ty = obligation.predicate.self_ty();
     while let ty::Alias(
+        _,
         alias_ty @ ty::AliasTy {
             kind: kind @ (ty::Projection { def_id } | ty::Opaque { def_id }),
             ..
         },
     ) = *consider_ty.kind()
     {
-        for clause in tcx.item_bounds(def_id).iter_instantiated(tcx, alias_ty.args) {
+        for clause in tcx
+            .item_bounds(def_id)
+            .iter_instantiated(tcx, alias_ty.args)
+            .map(Unnormalized::skip_norm_wip)
+        {
             let bound_clause = clause.kind();
             let ty::ClauseKind::HostEffect(data) = bound_clause.skip_binder() else {
                 continue;
@@ -364,7 +378,7 @@ fn evaluate_host_effect_for_copy_clone_goal<'tcx>(
         | ty::Foreign(..)
         | ty::Ref(_, _, ty::Mutability::Mut)
         | ty::Adt(_, _)
-        | ty::Alias(_)
+        | ty::Alias(_, _)
         | ty::Param(_)
         | ty::Placeholder(..) => Err(EvaluationFailure::NoSolution),
 
@@ -411,6 +425,7 @@ fn evaluate_host_effect_for_copy_clone_goal<'tcx>(
         ty::CoroutineWitness(def_id, args) => Ok(tcx
             .coroutine_hidden_types(def_id)
             .instantiate(tcx, args)
+            .skip_norm_wip()
             .map_bound(|bound| bound.types.to_vec())),
     }?;
 
@@ -444,13 +459,16 @@ fn evaluate_host_effect_for_destruct_goal<'tcx>(
         ty::Adt(adt_def, args) => {
             let mut const_conditions: ThinVec<_> = adt_def
                 .all_fields()
-                .map(|field| ty::TraitRef::new(tcx, destruct_def_id, [field.ty(tcx, args)]))
+                .map(|field| {
+                    ty::TraitRef::new(tcx, destruct_def_id, [field.ty(tcx, args).skip_norm_wip()])
+                })
                 .collect();
             match adt_def.destructor(tcx).map(|dtor| tcx.constness(dtor.did)) {
+                Some(hir::Constness::Const { always: true }) => unimplemented!("FIXME(comptime)"),
                 // `Drop` impl exists, but it's not const. Type cannot be `[const] Destruct`.
                 Some(hir::Constness::NotConst) => return Err(EvaluationFailure::NoSolution),
                 // `Drop` impl exists, and it's const. Require `Ty: [const] Drop` to hold.
-                Some(hir::Constness::Const) => {
+                Some(hir::Constness::Const { always: false }) => {
                     let drop_def_id = tcx.require_lang_item(LangItem::Drop, obligation.cause.span);
                     let drop_trait_ref = ty::TraitRef::new(tcx, drop_def_id, [self_ty]);
                     const_conditions.push(drop_trait_ref);
@@ -540,37 +558,28 @@ fn evaluate_host_effect_for_fn_goal<'tcx>(
         // but they don't really need to right now.
         ty::CoroutineClosure(_, _) => return Err(EvaluationFailure::NoSolution),
 
-        ty::Closure(def, args) => {
-            // For now we limit ourselves to closures without binders. The next solver can handle them.
-            let sig =
-                args.as_closure().sig().no_bound_vars().ok_or(EvaluationFailure::NoSolution)?;
-            (
-                def,
-                tcx.mk_args_from_iter(
-                    [ty::GenericArg::from(*sig.inputs().get(0).unwrap()), sig.output().into()]
-                        .into_iter(),
-                ),
-            )
-        }
+        ty::Closure(def, args) => (def, ty::Binder::dummy(args)),
 
         // Everything else needs explicit impls or cannot have an impl
         _ => return Err(EvaluationFailure::NoSolution),
     };
 
     match tcx.constness(def) {
-        hir::Constness::Const => Ok(tcx
+        // FIXME(comptime)
+        hir::Constness::Const { always: true } => Err(EvaluationFailure::NoSolution),
+        hir::Constness::Const { always: false } => Ok(tcx
             .const_conditions(def)
-            .instantiate(tcx, args)
+            .instantiate(tcx, args.no_bound_vars().unwrap())
             .into_iter()
             .map(|(c, span)| {
                 let code = ObligationCauseCode::WhereClause(def, span);
                 let cause =
-                    ObligationCause::new(obligation.cause.span, obligation.cause.body_id, code);
+                    ObligationCause::new(obligation.cause.span, obligation.cause.body_def_id, code);
                 Obligation::new(
                     tcx,
                     cause,
                     obligation.param_env,
-                    c.to_host_effect_clause(tcx, obligation.predicate.constness),
+                    c.to_host_effect_clause(tcx, obligation.predicate.constness).skip_norm_wip(),
                 )
             })
             .collect()),
@@ -589,8 +598,16 @@ fn evaluate_host_effect_from_selection_candidate<'tcx>(
             Err(_) => Err(EvaluationFailure::NoSolution),
             Ok(Some(source)) => match source {
                 ImplSource::UserDefined(impl_) => {
-                    if tcx.impl_trait_header(impl_.impl_def_id).constness != hir::Constness::Const {
-                        return Err(EvaluationFailure::NoSolution);
+                    match tcx.impl_trait_header(impl_.impl_def_id).constness {
+                        rustc_hir::Constness::Const { always } => {
+                            if always {
+                                // FIXME(comptime): just bailing for now to avoid an ICE in a test.
+                                return Err(EvaluationFailure::NoSolution);
+                            }
+                        }
+                        rustc_hir::Constness::NotConst => {
+                            return Err(EvaluationFailure::NoSolution);
+                        }
                     }
 
                     let mut nested = impl_.nested;
@@ -615,7 +632,8 @@ fn evaluate_host_effect_from_selection_candidate<'tcx>(
                                     ),
                                     obligation.param_env,
                                     trait_ref
-                                        .to_host_effect_clause(tcx, obligation.predicate.constness),
+                                        .to_host_effect_clause(tcx, obligation.predicate.constness)
+                                        .skip_norm_wip(),
                                 )
                             }),
                     );
@@ -656,7 +674,9 @@ fn evaluate_host_effect_from_trait_alias<'tcx>(
                     },
                 ),
                 obligation.param_env,
-                trait_ref.to_host_effect_clause(tcx, obligation.predicate.constness),
+                trait_ref
+                    .to_host_effect_clause(tcx, obligation.predicate.constness)
+                    .skip_norm_wip(),
             )
         })
         .collect())

@@ -4,6 +4,7 @@ use std::ops::Range;
 
 use rustc_data_structures::undo_log::Rollback;
 use rustc_data_structures::{snapshot_vec as sv, unify as ut};
+use rustc_hir::HirId;
 use rustc_hir::def_id::DefId;
 use rustc_index::IndexVec;
 use rustc_middle::bug;
@@ -97,6 +98,16 @@ pub struct TypeVariableOrigin {
     ///
     /// This should only be used for diagnostics.
     pub param_def_id: Option<DefId>,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct FloatVariableOrigin {
+    pub span: Span,
+
+    /// `HirId` to lint at for this float variable, if any.
+    ///
+    /// This should only be used for diagnostics.
+    pub lint_id: Option<HirId>,
 }
 
 #[derive(Clone)]
@@ -235,13 +246,11 @@ impl<'tcx> TypeVariableTable<'_, 'tcx> {
     }
 
     /// Returns the "root" variable of `vid` in the `sub_unification_table`
-    /// equivalence table. All type variables that have been are related via
+    /// equivalence table. All type variables that have been related via
     /// equality or subtyping will yield the same root variable (per the
     /// union-find algorithm), so `sub_unification_table_root_var(a)
-    /// == sub_unification_table_root_var(b)` implies that:
-    /// ```text
-    /// exists X. (a <: X || X <: a) && (b <: X || X <: b)
-    /// ```
+    /// == sub_unification_table_root_var(b)` implies that `a` and `b` are
+    /// transitively related via subtyping.
     pub(crate) fn sub_unification_table_root_var(&mut self, vid: ty::TyVid) -> ty::TyVid {
         self.sub_unification_table().find(vid).vid
     }

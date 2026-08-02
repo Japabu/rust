@@ -5,6 +5,8 @@
 #![feature(default_field_values)]
 #![feature(iter_intersperse)]
 #![feature(macro_derive)]
+#![feature(macro_metavar_expr)]
+#![feature(option_into_flat_iter)]
 #![feature(rustc_attrs)]
 // To generate CodegenOptionsTargetModifiers and UnstableOptionsTargetModifiers enums
 // with macro_rules, it is necessary to use recursive mechanic ("Incremental TT Munchers").
@@ -17,7 +19,7 @@ pub use rustc_lint_defs as lint;
 pub use session::*;
 
 pub mod code_stats;
-pub mod errors;
+pub mod diagnostics;
 pub mod parse;
 pub mod utils;
 #[macro_use]

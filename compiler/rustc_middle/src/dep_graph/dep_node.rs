@@ -51,13 +51,13 @@ use std::fmt;
 use std::hash::Hash;
 
 use rustc_data_structures::fingerprint::{Fingerprint, PackedFingerprint};
-use rustc_data_structures::stable_hasher::{StableHasher, StableOrd, ToStableHashKey};
+use rustc_data_structures::stable_hash::{StableHasher, StableOrd};
 use rustc_hir::def_id::DefId;
 use rustc_hir::definitions::DefPathHash;
-use rustc_macros::{Decodable, Encodable, HashStable};
+use rustc_macros::{Decodable, Encodable, StableHash};
 use rustc_span::Symbol;
 
-use super::{KeyFingerprintStyle, SerializedDepNodeIndex};
+use super::{DepNodeIndex, KeyFingerprintStyle, SerializedDepNodeIndex};
 use crate::dep_graph::DepNodeKey;
 use crate::mono::MonoItem;
 use crate::ty::{TyCtxt, tls};
@@ -208,8 +208,17 @@ pub struct DepKindVTable<'tcx> {
         fn(tcx: TyCtxt<'tcx>, dep_node: DepNode, prev_index: SerializedDepNodeIndex) -> bool,
     >,
 
-    /// Invoke a query to put the on-disk cached value in memory.
-    pub promote_from_disk_fn: Option<fn(TyCtxt<'tcx>, DepNode)>,
+    /// Load the on-disk cached value of a query into memory. The node is known
+    /// to be green, with `prev_index` its index in the previous session's dep
+    /// graph and `dep_node_index` its index in the current session's dep graph.
+    pub promote_from_disk_fn: Option<
+        fn(
+            tcx: TyCtxt<'tcx>,
+            dep_node: DepNode,
+            prev_index: SerializedDepNodeIndex,
+            dep_node_index: DepNodeIndex,
+        ),
+    >,
 }
 
 /// A "work product" corresponds to a `.o` (or other) file that we
@@ -217,9 +226,8 @@ pub struct DepKindVTable<'tcx> {
 /// some independent path or string that persists between runs without
 /// the need to be mapped or unmapped. (This ensures we can serialize
 /// them even in the absence of a tcx.)
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encodable, Decodable, HashStable
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Encodable, Decodable, StableHash)]
 pub struct WorkProductId {
     hash: Fingerprint,
 }
@@ -231,13 +239,7 @@ impl WorkProductId {
         WorkProductId { hash: hasher.finish() }
     }
 }
-impl<Hcx> ToStableHashKey<Hcx> for WorkProductId {
-    type KeyType = Fingerprint;
-    #[inline]
-    fn to_stable_hash_key(&self, _: &mut Hcx) -> Self::KeyType {
-        self.hash
-    }
-}
+
 impl StableOrd for WorkProductId {
     // Fingerprint can use unstable (just a tuple of `u64`s), so WorkProductId can as well
     const CAN_USE_UNSTABLE_SORT: bool = true;

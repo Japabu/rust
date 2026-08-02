@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use rustc_abi::Endian;
 use rustc_data_structures::base_n::{CASE_INSENSITIVE, ToBaseN};
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
-use rustc_data_structures::stable_hasher::StableHasher;
+use rustc_data_structures::stable_hash::StableHasher;
 use rustc_hashes::Hash128;
 use rustc_hir::attrs::NativeLibKind;
 use rustc_session::Session;
@@ -15,8 +15,8 @@ use rustc_target::spec::Arch;
 
 use crate::back::archive::ImportLibraryItem;
 use crate::back::link::ArchiveBuilderBuilder;
-use crate::errors::ErrorCreatingImportLibrary;
-use crate::{NativeLib, common, errors};
+use crate::diagnostics::ErrorCreatingImportLibrary;
+use crate::{NativeLib, common, diagnostics};
 
 /// Extract all symbols defined in raw-dylib libraries, collated by library name.
 ///
@@ -41,7 +41,7 @@ fn collate_raw_dylibs_windows<'a>(
                     // FIXME: when we add support for ordinals, figure out if we need to do anything
                     // if we have two DllImport values with the same name but different ordinals.
                     if import.calling_convention != old_import.calling_convention {
-                        sess.dcx().emit_err(errors::MultipleExternalFuncDecl {
+                        sess.dcx().emit_err(diagnostics::MultipleExternalFuncDecl {
                             span: import.span,
                             function: import.name,
                             library_name: &name,

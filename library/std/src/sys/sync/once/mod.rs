@@ -19,6 +19,7 @@ cfg_select! {
         target_os = "dragonfly",
         target_os = "fuchsia",
         target_os = "hermit",
+        all(target_os = "wasi", target_env = "p3"),
         target_os = "toyos",
     ) => {
         mod futex;

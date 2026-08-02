@@ -7,11 +7,11 @@ mod normalize;
 mod select;
 
 pub(crate) use delegate::SolverDelegate;
-pub use fulfill::{FulfillmentCtxt, NextSolverError, StalledOnCoroutines};
+pub use fulfill::{FulfillmentCtxt, NextSolverError};
 pub(crate) use normalize::deeply_normalize_for_diagnostics;
 pub use normalize::{
     deeply_normalize, deeply_normalize_with_skipped_universes,
-    deeply_normalize_with_skipped_universes_and_ambiguous_coroutine_goals,
+    deeply_normalize_with_skipped_universes_and_ambiguous_coroutine_goals, normalize,
 };
 use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
@@ -19,11 +19,10 @@ pub use select::InferCtxtSelectExt;
 
 fn evaluate_root_goal_for_proof_tree_raw<'tcx>(
     tcx: TyCtxt<'tcx>,
-    canonical_input: CanonicalInput<TyCtxt<'tcx>>,
+    key: (CanonicalInput<TyCtxt<'tcx>>, usize),
 ) -> (QueryResult<TyCtxt<'tcx>>, &'tcx inspect::Probe<TyCtxt<'tcx>>) {
     evaluate_root_goal_for_proof_tree_raw_provider::<SolverDelegate<'tcx>, TyCtxt<'tcx>>(
-        tcx,
-        canonical_input,
+        tcx, key.0, key.1,
     )
 }
 
