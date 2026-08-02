@@ -275,7 +275,7 @@ impl File {
 
     pub fn is_read_vectored(&self) -> bool { false }
 
-    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
+    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
         let n = self.read(cursor.ensure_init())?;
         unsafe { cursor.advance(n) };
         Ok(())
@@ -444,6 +444,10 @@ pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
 }
 
 pub fn set_perm(_p: &Path, _perm: FilePermissions) -> io::Result<()> {
+    Ok(())
+}
+
+pub fn set_perm_nofollow(_p: &Path, _perm: FilePermissions) -> io::Result<()> {
     Ok(())
 }
 

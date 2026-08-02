@@ -46,7 +46,7 @@ extern "C" fn start_rust(argc: usize, argv: *const *const u8) -> ! {
         fn main(argc: i32, argv: *const *const u8) -> i32;
     }
     ARGC.store(argc, Ordering::Relaxed);
-    ARGV.store(argv as usize, Ordering::Relaxed);
+    ARGV.store(argv.expose_provenance(), Ordering::Relaxed);
 
     // Register EH frame finder (also in .init_array for cdylib, but exes don't run .init_array)
     eh_frame::init();

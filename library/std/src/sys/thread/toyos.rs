@@ -23,16 +23,16 @@ impl Thread {
         if stack_base.is_null() {
             return Err(io::const_error!(io::ErrorKind::OutOfMemory, "thread stack allocation failed"));
         }
-        let stack_top = stack_base as u64 + stack_size as u64;
+        let stack_top = stack_base.expose_provenance() as u64 + stack_size as u64;
 
         let data = Box::into_raw(init);
         // SAFETY: entry point and stack are valid; data is a valid pointer to the thread init.
         let tid = unsafe {
             syscall::thread_spawn(
-                thread_trampoline as *const () as u64,
+                (thread_trampoline as *const ()).expose_provenance() as u64,
                 stack_top,
                 data.expose_provenance() as u64,
-                stack_base as u64,
+                stack_base.expose_provenance() as u64,
             )
         };
 

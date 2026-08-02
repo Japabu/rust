@@ -99,6 +99,7 @@ cfg_select! {
     }
     target_os = "toyos" => {
         mod toyos;
+        use toyos as imp;
     }
     target_os = "vexos" => {
         mod vexos;

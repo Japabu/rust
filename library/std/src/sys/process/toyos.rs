@@ -1,4 +1,4 @@
-use super::env::{CommandEnv, CommandEnvs};
+use super::env::{CommandEnv, CommandEnvs, CommandResolvedEnvs};
 pub use crate::ffi::OsString as EnvKey;
 use crate::ffi::{OsStr, OsString};
 use crate::num::NonZero;
@@ -92,6 +92,10 @@ impl Command {
         self.env.does_clear()
     }
 
+    pub fn get_resolved_envs(&self) -> CommandResolvedEnvs {
+        CommandResolvedEnvs::new(self.env.capture())
+    }
+
     pub fn get_current_dir(&self) -> Option<&Path> {
         self.cwd.as_ref().map(|cs| Path::new(cs))
     }
@@ -161,11 +165,11 @@ impl Command {
         }
 
         let spawn_args = toyos_abi::syscall::SpawnArgs {
-            argv_ptr: argv_buf.as_ptr() as u64,
+            argv_ptr: argv_buf.as_ptr().expose_provenance() as u64,
             argv_len: argv_buf.len() as u64,
-            fd_map_ptr: fd_map.as_ptr() as u64,
+            fd_map_ptr: fd_map.as_ptr().expose_provenance() as u64,
             fd_map_count: fd_map.len() as u64,
-            env_ptr: env_buf.as_ptr() as u64,
+            env_ptr: env_buf.as_ptr().expose_provenance() as u64,
             env_len: env_buf.len() as u64,
         };
         // SAFETY: spawn_args contains valid pointers to stack-local buffers that outlive the call.

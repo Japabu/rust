@@ -8,7 +8,7 @@ use crate::time::Duration;
 use toyos_abi::Fd;
 use toyos::poller::{Poller, IORING_POLL_IN, IORING_POLL_OUT};
 use toyos_abi::syscall::{self, SyscallError};
-use toyos::net::{self, NetError, TcpSocketId, UdpSocketId};
+use toyos::net::{NetError, TcpSocketId, UdpSocketId};
 
 // --- Helpers ---
 
@@ -170,7 +170,7 @@ impl TcpStream {
         syscall::read(self.raw_fd(), buf).map_err(syscall_err)
     }
 
-    pub fn read_buf(&self, mut buf: BorrowedCursor<'_>) -> io::Result<()> {
+    pub fn read_buf(&self, mut buf: BorrowedCursor<'_, u8>) -> io::Result<()> {
         let mut tmp = vec![0u8; buf.capacity()];
         let n = self.read(&mut tmp)?;
         buf.append(&tmp[..n]);
@@ -286,6 +286,14 @@ impl TcpStream {
 
     pub fn nodelay(&self) -> io::Result<bool> {
         Ok(self.nodelay.load(Relaxed))
+    }
+
+    pub fn set_keepalive(&self, _keepalive: bool) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "keepalive not supported"))
+    }
+
+    pub fn keepalive(&self) -> io::Result<bool> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "keepalive not supported"))
     }
 
     pub fn set_ttl(&self, _ttl: u32) -> io::Result<()> {

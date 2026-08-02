@@ -37,7 +37,7 @@ impl Pipe {
         syscall::read(self.fd, buf).map_err(to_io_error)
     }
 
-    pub fn read_buf(&self, mut buf: BorrowedCursor<'_>) -> io::Result<()> {
+    pub fn read_buf(&self, mut buf: BorrowedCursor<'_, u8>) -> io::Result<()> {
         let spare = buf.ensure_init();
         let n = self.read(spare)?;
         unsafe { buf.advance(n) };

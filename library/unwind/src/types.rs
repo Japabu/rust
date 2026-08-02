@@ -20,6 +20,7 @@ pub type _Unwind_Exception_Class = u64;
 pub type _Unwind_Word = *const u8;
 
 pub const unwinder_private_data_size: usize = cfg_select! {
+    all(target_os = "toyos", target_arch = "x86_64") => 6,
     target_arch = "x86" => 5,
     all(target_arch = "x86_64", not(any(target_os = "windows", target_os = "cygwin"))) => 2,
     all(target_arch = "x86_64", any(target_os = "windows", target_os = "cygwin")) => 6,
@@ -50,7 +51,7 @@ pub struct _Unwind_Exception {
 }
 
 // Check the size of _Unwind_Exception against the source of truth when using the unwinding crate.
-#[cfg(target_os = "xous")]
+#[cfg(any(target_os = "xous", target_os = "toyos"))]
 const _: () = {
     assert!(size_of::<unwinding::abi::UnwindException>() == size_of::<_Unwind_Exception>());
 };

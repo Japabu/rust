@@ -342,6 +342,8 @@ dependencies = [
  "rand_xorshift",
  "rustc-demangle",
  "std_detect",
+ "toyos",
+ "toyos-abi",
  "unwind",
  "vex-sdk",
  "wasip1",
@@ -377,6 +379,21 @@ dependencies = [
  "getopts",
  "libc",
  "std",
+]
+
+[[package]]
+name = "toyos"
+version = "0.1.0"
+dependencies = [
+ "rustc-std-workspace-core",
+ "toyos-abi",
+]
+
+[[package]]
+name = "toyos-abi"
+version = "0.1.0"
+dependencies = [
+ "rustc-std-workspace-core",
 ]
 
 [[package]]

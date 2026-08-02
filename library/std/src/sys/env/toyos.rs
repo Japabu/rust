@@ -31,7 +31,7 @@ fn lock_env() -> MutexGuard<'static, Option<HashMap<OsString, OsString>>> {
 }
 
 pub fn init() {
-    lock_env();
+    drop(lock_env());
 }
 
 pub fn env() -> Env {

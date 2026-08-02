@@ -482,8 +482,7 @@ dependencies = [
 [[package]]
 name = "target-lexicon"
 version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
+source = "git+https://github.com/Japabu/target-lexicon?branch=toyos#45832ce6b39a3f912f1d0a60a86aa3c5c099dd46"
 
 [[package]]
 name = "unicode-ident"
