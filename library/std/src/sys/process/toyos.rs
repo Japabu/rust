@@ -232,16 +232,6 @@ impl Command {
     }
 }
 
-pub fn output(cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
-    let (mut process, pipes) = cmd.spawn(Stdio::MakePipe, false)?;
-    let mut stdout_data = Vec::new();
-    if let Some(pipe) = pipes.stdout {
-        pipe.read_to_end(&mut stdout_data)?;
-    }
-    let status = process.wait()?;
-    Ok((status, stdout_data, Vec::new()))
-}
-
 impl From<ChildPipe> for Stdio {
     fn from(pipe: ChildPipe) -> Stdio {
         Stdio::InheritPipe(pipe)
