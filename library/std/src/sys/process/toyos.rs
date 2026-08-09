@@ -116,6 +116,21 @@ impl Command {
         self.endowments.push((label.to_owned(), handle));
     }
 
+    /// A duplicate of this process's own namespace handle, for the child to be
+    /// endowed under `svc`.
+    ///
+    /// `None` when the caller endowed one itself — it has decided what its
+    /// child may reach — and when this process has no namespace, which is a
+    /// program the manifest gives no `receives` and whose children therefore
+    /// have nothing to inherit.
+    fn inherited_namespace(&self) -> Option<toyos_abi::RawHandle> {
+        if self.endowments.iter().any(|(label, _)| label == toyos_abi::syscall::SVC_LABEL) {
+            return None;
+        }
+        let namespace = toyos::endow::namespace()?;
+        toyos_abi::syscall::dup(toyos::AsHandle::as_handle(namespace)).ok()
+    }
+
     fn resolve_program(&self) -> io::Result<OsString> {
         let prog = self.program.to_str().unwrap_or("");
         if prog.contains('/') {
@@ -178,15 +193,27 @@ impl Command {
         // kernel reads both out of one call and keeps the blob for the child's
         // life.
         let mut labels = Vec::new();
-        let mut endow = Vec::with_capacity(self.endowments.len());
-        for (label, handle) in &self.endowments {
+        let mut endow = Vec::with_capacity(self.endowments.len() + 1);
+        let mut push = |label: &str, handle: u32, labels: &mut Vec<u8>| {
             endow.push(toyos_abi::syscall::EndowEntry {
                 label_off: labels.len() as u32,
                 label_len: label.len() as u32,
-                handle: toyos_abi::RawHandle(*handle),
+                handle: toyos_abi::RawHandle(handle),
                 _pad: 0,
             });
             labels.extend_from_slice(label.as_bytes());
+        };
+        for (label, handle) in &self.endowments {
+            push(label, *handle, &mut labels);
+        }
+        // The child inherits this process's namespace unless the caller decided
+        // otherwise. A duplicate rather than the handle itself: an endowment is
+        // a move, and a parent that gave its namespace away could not spawn a
+        // second child. A caller that endows `svc` has decided what its child
+        // may reach and is not overruled here.
+        let inherited = self.inherited_namespace();
+        if let Some(handle) = inherited {
+            push(toyos_abi::syscall::SVC_LABEL, handle.0, &mut labels);
         }
 
         let spawn_args = toyos_abi::syscall::SpawnArgs {
@@ -208,6 +235,11 @@ impl Command {
         drop(child_pipes);
 
         let pid = pid.map_err(|e| {
+            // An endowment moves only on a spawn that happened, so the
+            // duplicate this call made is still ours and is ours to close.
+            if let Some(handle) = inherited {
+                toyos_abi::syscall::close(handle);
+            }
             let kind = match e {
                 toyos_abi::syscall::SyscallError::NotFound => io::ErrorKind::NotFound,
                 _ => io::ErrorKind::Other,
