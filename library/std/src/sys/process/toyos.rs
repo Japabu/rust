@@ -22,6 +22,7 @@ pub struct Command {
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
     extra_fds: Vec<[u32; 2]>,
+    endowments: Vec<(String, u32)>,
 }
 
 #[derive(Debug)]
@@ -47,6 +48,7 @@ impl Command {
             stdout: None,
             stderr: None,
             extra_fds: Vec::new(),
+            endowments: Vec::new(),
         }
     }
 
@@ -104,6 +106,14 @@ impl Command {
     /// The child will see `child_fd` mapped to the parent's `parent_fd`.
     pub fn inherit_fd(&mut self, child_fd: u32, parent_fd: u32) {
         self.extra_fds.push([child_fd, parent_fd]);
+    }
+
+    /// Give the child `handle` under the name `label`.
+    ///
+    /// The handle is **moved**: after a successful spawn this process no longer
+    /// holds it. A caller that wants to keep one duplicates it first.
+    pub fn endow(&mut self, label: &str, handle: u32) {
+        self.endowments.push((label.to_owned(), handle));
     }
 
     fn resolve_program(&self) -> io::Result<OsString> {
@@ -164,13 +174,32 @@ impl Command {
             env_buf.push(0);
         }
 
+        // The label blob and the entries that index it. Built here because the
+        // kernel reads both out of one call and keeps the blob for the child's
+        // life.
+        let mut labels = Vec::new();
+        let mut endow = Vec::with_capacity(self.endowments.len());
+        for (label, handle) in &self.endowments {
+            endow.push(toyos_abi::syscall::EndowEntry {
+                label_off: labels.len() as u32,
+                label_len: label.len() as u32,
+                handle: toyos_abi::RawHandle(*handle),
+                _pad: 0,
+            });
+            labels.extend_from_slice(label.as_bytes());
+        }
+
         let spawn_args = toyos_abi::syscall::SpawnArgs {
             argv_ptr: argv_buf.as_ptr().expose_provenance() as u64,
             argv_len: argv_buf.len() as u64,
-            fd_map_ptr: fd_map.as_ptr().expose_provenance() as u64,
-            fd_map_count: fd_map.len() as u64,
+            slot_map_ptr: fd_map.as_ptr().expose_provenance() as u64,
+            slot_map_count: fd_map.len() as u64,
             env_ptr: env_buf.as_ptr().expose_provenance() as u64,
             env_len: env_buf.len() as u64,
+            endow_ptr: endow.as_ptr().expose_provenance() as u64,
+            endow_count: endow.len() as u64,
+            labels_ptr: labels.as_ptr().expose_provenance() as u64,
+            labels_len: labels.len() as u64,
         };
         // SAFETY: spawn_args contains valid pointers to stack-local buffers that outlive the call.
         let pid = unsafe { toyos_abi::syscall::spawn(&spawn_args) };

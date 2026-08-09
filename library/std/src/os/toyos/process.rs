@@ -20,12 +20,26 @@ pub trait CommandExt {
     /// protocols) to child processes.
     #[stable(feature = "toyos_ext", since = "1.0.0")]
     fn inherit_fd(&mut self, child_fd: u32, parent_fd: u32) -> &mut Self;
+
+    /// Give the child a handle under a name it can look itself up by.
+    ///
+    /// The handle is **moved**: after a successful spawn the parent no longer
+    /// holds it, which is what lets a capability that admits only one holder —
+    /// a device claim — be handed over at all. A parent that wants to keep one
+    /// duplicates it first.
+    #[stable(feature = "toyos_ext", since = "1.0.0")]
+    fn endow(&mut self, label: &str, handle: u32) -> &mut Self;
 }
 
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 impl CommandExt for crate::process::Command {
     fn inherit_fd(&mut self, child_fd: u32, parent_fd: u32) -> &mut Self {
         self.as_inner_mut().inherit_fd(child_fd, parent_fd);
+        self
+    }
+
+    fn endow(&mut self, label: &str, handle: u32) -> &mut Self {
+        self.as_inner_mut().endow(label, handle);
         self
     }
 }
