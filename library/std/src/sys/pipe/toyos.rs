@@ -1,6 +1,6 @@
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use toyos_abi::syscall::{self, SyscallError};
 
 fn to_io_error(e: SyscallError) -> io::Error {
@@ -15,17 +15,17 @@ fn to_io_error(e: SyscallError) -> io::Error {
 
 #[derive(Debug)]
 pub struct Pipe {
-    fd: Fd,
+    fd: RawHandle,
 }
 
 pub fn pipe() -> io::Result<(Pipe, Pipe)> {
-    let fds = syscall::pipe();
+    let fds = syscall::pipe().map_err(to_io_error)?;
     Ok((Pipe { fd: fds.read }, Pipe { fd: fds.write }))
 }
 
 impl Pipe {
     pub fn raw_fd(&self) -> i32 {
-        self.fd.0
+        self.fd.0 as i32
     }
 
     pub fn try_clone(&self) -> io::Result<Self> {

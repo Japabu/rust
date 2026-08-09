@@ -209,8 +209,8 @@ impl Command {
             Stdio::MakePipe | Stdio::MakeTtyPipe => {
                 let (r, w) = crate::sys::pipe::pipe()?;
                 if matches!(stdio, Stdio::MakeTtyPipe) {
-                    toyos_abi::syscall::mark_tty(toyos_abi::Fd(r.raw_fd()));
-                    toyos_abi::syscall::mark_tty(toyos_abi::Fd(w.raw_fd()));
+                    toyos_abi::syscall::mark_tty(toyos_abi::RawHandle(r.raw_fd() as u32));
+                    toyos_abi::syscall::mark_tty(toyos_abi::RawHandle(w.raw_fd() as u32));
                 }
                 if is_input {
                     fd_map.push([child_fd, r.raw_fd() as u32]);

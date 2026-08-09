@@ -5,7 +5,7 @@ use crate::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use crate::time::Duration;
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use toyos::poller::{Poller, IORING_POLL_IN, IORING_POLL_OUT};
 use toyos_abi::syscall::{self, SyscallError};
 use toyos::net::{NetError, TcpSocketId, UdpSocketId};
@@ -58,7 +58,7 @@ fn make_socket_fd(rx: toyos::Pipe, tx: toyos::Pipe) -> io::Result<OwnedFd> {
     // Pipes are consumed — drop closes the underlying fds
     drop(rx);
     drop(tx);
-    Ok(unsafe { OwnedFd::from_raw_fd(socket_fd.0) })
+    Ok(unsafe { OwnedFd::from_raw_fd(socket_fd.0 as i32) })
 }
 
 // --- Shared socket ownership (prevents double-close on duplicate) ---
@@ -122,8 +122,8 @@ impl TcpStream {
         })
     }
 
-    fn raw_fd(&self) -> Fd {
-        Fd(self.fd.as_raw_fd())
+    fn raw_fd(&self) -> RawHandle {
+        RawHandle(self.fd.as_raw_fd() as u32)
     }
 
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
@@ -258,7 +258,7 @@ impl TcpStream {
     pub fn duplicate(&self) -> io::Result<TcpStream> {
         let new_fd = syscall::dup(self.raw_fd()).map_err(syscall_err)?;
         Ok(TcpStream {
-            fd: unsafe { OwnedFd::from_raw_fd(new_fd.0) },
+            fd: unsafe { OwnedFd::from_raw_fd(new_fd.0 as i32) },
             socket: Arc::clone(&self.socket),
             peer: self.peer,
             local_port: self.local_port,
@@ -355,7 +355,7 @@ impl TcpListener {
         let (ip, port) = addr_to_v4(&addr)?;
         let bound = toyos::net::tcp_bind(ip, port).map_err(net_err_to_io)?;
         Ok(TcpListener {
-            notify_fd: unsafe { OwnedFd::from_raw_fd(bound.notify.into_fd().0) },
+            notify_fd: unsafe { OwnedFd::from_raw_fd(bound.notify.into_fd().0 as i32) },
             socket: Arc::new(NetdSocket::Tcp(bound.socket_id)),
             local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), bound.bound_port)),
             nonblocking: AtomicBool::new(false),
@@ -368,7 +368,7 @@ impl TcpListener {
 
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let mut byte = [0u8; 1];
-        let notify_fd = Fd(self.notify_fd.as_raw_fd());
+        let notify_fd = RawHandle(self.notify_fd.as_raw_fd() as u32);
         if self.nonblocking.load(Relaxed) {
             syscall::read_nonblock(notify_fd, &mut byte).map_err(syscall_err)?;
         } else {
@@ -398,9 +398,9 @@ impl TcpListener {
     }
 
     pub fn duplicate(&self) -> io::Result<TcpListener> {
-        let new_fd = syscall::dup(Fd(self.notify_fd.as_raw_fd())).map_err(syscall_err)?;
+        let new_fd = syscall::dup(RawHandle(self.notify_fd.as_raw_fd() as u32)).map_err(syscall_err)?;
         Ok(TcpListener {
-            notify_fd: unsafe { OwnedFd::from_raw_fd(new_fd.0) },
+            notify_fd: unsafe { OwnedFd::from_raw_fd(new_fd.0 as i32) },
             socket: Arc::clone(&self.socket),
             local: self.local,
             nonblocking: AtomicBool::new(self.nonblocking.load(Relaxed)),
@@ -477,8 +477,8 @@ impl UdpSocket {
         let bound = toyos::net::udp_bind(ip, port).map_err(net_err_to_io)?;
         Ok(UdpSocket {
             socket: Arc::new(NetdSocket::Udp(bound.socket_id)),
-            tx_fd: unsafe { OwnedFd::from_raw_fd(bound.tx.into_fd().0) },
-            rx_fd: unsafe { OwnedFd::from_raw_fd(bound.rx.into_fd().0) },
+            tx_fd: unsafe { OwnedFd::from_raw_fd(bound.tx.into_fd().0 as i32) },
+            rx_fd: unsafe { OwnedFd::from_raw_fd(bound.rx.into_fd().0 as i32) },
             local: SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::from(ip),
                 bound.bound_port,
@@ -505,7 +505,7 @@ impl UdpSocket {
 
         let n = (resp.len as usize).min(buf.len());
         if n > 0 {
-            let rx_fd = Fd(self.rx_fd.as_raw_fd());
+            let rx_fd = RawHandle(self.rx_fd.as_raw_fd() as u32);
             syscall::read(rx_fd, &mut buf[..n]).map_err(syscall_err)?;
         }
 
@@ -521,7 +521,7 @@ impl UdpSocket {
         let (ip, port) = addr_to_v4(addr)?;
 
         // Write data to TX pipe first, then send control message
-        let tx_fd = Fd(self.tx_fd.as_raw_fd());
+        let tx_fd = RawHandle(self.tx_fd.as_raw_fd() as u32);
         if !buf.is_empty() {
             syscall::write(tx_fd, buf).map_err(syscall_err)?;
         }
@@ -532,12 +532,12 @@ impl UdpSocket {
     }
 
     pub fn duplicate(&self) -> io::Result<UdpSocket> {
-        let new_tx_fd = syscall::dup(Fd(self.tx_fd.as_raw_fd())).map_err(syscall_err)?;
-        let new_rx_fd = syscall::dup(Fd(self.rx_fd.as_raw_fd())).map_err(syscall_err)?;
+        let new_tx_fd = syscall::dup(RawHandle(self.tx_fd.as_raw_fd() as u32)).map_err(syscall_err)?;
+        let new_rx_fd = syscall::dup(RawHandle(self.rx_fd.as_raw_fd() as u32)).map_err(syscall_err)?;
         Ok(UdpSocket {
             socket: Arc::clone(&self.socket),
-            tx_fd: unsafe { OwnedFd::from_raw_fd(new_tx_fd.0) },
-            rx_fd: unsafe { OwnedFd::from_raw_fd(new_rx_fd.0) },
+            tx_fd: unsafe { OwnedFd::from_raw_fd(new_tx_fd.0 as i32) },
+            rx_fd: unsafe { OwnedFd::from_raw_fd(new_rx_fd.0 as i32) },
             local: self.local,
             peer: crate::sync::Mutex::new(*self.peer.lock().unwrap()),
             read_timeout_ms: AtomicU32::new(self.read_timeout_ms.load(Relaxed)),

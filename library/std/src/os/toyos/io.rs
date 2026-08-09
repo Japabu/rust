@@ -17,7 +17,7 @@ impl AsRawFd for crate::fs::File {
 impl FromRawFd for crate::fs::File {
     #[inline]
     unsafe fn from_raw_fd(fd: RawFd) -> crate::fs::File {
-        crate::fs::File::from_inner(crate::sys::fs::File::from_fd(toyos_abi::Fd(fd)))
+        crate::fs::File::from_inner(crate::sys::fs::File::from_fd(toyos_abi::RawHandle(fd as u32)))
     }
 }
 

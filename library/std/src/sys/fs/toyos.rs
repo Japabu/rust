@@ -7,7 +7,7 @@ use crate::path::{Path, PathBuf};
 pub use crate::sys::fs::common::Dir;
 use crate::sys::time::SystemTime;
 
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use toyos_abi::syscall::{self, OpenFlags, SyscallError};
 
 fn to_io_error(e: SyscallError) -> io::Error {
@@ -23,7 +23,7 @@ fn to_io_error(e: SyscallError) -> io::Error {
     io::Error::from(kind)
 }
 
-pub struct File(Fd);
+pub struct File(RawHandle);
 
 #[derive(Clone)]
 pub struct FileAttr {
@@ -216,16 +216,16 @@ impl OpenOptions {
 }
 
 impl File {
-    pub fn from_fd(fd: Fd) -> Self {
+    pub fn from_fd(fd: RawHandle) -> Self {
         File(fd)
     }
 
     pub fn raw_fd(&self) -> i32 {
-        self.0.0
+        self.0.0 as i32
     }
 
     pub fn as_raw_fd(&self) -> i32 {
-        self.0.0
+        self.0.0 as i32
     }
 
     pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {

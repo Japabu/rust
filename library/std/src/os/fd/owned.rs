@@ -157,9 +157,9 @@ impl BorrowedFd<'_> {
     #[cfg(target_os = "toyos")]
     #[stable(feature = "io_safety", since = "1.63.0")]
     pub fn try_clone_to_owned(&self) -> io::Result<OwnedFd> {
-        let new_fd = toyos_abi::syscall::dup(toyos_abi::Fd(self.as_raw_fd()))
+        let new_fd = toyos_abi::syscall::dup(toyos_abi::RawHandle(self.as_raw_fd() as u32))
             .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
-        Ok(unsafe { OwnedFd::from_raw_fd(new_fd.0) })
+        Ok(unsafe { OwnedFd::from_raw_fd(new_fd.0 as RawFd) })
     }
 }
 
@@ -235,7 +235,7 @@ impl Drop for OwnedFd {
             let _ = hermit_abi::close(self.fd.as_inner());
             #[cfg(target_os = "toyos")]
             {
-                toyos_abi::syscall::close(toyos_abi::Fd(self.fd.as_inner()));
+                toyos_abi::syscall::close(toyos_abi::RawHandle(self.fd.as_inner() as u32));
             }
         }
     }

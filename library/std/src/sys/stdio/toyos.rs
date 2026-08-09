@@ -1,12 +1,12 @@
 use crate::io::{self, IoSlice, IoSliceMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use toyos_abi::syscall::{self, FileType, SyscallError};
 
-const STDIN: Fd = Fd(0);
-const STDOUT: Fd = Fd(1);
-const STDERR: Fd = Fd(2);
+const STDIN: RawHandle = RawHandle(0);
+const STDOUT: RawHandle = RawHandle(1);
+const STDERR: RawHandle = RawHandle(2);
 
 fn to_io_error(e: SyscallError) -> io::Error {
     io::Error::from(io::ErrorKind::Other)
