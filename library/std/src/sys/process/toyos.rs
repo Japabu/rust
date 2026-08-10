@@ -23,6 +23,7 @@ pub struct Command {
     stderr: Option<Stdio>,
     extra_fds: Vec<[u32; 2]>,
     endowments: Vec<(String, u32)>,
+    provided: Vec<(String, u32)>,
 }
 
 #[derive(Debug)]
@@ -49,6 +50,7 @@ impl Command {
             stderr: None,
             extra_fds: Vec::new(),
             endowments: Vec::new(),
+            provided: Vec::new(),
         }
     }
 
@@ -114,6 +116,14 @@ impl Command {
     /// holds it. A caller that wants to keep one duplicates it first.
     pub fn endow(&mut self, label: &str, handle: u32) {
         self.endowments.push((label.to_owned(), handle));
+    }
+
+    /// Give the child `connector` under `name`, on top of its manifest row.
+    ///
+    /// Routes the spawn through the launcher, which is the only thing that can
+    /// build a child's authority out of the child's own declaration.
+    pub fn provide(&mut self, name: &str, connector: u32) {
+        self.provided.push((name.to_owned(), connector));
     }
 
     /// A duplicate of this process's own namespace handle, for the child to be
@@ -216,6 +226,24 @@ impl Command {
             push(toyos_abi::syscall::SVC_LABEL, handle.0, &mut labels);
         }
 
+        // **The routing rule (`specs/capability-endowment-spec.md` §4.5).**
+        // A caller that endowed a handle or named an extra fd has decided what
+        // its child holds, and the launcher would overwrite that decision with
+        // a manifest row — so those spawn directly. Everything else asks the
+        // launcher when it holds one, and falls back for a program the image
+        // does not declare. A caller with no `launcher` connector gets plain
+        // inheritance, which is what a program endowed nothing should get.
+        let decided = !self.endowments.is_empty() || !self.extra_fds.is_empty();
+        if !decided {
+            if let Some(process) = self.launch(&resolved, &argv_buf, &env_buf, &fd_map)? {
+                drop(child_pipes);
+                return Ok((
+                    process,
+                    StdioPipes { stdin: stdin_pipe, stdout: stdout_pipe, stderr: stderr_pipe },
+                ));
+            }
+        }
+
         let spawn_args = toyos_abi::syscall::SpawnArgs {
             argv_ptr: argv_buf.as_ptr().expose_provenance() as u64,
             argv_len: argv_buf.len() as u64,
@@ -229,12 +257,12 @@ impl Command {
             labels_len: labels.len() as u64,
         };
         // SAFETY: spawn_args contains valid pointers to stack-local buffers that outlive the call.
-        let pid = unsafe { toyos_abi::syscall::spawn(&spawn_args) };
+        let spawned = unsafe { toyos_abi::syscall::spawn(&spawn_args) };
 
         // Close child-side pipe ends in the parent
         drop(child_pipes);
 
-        let pid = pid.map_err(|e| {
+        let handle = spawned.map_err(|e| {
             // An endowment moves only on a spawn that happened, so the
             // duplicate this call made is still ours and is ours to close.
             if let Some(handle) = inherited {
@@ -248,13 +276,116 @@ impl Command {
         })?;
 
         Ok((
-            Process { pid: pid.0 },
+            // SAFETY: the kernel installed this handle in our table for this
+            // call and no other.
+            Process { handle: unsafe { toyos::process::Process::from_raw(handle) } },
             StdioPipes {
                 stdin: stdin_pipe,
                 stdout: stdout_pipe,
                 stderr: stderr_pipe,
             },
         ))
+    }
+
+    /// Ask `/bin/init` to start this program, or answer `None` for a caller
+    /// that cannot or a program the manifest does not declare.
+    ///
+    /// The stdio handles are **duplicated** before they go: a launch moves what
+    /// it carries, and `Stdio::Inherit` names the parent's own slot 1.
+    fn launch(
+        &self,
+        resolved: &OsStr,
+        argv: &[u8],
+        env: &[u8],
+        fd_map: &[[u32; 2]],
+    ) -> io::Result<Option<Process>> {
+        use toyos::launch::{
+            self, Launch, LaunchError, Outcome, MAX_LAUNCH_EXTRAS, MAX_LAUNCH_SLOTS,
+        };
+
+        // A `provide` is a statement that the child's authority comes from its
+        // own manifest row plus this connector, and only the launcher can build
+        // that. Without one there is no weaker thing to fall back to that would
+        // still be what the caller asked for.
+        let Ok(conn) = toyos::endow::service("launcher") else {
+            return if self.provided.is_empty() {
+                Ok(None)
+            } else {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            };
+        };
+
+        // The whole path, not a key: `/bin/ls` is a symlink to `/bin/toybox`
+        // and the row that says what an applet holds is `toybox`'s. Resolving
+        // that is init's — it holds the manifest and this process must not
+        // become a second reader of it.
+        let program = resolved.to_str().unwrap_or("");
+
+        if self.provided.len() > MAX_LAUNCH_EXTRAS || fd_map.len() > MAX_LAUNCH_SLOTS {
+            return Ok(None);
+        }
+
+        let mut slots: Vec<(u32, toyos_abi::RawHandle)> = Vec::with_capacity(fd_map.len());
+        for &[child_slot, parent] in fd_map {
+            match toyos_abi::syscall::dup(toyos_abi::RawHandle(parent)) {
+                Ok(copy) => slots.push((child_slot, copy)),
+                Err(_) => {
+                    for (_, h) in &slots {
+                        toyos_abi::syscall::close(*h);
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+        let extras: Vec<(&str, toyos_abi::RawHandle)> = self
+            .provided
+            .iter()
+            .map(|(name, handle)| (name.as_str(), toyos_abi::RawHandle(*handle)))
+            .collect();
+        let cwd = self
+            .cwd
+            .as_ref()
+            .and_then(|c| c.to_str())
+            .map(String::from)
+            .unwrap_or_else(|| {
+                crate::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.to_str().map(String::from))
+                    .unwrap_or_else(|| String::from("/"))
+            });
+
+        let request = Launch { program, argv, env, cwd: &cwd, extras: &extras, slots: &slots };
+        let answer = launch::launch(&conn, &request);
+
+        // **The send moved them.** Every arm below but `NotSent` is past the
+        // point where these duplicates left this table, so closing them here
+        // would be this process naming a handle it does not hold — which the
+        // kernel answers by ending it. The launcher releases what it took.
+        match answer {
+            Ok(Outcome::Started(handle)) => {
+                // SAFETY: init moved this handle into our table and holds none.
+                Ok(Some(Process { handle: unsafe { toyos::process::Process::from_raw(handle) } }))
+            }
+            Ok(Outcome::NotDeclared) => {
+                if self.provided.is_empty() {
+                    Ok(None)
+                } else {
+                    // The direct path has no spelling for a provided connector,
+                    // so falling back would start the child without what the
+                    // caller said it must hold.
+                    Err(io::Error::from(io::ErrorKind::NotFound))
+                }
+            }
+            Ok(Outcome::Refused) | Err(LaunchError::Sent(_)) => {
+                Err(io::Error::from(io::ErrorKind::Other))
+            }
+            Err(LaunchError::NotSent(_)) => {
+                for (_, h) in &slots {
+                    toyos_abi::syscall::close(*h);
+                }
+                Ok(None)
+            }
+        }
     }
 
     fn setup_fd(
@@ -449,26 +580,53 @@ impl From<u8> for ExitCode {
     }
 }
 
+/// A child, as the handle its spawn answered with.
+///
+/// There is no pid in here and no way back from one: what may wait for this
+/// child, kill it or read its accounting is exactly what holds this handle.
 pub struct Process {
-    pid: u32,
+    handle: toyos::process::Process,
 }
 
 impl Process {
+    /// The child's pid, which is a name and not a key.
+    ///
+    /// Read out of the accounting record rather than kept beside the handle:
+    /// this is a diagnostic and nothing in the tree calls it on a hot path, so
+    /// paying a syscall for it is better than a second copy of the identity.
+    /// Zero for a child whose accounting the kernel would not answer for, which
+    /// is a process torn down between the spawn and the question.
     pub fn id(&self) -> u32 {
-        self.pid
+        self.handle.stats().map_or(0, |s| s.pid)
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
-        panic!("Process::kill not supported on ToyOS");
+        self.handle.kill().map_err(|_| io::Error::from(io::ErrorKind::Other))
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        let code = toyos_abi::syscall::waitpid(toyos_abi::Pid(self.pid));
-        Ok(ExitStatus(code as i32))
+        self.handle
+            .wait()
+            .map(ExitStatus)
+            .map_err(|_| io::Error::from(io::ErrorKind::Other))
+    }
+
+    /// See `os::toyos::process::ChildExt::as_raw_handle`.
+    pub fn as_raw_handle(&self) -> u32 {
+        toyos::AsHandle::as_handle(&self.handle).0
+    }
+
+    /// Give up the handle. See `os::toyos::process::ChildExt::into_raw_handle`.
+    pub fn into_raw_handle(self) -> u32 {
+        self.handle.into_raw().0
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.wait().map(Some)
+        match self.handle.try_wait() {
+            Ok(code) => Ok(Some(ExitStatus(code))),
+            Err(toyos_abi::syscall::SyscallError::WouldBlock) => Ok(None),
+            Err(_) => Err(io::Error::from(io::ErrorKind::Other)),
+        }
     }
 }
 
