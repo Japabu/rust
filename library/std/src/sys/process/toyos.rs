@@ -366,16 +366,16 @@ impl Command {
                 // SAFETY: init moved this handle into our table and holds none.
                 Ok(Some(Process { handle: unsafe { toyos::process::Process::from_raw(handle) } }))
             }
-            Ok(Outcome::NotDeclared) => {
-                if self.provided.is_empty() {
-                    Ok(None)
-                } else {
-                    // The direct path has no spelling for a provided connector,
-                    // so falling back would start the child without what the
-                    // caller said it must hold.
-                    Err(io::Error::from(io::ErrorKind::NotFound))
-                }
-            }
+            // The direct path, which is what §4.5 clause 2 says an undeclared
+            // program gets. A caller that transferred connectors loses nothing
+            // by it: init merges a launched program's extras into the namespace
+            // it builds, so a caller that was itself launched already carries
+            // them, and the child inherits that. What the direct path cannot do
+            // is merge a name into an *inherited* namespace — no caller in the
+            // tree needs it, and
+            // `specs/issues/isolation/a-provided-name-cannot-reach-an-undeclared-child.md`
+            // is where that is written down.
+            Ok(Outcome::NotDeclared) => Ok(None),
             Ok(Outcome::Refused) | Err(LaunchError::Sent(_)) => {
                 Err(io::Error::from(io::ErrorKind::Other))
             }

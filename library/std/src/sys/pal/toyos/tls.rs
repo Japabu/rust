@@ -27,8 +27,13 @@
 /// Calls SYS_TLS_ALLOC_BLOCK to allocate the TLS block on demand.
 #[inline(never)]
 unsafe extern "C" fn __tls_get_addr_slow(module_id: u64, offset: u64) -> *mut u8 {
-    let block_phys = toyos_abi::syscall::tls_alloc_block(module_id);
-    core::ptr::without_provenance_mut((block_phys + offset) as usize)
+    // `__tls_get_addr`'s ABI is an address and there is nobody to return an
+    // error to: a refusal added to `offset` is a pointer near the top of the
+    // address space that the caller would then dereference.
+    match toyos_abi::syscall::tls_alloc_block(module_id) {
+        Ok(block) => core::ptr::without_provenance_mut((block + offset) as usize),
+        Err(_) => crate::rtabort!("no TLS block for a dlopen'd module"),
+    }
 }
 
 /// Fast path: naked asm reads DTV directly from fs:[8], checks bounds and allocation,
