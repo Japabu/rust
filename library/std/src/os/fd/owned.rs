@@ -21,7 +21,9 @@ use crate::mem::ManuallyDrop;
 )))]
 use crate::sys::cvt;
 #[cfg(not(target_os = "trusty"))]
-use crate::sys::{AsInner, FromInner, IntoInner};
+use crate::sys::AsInner;
+#[cfg(not(any(target_os = "trusty", target_os = "toyos")))]
+use crate::sys::{FromInner, IntoInner};
 use crate::{fmt, io};
 
 type ValidRawFd = core::num::niche_types::NotAllOnes<RawFd>;
@@ -211,6 +213,9 @@ impl FromRawFd for OwnedFd {
 #[stable(feature = "io_safety", since = "1.63.0")]
 impl Drop for OwnedFd {
     #[inline]
+    // ToyOS closes a handle with a safe call, so the block this shares with
+    // every `libc::close` below has nothing unsafe left in it there.
+    #[cfg_attr(target_os = "toyos", allow(unused_unsafe))]
     fn drop(&mut self) {
         unsafe {
             // Note that errors are ignored when closing a file descriptor. According to POSIX 2024,

@@ -32,7 +32,7 @@ unsafe extern "C" fn __tls_get_addr_slow(module_id: u64, offset: u64) -> *mut u8
     // address space that the caller would then dereference.
     match toyos_abi::syscall::tls_alloc_block(module_id) {
         Ok(block) => core::ptr::without_provenance_mut((block + offset) as usize),
-        Err(_) => crate::rtabort!("no TLS block for a dlopen'd module"),
+        Err(_) => rtabort!("no TLS block for a dlopen'd module"),
     }
 }
 
