@@ -50,12 +50,10 @@ fn syscall_err(e: SyscallError) -> io::Error {
     }
 }
 
-/// Wrap rx/tx pipes into a single kernel socket fd.
+/// Join rx/tx pipes into a single duplex kernel handle.
 fn make_socket_fd(rx: toyos::Pipe, tx: toyos::Pipe) -> io::Result<OwnedFd> {
-    let rx_id = rx.pipe_id().map_err(syscall_err)?;
-    let tx_id = tx.pipe_id().map_err(syscall_err)?;
-    let socket_fd = syscall::socket_create(rx_id, tx_id).map_err(syscall_err)?;
-    // Pipes are consumed — drop closes the underlying fds
+    let socket_fd = syscall::connection_join(rx.fd(), tx.fd()).map_err(syscall_err)?;
+    // The join takes references of its own; these two are consumed here.
     drop(rx);
     drop(tx);
     Ok(unsafe { OwnedFd::from_raw_fd(socket_fd.0 as i32) })
