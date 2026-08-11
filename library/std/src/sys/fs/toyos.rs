@@ -28,9 +28,8 @@ pub struct File(RawHandle);
 #[derive(Clone)]
 pub struct FileAttr {
     size: u64,
-    file_type: syscall::FileType,
+    file_type: FileType,
     mtime: u64,
-    is_symlink: bool,
 }
 
 pub struct ReadDir {
@@ -83,11 +82,7 @@ impl FileAttr {
     }
 
     pub fn file_type(&self) -> FileType {
-        FileType {
-            is_file: self.file_type == syscall::FileType::File,
-            is_dir: self.file_type == syscall::FileType::Pipe, // directories use readdir path, not fstat
-            is_symlink: self.is_symlink,
-        }
+        self.file_type
     }
 
     pub fn modified(&self) -> io::Result<SystemTime> {
@@ -168,12 +163,7 @@ impl DirEntry {
     }
 
     pub fn metadata(&self) -> io::Result<FileAttr> {
-        Ok(FileAttr {
-            size: self.size,
-            file_type: if self.is_dir { syscall::FileType::Pipe } else { syscall::FileType::File },
-            mtime: 0,
-            is_symlink: false,
-        })
+        Ok(FileAttr { size: self.size, file_type: self.file_type()?, mtime: 0 })
     }
 
     pub fn file_type(&self) -> io::Result<FileType> {
@@ -236,7 +226,11 @@ impl File {
 
     pub fn file_attr(&self) -> io::Result<FileAttr> {
         let stat = syscall::fstat(self.0).map_err(to_io_error)?;
-        Ok(FileAttr { size: stat.size, file_type: stat.file_type, mtime: stat.mtime, is_symlink: false })
+        Ok(FileAttr {
+            size: stat.size,
+            file_type: opened_file_type(stat.file_type),
+            mtime: stat.mtime,
+        })
     }
 
     pub fn fsync(&self) -> io::Result<()> {
@@ -360,17 +354,22 @@ impl fmt::Debug for File {
 /// Whether `path` names a directory, asked through `readdir`.
 ///
 /// `open` only works for files, so this is the only way to tell. The buffer is
-/// deliberately tiny: the kernel reports the size the listing *needs* whether
-/// or not it fits, so the answer is in the return value and the bytes are not
-/// wanted. A directory too large to list is still a directory, which is why
-/// `ResourceExhausted` is a yes.
+/// deliberately tiny: only whether the kernel accepted the path matters, and a
+/// listing that does not fit is reported rather than written. An empty
+/// directory lists as zero entries, and a directory too large to list is still
+/// a directory, which is why `ResourceExhausted` is a yes.
 fn is_dir(path_bytes: &[u8]) -> bool {
     let mut buf = [0u8; 1];
     match syscall::readdir(path_bytes, &mut buf) {
-        Ok(n) => n > 0,
-        Err(SyscallError::ResourceExhausted) => true,
+        Ok(_) | Err(SyscallError::ResourceExhausted) => true,
         Err(_) => false,
     }
+}
+
+/// The type of something `open` accepted, which is never a directory: `open`
+/// refuses those, so `is_dir` is the only way to ask.
+fn opened_file_type(ty: syscall::FileType) -> FileType {
+    FileType { is_file: ty == syscall::FileType::File, is_dir: false, is_symlink: false }
 }
 
 pub fn readdir(p: &Path) -> io::Result<ReadDir> {
@@ -502,10 +501,18 @@ pub fn stat(path: &Path) -> io::Result<FileAttr> {
         let result = syscall::fstat(fd);
         syscall::close(fd);
         let st = result.map_err(to_io_error)?;
-        return Ok(FileAttr { size: st.size, file_type: st.file_type, mtime: st.mtime, is_symlink: false });
+        return Ok(FileAttr {
+            size: st.size,
+            file_type: opened_file_type(st.file_type),
+            mtime: st.mtime,
+        });
     }
     if is_dir(path_bytes) {
-        return Ok(FileAttr { size: 0, file_type: syscall::FileType::Pipe, mtime: 0, is_symlink: false });
+        return Ok(FileAttr {
+            size: 0,
+            file_type: FileType { is_file: false, is_dir: true, is_symlink: false },
+            mtime: 0,
+        });
     }
     Err(io::Error::new(io::ErrorKind::NotFound, "file not found"))
 }
@@ -517,9 +524,8 @@ pub fn lstat(path: &Path) -> io::Result<FileAttr> {
     if let Ok(n) = syscall::readlink(path_bytes, &mut link_buf) {
         return Ok(FileAttr {
             size: n as u64,
-            file_type: syscall::FileType::File,
+            file_type: FileType { is_file: false, is_dir: false, is_symlink: true },
             mtime: 0,
-            is_symlink: true,
         });
     }
     stat(path)
