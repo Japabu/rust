@@ -1,7 +1,7 @@
 use crate::sys::process as imp;
 use crate::sys::{AsInner, AsInnerMut, FromInner, IntoInner};
 
-/// Create a `Stdio` that pipes through a tty-typed file descriptor.
+/// Create a `Stdio` that pipes through a tty-typed handle.
 ///
 /// Like `Stdio::piped()`, but the pipe endpoints are marked as tty so the
 /// child process gets canonical mode (echo + line editing) on its stdin.
@@ -13,13 +13,13 @@ pub fn tty_piped() -> crate::process::Stdio {
 /// ToyOS-specific extensions to [`process::Command`].
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 pub trait CommandExt {
-    /// Pass an additional file descriptor to the child process.
+    /// Pass an additional handle to the child process.
     ///
-    /// The child process will inherit `parent_fd` as `child_fd`.
-    /// This is useful for passing pipe file descriptors (e.g., for jobserver
+    /// The child process will inherit `parent_handle` at slot `child_slot`.
+    /// This is useful for passing pipe handles (e.g., for jobserver
     /// protocols) to child processes.
     #[stable(feature = "toyos_ext", since = "1.0.0")]
-    fn inherit_fd(&mut self, child_fd: u32, parent_fd: u32) -> &mut Self;
+    fn inherit_handle(&mut self, child_slot: u32, parent_handle: u32) -> &mut Self;
 
     /// Give the child a handle under a name it can look itself up by.
     ///
@@ -48,8 +48,8 @@ pub trait CommandExt {
 
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 impl CommandExt for crate::process::Command {
-    fn inherit_fd(&mut self, child_fd: u32, parent_fd: u32) -> &mut Self {
-        self.as_inner_mut().inherit_fd(child_fd, parent_fd);
+    fn inherit_handle(&mut self, child_slot: u32, parent_handle: u32) -> &mut Self {
+        self.as_inner_mut().inherit_handle(child_slot, parent_handle);
         self
     }
 

@@ -6,7 +6,8 @@ use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use crate::time::Duration;
 use toyos_abi::RawHandle;
-use toyos::poller::{Poller, IORING_POLL_IN, IORING_POLL_OUT};
+use toyos::AsHandle;
+use toyos::poller::{Poller, READABLE, WRITABLE};
 use toyos_abi::syscall::{self, SyscallError};
 use toyos::net::{NetError, TcpSocketId, UdpSocketId};
 
@@ -52,7 +53,8 @@ fn syscall_err(e: SyscallError) -> io::Error {
 
 /// Join rx/tx pipes into a single duplex kernel handle.
 fn make_socket_fd(rx: toyos::Pipe, tx: toyos::Pipe) -> io::Result<OwnedFd> {
-    let socket_fd = syscall::connection_join(rx.fd(), tx.fd()).map_err(syscall_err)?;
+    let socket_fd =
+        syscall::connection_join(rx.as_handle(), tx.as_handle()).map_err(syscall_err)?;
     // The join takes references of its own; these two are consumed here.
     drop(rx);
     drop(tx);
@@ -120,7 +122,7 @@ impl TcpStream {
         })
     }
 
-    fn raw_fd(&self) -> RawHandle {
+    fn raw_handle(&self) -> RawHandle {
         RawHandle(self.fd.as_raw_fd() as u32)
     }
 
@@ -153,19 +155,19 @@ impl TcpStream {
             return Ok(0);
         }
         if self.nonblocking.load(Relaxed) {
-            return syscall::read_nonblock(self.raw_fd(), buf).map_err(syscall_err);
+            return syscall::read_nonblock(self.raw_handle(), buf).map_err(syscall_err);
         }
         let timeout_ms = self.read_timeout_ms.load(Relaxed);
         if timeout_ms > 0 {
             let poller = Poller::new(1);
-            poller.poll_add_fd(self.raw_fd(), IORING_POLL_IN, 0);
+            poller.watch_raw(self.raw_handle(), READABLE, 0);
             let mut ready = false;
             poller.wait(1, timeout_ms as u64 * 1_000_000, |_| ready = true);
             if !ready {
                 return Err(io::ErrorKind::TimedOut.into());
             }
         }
-        syscall::read(self.raw_fd(), buf).map_err(syscall_err)
+        syscall::read(self.raw_handle(), buf).map_err(syscall_err)
     }
 
     pub fn read_buf(&self, mut buf: BorrowedCursor<'_, u8>) -> io::Result<()> {
@@ -199,19 +201,19 @@ impl TcpStream {
             return Ok(0);
         }
         if self.nonblocking.load(Relaxed) {
-            return syscall::write_nonblock(self.raw_fd(), buf).map_err(syscall_err);
+            return syscall::write_nonblock(self.raw_handle(), buf).map_err(syscall_err);
         }
         let timeout_ms = self.write_timeout_ms.load(Relaxed);
         if timeout_ms > 0 {
             let poller = Poller::new(1);
-            poller.poll_add_fd(self.raw_fd(), IORING_POLL_OUT, 0);
+            poller.watch_raw(self.raw_handle(), WRITABLE, 0);
             let mut ready = false;
             poller.wait(1, timeout_ms as u64 * 1_000_000, |_| ready = true);
             if !ready {
                 return Err(io::ErrorKind::TimedOut.into());
             }
         }
-        syscall::write(self.raw_fd(), buf).map_err(syscall_err)
+        syscall::write(self.raw_handle(), buf).map_err(syscall_err)
     }
 
     pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
@@ -254,7 +256,7 @@ impl TcpStream {
     }
 
     pub fn duplicate(&self) -> io::Result<TcpStream> {
-        let new_fd = syscall::dup(self.raw_fd()).map_err(syscall_err)?;
+        let new_fd = syscall::dup(self.raw_handle()).map_err(syscall_err)?;
         Ok(TcpStream {
             fd: unsafe { OwnedFd::from_raw_fd(new_fd.0 as i32) },
             socket: Arc::clone(&self.socket),
@@ -353,7 +355,7 @@ impl TcpListener {
         let (ip, port) = addr_to_v4(&addr)?;
         let bound = toyos::net::tcp_bind(ip, port).map_err(net_err_to_io)?;
         Ok(TcpListener {
-            notify_fd: unsafe { OwnedFd::from_raw_fd(bound.notify.into_fd().0 as i32) },
+            notify_fd: unsafe { OwnedFd::from_raw_fd(bound.notify.into_raw().0 as i32) },
             socket: Arc::new(NetdSocket::Tcp(bound.socket_id)),
             local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), bound.bound_port)),
             nonblocking: AtomicBool::new(false),
@@ -475,8 +477,8 @@ impl UdpSocket {
         let bound = toyos::net::udp_bind(ip, port).map_err(net_err_to_io)?;
         Ok(UdpSocket {
             socket: Arc::new(NetdSocket::Udp(bound.socket_id)),
-            tx_fd: unsafe { OwnedFd::from_raw_fd(bound.tx.into_fd().0 as i32) },
-            rx_fd: unsafe { OwnedFd::from_raw_fd(bound.rx.into_fd().0 as i32) },
+            tx_fd: unsafe { OwnedFd::from_raw_fd(bound.tx.into_raw().0 as i32) },
+            rx_fd: unsafe { OwnedFd::from_raw_fd(bound.rx.into_raw().0 as i32) },
             local: SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::from(ip),
                 bound.bound_port,

@@ -21,7 +21,7 @@ pub struct Command {
     stdin: Option<Stdio>,
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
-    extra_fds: Vec<[u32; 2]>,
+    extra_slots: Vec<[u32; 2]>,
     endowments: Vec<(String, u32)>,
     provided: Vec<(String, u32)>,
 }
@@ -48,7 +48,7 @@ impl Command {
             stdin: None,
             stdout: None,
             stderr: None,
-            extra_fds: Vec::new(),
+            extra_slots: Vec::new(),
             endowments: Vec::new(),
             provided: Vec::new(),
         }
@@ -104,10 +104,10 @@ impl Command {
         self.cwd.as_ref().map(|cs| Path::new(cs))
     }
 
-    /// Add an extra file descriptor mapping for the child process.
-    /// The child will see `child_fd` mapped to the parent's `parent_fd`.
-    pub fn inherit_fd(&mut self, child_fd: u32, parent_fd: u32) {
-        self.extra_fds.push([child_fd, parent_fd]);
+    /// Add an extra handle mapping for the child process.
+    /// The child will see slot `child_slot` holding the parent's `parent_handle`.
+    pub fn inherit_handle(&mut self, child_slot: u32, parent_handle: u32) {
+        self.extra_slots.push([child_slot, parent_handle]);
     }
 
     /// Give the child `handle` under the name `label`.
@@ -175,19 +175,19 @@ impl Command {
         let stdout = self.stdout.as_ref().unwrap_or(&default);
         let stderr = self.stderr.as_ref().unwrap_or(&default);
 
-        let mut fd_map: Vec<[u32; 2]> = Vec::new();
+        let mut slot_map: Vec<[u32; 2]> = Vec::new();
         let mut child_pipes: Vec<Pipe> = Vec::new();
         let mut stdin_pipe: Option<Pipe> = None;
         let mut stdout_pipe: Option<Pipe> = None;
         let mut stderr_pipe: Option<Pipe> = None;
 
-        // Resolve each stdio to an fd_map entry: [child_fd, parent_fd]
-        Self::setup_fd(&mut fd_map, &mut child_pipes, &mut stdin_pipe, stdin, 0, true)?;
-        Self::setup_fd(&mut fd_map, &mut child_pipes, &mut stdout_pipe, stdout, 1, false)?;
-        Self::setup_fd(&mut fd_map, &mut child_pipes, &mut stderr_pipe, stderr, 2, false)?;
+        // Resolve each stdio to a slot_map entry: [child_slot, parent_handle]
+        Self::setup_slot(&mut slot_map, &mut child_pipes, &mut stdin_pipe, stdin, 0, true)?;
+        Self::setup_slot(&mut slot_map, &mut child_pipes, &mut stdout_pipe, stdout, 1, false)?;
+        Self::setup_slot(&mut slot_map, &mut child_pipes, &mut stderr_pipe, stderr, 2, false)?;
 
-        // Add extra fd mappings (e.g., for jobserver pipes)
-        fd_map.extend_from_slice(&self.extra_fds);
+        // Add extra handle mappings (e.g., for jobserver pipes)
+        slot_map.extend_from_slice(&self.extra_slots);
 
         // Build environment: serialize all env vars as KEY=VALUE\0KEY2=VALUE2\0...
         let mut env_buf = Vec::new();
@@ -226,16 +226,16 @@ impl Command {
             push(toyos_abi::syscall::SVC_LABEL, handle.0, &mut labels);
         }
 
-        // **The routing rule (`specs/capability-endowment-spec.md` §4.5).**
-        // A caller that endowed a handle or named an extra fd has decided what
+        // **The routing rule.**
+        // A caller that endowed a handle or named an extra slot has decided what
         // its child holds, and the launcher would overwrite that decision with
         // a manifest row — so those spawn directly. Everything else asks the
         // launcher when it holds one, and falls back for a program the image
         // does not declare. A caller with no `launcher` connector gets plain
         // inheritance, which is what a program endowed nothing should get.
-        let decided = !self.endowments.is_empty() || !self.extra_fds.is_empty();
+        let decided = !self.endowments.is_empty() || !self.extra_slots.is_empty();
         if !decided {
-            if let Some(process) = self.launch(&resolved, &argv_buf, &env_buf, &fd_map)? {
+            if let Some(process) = self.launch(&resolved, &argv_buf, &env_buf, &slot_map)? {
                 drop(child_pipes);
                 return Ok((
                     process,
@@ -247,8 +247,8 @@ impl Command {
         let spawn_args = toyos_abi::syscall::SpawnArgs {
             argv_ptr: argv_buf.as_ptr().expose_provenance() as u64,
             argv_len: argv_buf.len() as u64,
-            slot_map_ptr: fd_map.as_ptr().expose_provenance() as u64,
-            slot_map_count: fd_map.len() as u64,
+            slot_map_ptr: slot_map.as_ptr().expose_provenance() as u64,
+            slot_map_count: slot_map.len() as u64,
             env_ptr: env_buf.as_ptr().expose_provenance() as u64,
             env_len: env_buf.len() as u64,
             endow_ptr: endow.as_ptr().expose_provenance() as u64,
@@ -297,7 +297,7 @@ impl Command {
         resolved: &OsStr,
         argv: &[u8],
         env: &[u8],
-        fd_map: &[[u32; 2]],
+        slot_map: &[[u32; 2]],
     ) -> io::Result<Option<Process>> {
         use toyos::launch::{
             self, Launch, LaunchError, Outcome, MAX_LAUNCH_EXTRAS, MAX_LAUNCH_SLOTS,
@@ -321,12 +321,12 @@ impl Command {
         // become a second reader of it.
         let program = resolved.to_str().unwrap_or("");
 
-        if self.provided.len() > MAX_LAUNCH_EXTRAS || fd_map.len() > MAX_LAUNCH_SLOTS {
+        if self.provided.len() > MAX_LAUNCH_EXTRAS || slot_map.len() > MAX_LAUNCH_SLOTS {
             return Ok(None);
         }
 
-        let mut slots: Vec<(u32, toyos_abi::RawHandle)> = Vec::with_capacity(fd_map.len());
-        for &[child_slot, parent] in fd_map {
+        let mut slots: Vec<(u32, toyos_abi::RawHandle)> = Vec::with_capacity(slot_map.len());
+        for &[child_slot, parent] in slot_map {
             match toyos_abi::syscall::dup(toyos_abi::RawHandle(parent)) {
                 Ok(copy) => slots.push((child_slot, copy)),
                 Err(_) => {
@@ -373,7 +373,7 @@ impl Command {
             // them, and the child inherits that. What the direct path cannot do
             // is merge a name into an *inherited* namespace — no caller in the
             // tree needs it, and
-            // `specs/issues/isolation/a-provided-name-cannot-reach-an-undeclared-child.md`
+            // `issues/isolation/a-provided-name-cannot-reach-an-undeclared-child.md`
             // is where that is written down.
             Ok(Outcome::NotDeclared) => Ok(None),
             Ok(Outcome::Refused) | Err(LaunchError::Sent(_)) => {
@@ -388,16 +388,16 @@ impl Command {
         }
     }
 
-    fn setup_fd(
-        fd_map: &mut Vec<[u32; 2]>,
+    fn setup_slot(
+        slot_map: &mut Vec<[u32; 2]>,
         child_pipes: &mut Vec<Pipe>,
         parent_pipe: &mut Option<Pipe>,
         stdio: &Stdio,
-        child_fd: u32,
+        child_slot: u32,
         is_input: bool,
     ) -> io::Result<()> {
         match stdio {
-            Stdio::Inherit => fd_map.push([child_fd, child_fd]),
+            Stdio::Inherit => slot_map.push([child_slot, child_slot]),
             Stdio::MakePipe | Stdio::MakeTtyPipe => {
                 let (r, w) = crate::sys::pipe::pipe()?;
                 if matches!(stdio, Stdio::MakeTtyPipe) {
@@ -405,19 +405,19 @@ impl Command {
                     toyos_abi::syscall::mark_tty(toyos_abi::RawHandle(w.raw_fd() as u32));
                 }
                 if is_input {
-                    fd_map.push([child_fd, r.raw_fd() as u32]);
+                    slot_map.push([child_slot, r.raw_fd() as u32]);
                     child_pipes.push(r);
                     *parent_pipe = Some(w);
                 } else {
-                    fd_map.push([child_fd, w.raw_fd() as u32]);
+                    slot_map.push([child_slot, w.raw_fd() as u32]);
                     child_pipes.push(w);
                     *parent_pipe = Some(r);
                 }
             }
-            Stdio::InheritFile(file) => fd_map.push([child_fd, file.raw_fd() as u32]),
-            Stdio::InheritPipe(pipe) => fd_map.push([child_fd, pipe.raw_fd() as u32]),
-            Stdio::ParentStdout => fd_map.push([child_fd, 1]),
-            Stdio::ParentStderr => fd_map.push([child_fd, 2]),
+            Stdio::InheritFile(file) => slot_map.push([child_slot, file.raw_fd() as u32]),
+            Stdio::InheritPipe(pipe) => slot_map.push([child_slot, pipe.raw_fd() as u32]),
+            Stdio::ParentStdout => slot_map.push([child_slot, 1]),
+            Stdio::ParentStderr => slot_map.push([child_slot, 2]),
             Stdio::Null => {}
         }
         Ok(())
