@@ -17,7 +17,9 @@ fn lock_env() -> MutexGuard<'static, Option<HashMap<OsString, OsString>>> {
             let mut buf = vec![0u8; size];
             toyos_abi::syscall::get_env(&mut buf);
             for entry in buf.split(|&b| b == 0) {
-                if entry.is_empty() { continue; }
+                if entry.is_empty() {
+                    continue;
+                }
                 if let Some(eq) = entry.iter().position(|&b| b == b'=') {
                     let key = OsString::from(crate::str::from_utf8(&entry[..eq]).unwrap_or(""));
                     let val = OsString::from(crate::str::from_utf8(&entry[eq + 1..]).unwrap_or(""));

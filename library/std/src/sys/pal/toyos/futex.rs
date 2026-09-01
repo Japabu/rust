@@ -8,8 +8,7 @@ pub type SmallFutex = Atomic<SmallPrimitive>;
 pub type SmallPrimitive = u32;
 
 pub fn futex_wait(futex: &Atomic<u32>, expected: u32, timeout: Option<Duration>) -> bool {
-    let timeout_ns = timeout
-        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    let timeout_ns = timeout.map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
 
     // SAFETY: futex points to a valid Atomic<u32> that outlives this call.
     let r = unsafe { toyos_abi::syscall::futex_wait(futex.as_ptr(), expected, timeout_ns) };
@@ -25,5 +24,7 @@ pub fn futex_wake(futex: &Atomic<u32>) -> bool {
 #[inline]
 pub fn futex_wake_all(futex: &Atomic<u32>) {
     // SAFETY: futex points to a valid Atomic<u32> that outlives this call.
-    unsafe { toyos_abi::syscall::futex_wake(futex.as_ptr(), u32::MAX); }
+    unsafe {
+        toyos_abi::syscall::futex_wake(futex.as_ptr(), u32::MAX);
+    }
 }

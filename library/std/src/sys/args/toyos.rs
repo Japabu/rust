@@ -1,6 +1,7 @@
+use core::sync::atomic::Ordering;
+
 pub use super::common::Args;
 use crate::ffi::{CStr, OsString};
-use core::sync::atomic::Ordering;
 
 pub fn args() -> Args {
     let argc = crate::sys::pal::ARGC.load(Ordering::Relaxed);

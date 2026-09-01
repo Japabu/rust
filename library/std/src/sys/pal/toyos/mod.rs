@@ -6,17 +6,18 @@ pub mod tls;
 #[path = "../unsupported/common.rs"]
 mod unsupported_common;
 
-pub use unsupported_common::{cleanup, init};
-
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+pub use unsupported_common::{cleanup, init};
 
 /// The kernel's word as the `ErrorKind` a caller can act on.
 ///
 /// Exhaustive: a new `SyscallError` has to be given a kind here rather than
 /// reaching callers as `Other` from whichever module mapped it last.
 pub fn to_io_error(e: toyos_abi::syscall::SyscallError) -> crate::io::Error {
-    use crate::io::ErrorKind;
     use toyos_abi::syscall::SyscallError;
+
+    use crate::io::ErrorKind;
 
     let kind = match e {
         SyscallError::Unknown => ErrorKind::Uncategorized,
@@ -160,8 +161,9 @@ mod c_allocator {
 /// DWARF EH frame finder for the `unwinding` crate.
 /// Locates `.eh_frame_hdr` for a given PC via `SYS_QUERY_MODULES`.
 mod eh_frame {
-    use crate::sync::Mutex;
     use toyos_abi::syscall::ModuleInfo;
+
+    use crate::sync::Mutex;
 
     struct Module {
         base: usize,
@@ -181,7 +183,9 @@ mod eh_frame {
                     let mut modules = Vec::with_capacity(count);
                     for i in 0..count {
                         let off = i * info_size;
-                        if off + info_size > buf.len() { break; }
+                        if off + info_size > buf.len() {
+                            break;
+                        }
                         let info = unsafe { &*(buf.as_ptr().add(off) as *const ModuleInfo) };
                         modules.push(Module {
                             base: info.base as usize,
@@ -194,7 +198,9 @@ mod eh_frame {
                 }
                 Err(_) => {
                     buf.resize(buf.len() * 2, 0);
-                    if buf.len() > 1024 * 1024 { return Vec::new(); }
+                    if buf.len() > 1024 * 1024 {
+                        return Vec::new();
+                    }
                 }
             }
         }

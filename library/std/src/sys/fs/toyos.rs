@@ -1,3 +1,6 @@
+use toyos_abi::RawHandle;
+use toyos_abi::syscall::{self, OpenFlags, SyscallError};
+
 use crate::ffi::OsString;
 use crate::fmt;
 use crate::fs::TryLockError;
@@ -7,9 +10,6 @@ use crate::path::{Path, PathBuf};
 pub use crate::sys::fs::common::Dir;
 use crate::sys::time::SystemTime;
 use crate::sys::to_io_error;
-
-use toyos_abi::RawHandle;
-use toyos_abi::syscall::{self, OpenFlags, SyscallError};
 
 pub struct File(RawHandle);
 
@@ -155,11 +155,7 @@ impl DirEntry {
     }
 
     pub fn file_type(&self) -> io::Result<FileType> {
-        Ok(FileType {
-            is_file: !self.is_dir,
-            is_dir: self.is_dir,
-            is_symlink: false,
-        })
+        Ok(FileType { is_file: !self.is_dir, is_dir: self.is_dir, is_symlink: false })
     }
 }
 
@@ -175,20 +171,42 @@ impl OpenOptions {
         }
     }
 
-    pub fn read(&mut self, read: bool) { self.read = read; }
-    pub fn write(&mut self, write: bool) { self.write = write; }
-    pub fn append(&mut self, append: bool) { self.append = append; }
-    pub fn truncate(&mut self, truncate: bool) { self.truncate = truncate; }
-    pub fn create(&mut self, create: bool) { self.create = create; }
-    pub fn create_new(&mut self, create_new: bool) { self.create_new = create_new; }
+    pub fn read(&mut self, read: bool) {
+        self.read = read;
+    }
+    pub fn write(&mut self, write: bool) {
+        self.write = write;
+    }
+    pub fn append(&mut self, append: bool) {
+        self.append = append;
+    }
+    pub fn truncate(&mut self, truncate: bool) {
+        self.truncate = truncate;
+    }
+    pub fn create(&mut self, create: bool) {
+        self.create = create;
+    }
+    pub fn create_new(&mut self, create_new: bool) {
+        self.create_new = create_new;
+    }
 
     fn to_flags(&self) -> OpenFlags {
         let mut flags = OpenFlags(0);
-        if self.read { flags |= OpenFlags::READ; }
-        if self.write || self.append { flags |= OpenFlags::WRITE; }
-        if self.append { flags |= OpenFlags::APPEND; }
-        if self.create || self.create_new { flags |= OpenFlags::CREATE; }
-        if self.truncate { flags |= OpenFlags::TRUNCATE; }
+        if self.read {
+            flags |= OpenFlags::READ;
+        }
+        if self.write || self.append {
+            flags |= OpenFlags::WRITE;
+        }
+        if self.append {
+            flags |= OpenFlags::APPEND;
+        }
+        if self.create || self.create_new {
+            flags |= OpenFlags::CREATE;
+        }
+        if self.truncate {
+            flags |= OpenFlags::TRUNCATE;
+        }
         flags
     }
 }
@@ -229,11 +247,21 @@ impl File {
         self.fsync()
     }
 
-    pub fn lock(&self) -> io::Result<()> { Ok(()) }
-    pub fn lock_shared(&self) -> io::Result<()> { Ok(()) }
-    pub fn try_lock(&self) -> Result<(), TryLockError> { Ok(()) }
-    pub fn try_lock_shared(&self) -> Result<(), TryLockError> { Ok(()) }
-    pub fn unlock(&self) -> io::Result<()> { Ok(()) }
+    pub fn lock(&self) -> io::Result<()> {
+        Ok(())
+    }
+    pub fn lock_shared(&self) -> io::Result<()> {
+        Ok(())
+    }
+    pub fn try_lock(&self) -> Result<(), TryLockError> {
+        Ok(())
+    }
+    pub fn try_lock_shared(&self) -> Result<(), TryLockError> {
+        Ok(())
+    }
+    pub fn unlock(&self) -> io::Result<()> {
+        Ok(())
+    }
 
     pub fn truncate(&self, size: u64) -> io::Result<()> {
         syscall::ftruncate(self.0, size).map_err(to_io_error)
@@ -249,13 +277,21 @@ impl File {
             match self.read(buf) {
                 Ok(0) => break,
                 Ok(n) => total += n,
-                Err(e) => if total == 0 { return Err(e) } else { break },
+                Err(e) => {
+                    if total == 0 {
+                        return Err(e);
+                    } else {
+                        break;
+                    }
+                }
             }
         }
         Ok(total)
     }
 
-    pub fn is_read_vectored(&self) -> bool { false }
+    pub fn is_read_vectored(&self) -> bool {
+        false
+    }
 
     pub fn read_buf(&self, mut cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
         let n = self.read(cursor.ensure_init())?;
@@ -273,13 +309,21 @@ impl File {
             match self.write(buf) {
                 Ok(0) => break,
                 Ok(n) => total += n,
-                Err(e) => if total == 0 { return Err(e) } else { break },
+                Err(e) => {
+                    if total == 0 {
+                        return Err(e);
+                    } else {
+                        break;
+                    }
+                }
             }
         }
         Ok(total)
     }
 
-    pub fn is_write_vectored(&self) -> bool { false }
+    pub fn is_write_vectored(&self) -> bool {
+        false
+    }
 
     pub fn flush(&self) -> io::Result<()> {
         self.fsync()
@@ -396,7 +440,9 @@ pub fn readdir(p: &Path) -> io::Result<ReadDir> {
     let mut entries = Vec::new();
     let mut pos = 0;
     while pos < data.len() {
-        if pos + 1 >= data.len() { break; }
+        if pos + 1 >= data.len() {
+            break;
+        }
         let entry_type = data[pos];
         pos += 1;
         let name_end = match data[pos..].iter().position(|&b| b == 0) {
@@ -405,7 +451,9 @@ pub fn readdir(p: &Path) -> io::Result<ReadDir> {
         };
         let name = core::str::from_utf8(&data[pos..name_end]).unwrap_or("");
         pos = name_end + 1;
-        if pos + 8 > data.len() { break; }
+        if pos + 8 > data.len() {
+            break;
+        }
         let size = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
         pos += 8;
         entries.push(DirEntry {
@@ -524,13 +572,35 @@ pub fn canonicalize(p: &Path) -> io::Result<PathBuf> {
 }
 
 pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
-    let reader = File::open(from, &OpenOptions { read: true, write: false, append: false, truncate: false, create: false, create_new: false })?;
-    let writer = File::open(to, &OpenOptions { read: false, write: true, append: false, truncate: true, create: true, create_new: false })?;
+    let reader = File::open(
+        from,
+        &OpenOptions {
+            read: true,
+            write: false,
+            append: false,
+            truncate: false,
+            create: false,
+            create_new: false,
+        },
+    )?;
+    let writer = File::open(
+        to,
+        &OpenOptions {
+            read: false,
+            write: true,
+            append: false,
+            truncate: true,
+            create: true,
+            create_new: false,
+        },
+    )?;
     let mut buf = vec![0u8; 8192];
     let mut total = 0u64;
     loop {
         let n = reader.read(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         writer.write(&buf[..n])?;
         total += n as u64;
     }

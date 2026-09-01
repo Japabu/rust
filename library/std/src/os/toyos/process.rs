@@ -1,5 +1,4 @@
-use crate::sys::process as imp;
-use crate::sys::{AsInner, AsInnerMut, FromInner, IntoInner};
+use crate::sys::{AsInner, AsInnerMut, FromInner, IntoInner, process as imp};
 
 /// Create a `Stdio` that pipes through a tty-typed handle.
 ///

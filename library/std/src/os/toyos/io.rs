@@ -1,9 +1,9 @@
-use crate::os::fd as fd;
-use crate::sys::{AsInner, FromInner};
-
 // Re-export standard fd traits
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 pub use fd::*;
+
+use crate::os::fd;
+use crate::sys::{AsInner, FromInner};
 
 #[stable(feature = "toyos_ext", since = "1.0.0")]
 impl AsRawFd for crate::fs::File {

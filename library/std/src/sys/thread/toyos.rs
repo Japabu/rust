@@ -1,9 +1,10 @@
+use toyos_abi::syscall;
+
 use crate::ffi::CStr;
 use crate::io;
 use crate::num::NonZero;
 use crate::thread::ThreadInit;
 use crate::time::Duration;
-use toyos_abi::syscall;
 
 pub struct Thread {
     tid: u32,
@@ -21,7 +22,10 @@ impl Thread {
         let layout = crate::alloc::Layout::from_size_align(stack_size, 4096).unwrap();
         let stack_base = unsafe { crate::alloc::alloc(layout) };
         if stack_base.is_null() {
-            return Err(io::const_error!(io::ErrorKind::OutOfMemory, "thread stack allocation failed"));
+            return Err(io::const_error!(
+                io::ErrorKind::OutOfMemory,
+                "thread stack allocation failed"
+            ));
         }
         let stack_top = stack_base.expose_provenance() as u64 + stack_size as u64;
 
@@ -37,8 +41,12 @@ impl Thread {
         };
 
         if syscall::SyscallError::from_u64(tid).is_some() {
-            unsafe { drop(Box::from_raw(data)); }
-            unsafe { crate::alloc::dealloc(stack_base, layout); }
+            unsafe {
+                drop(Box::from_raw(data));
+            }
+            unsafe {
+                crate::alloc::dealloc(stack_base, layout);
+            }
             return Err(io::const_error!(io::ErrorKind::Uncategorized, "thread spawn failed"));
         }
 
@@ -58,7 +66,9 @@ extern "C" fn thread_trampoline(data: u64) {
     main();
     // Run TLS destructors then clean up the current thread handle.
     // The guard module is no-op on ToyOS, so we drive cleanup explicitly.
-    unsafe { crate::sys::thread_local::destructors::run(); }
+    unsafe {
+        crate::sys::thread_local::destructors::run();
+    }
     crate::rt::thread_cleanup();
     syscall::thread_exit(0);
 }

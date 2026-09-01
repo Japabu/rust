@@ -80,7 +80,9 @@ where
 {
     let mut joined = OsString::new();
     for (i, path) in paths.enumerate() {
-        if i > 0 { joined.push(":"); }
+        if i > 0 {
+            joined.push(":");
+        }
         let p = path.as_ref();
         if p.as_encoded_bytes().contains(&b':') {
             return Err(JoinPathsError);

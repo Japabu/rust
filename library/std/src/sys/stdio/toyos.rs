@@ -1,10 +1,10 @@
-use crate::io::{self, IoSlice, IoSliceMut};
 use core::sync::atomic::{AtomicBool, Ordering};
-
-use crate::sys::to_io_error;
 
 use toyos_abi::RawHandle;
 use toyos_abi::syscall::{self, FileType};
+
+use crate::io::{self, IoSlice, IoSliceMut};
+use crate::sys::to_io_error;
 
 const STDIN: RawHandle = RawHandle(0);
 const STDOUT: RawHandle = RawHandle(1);
@@ -39,11 +39,7 @@ static mut LINE_BUF: LineBuf = LineBuf { buf: [0; LINE_BUF_CAP], len: 0, pos: 0 
 fn read_one() -> io::Result<u8> {
     let mut byte = [0u8; 1];
     let n = syscall::read(STDIN, &mut byte).map_err(to_io_error)?;
-    if n == 0 {
-        Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"))
-    } else {
-        Ok(byte[0])
-    }
+    if n == 0 { Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof")) } else { Ok(byte[0]) }
 }
 
 fn echo(bytes: &[u8]) {
@@ -133,7 +129,8 @@ impl Stdin {
 impl io::Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let stat = syscall::fstat(STDIN).ok();
-        let interactive = stat.is_some_and(|s| s.file_type == FileType::Keyboard || s.file_type == FileType::Tty);
+        let interactive =
+            stat.is_some_and(|s| s.file_type == FileType::Keyboard || s.file_type == FileType::Tty);
         if STDIN_RAW.load(Ordering::Relaxed) || !interactive {
             syscall::read(STDIN, buf).map_err(to_io_error)
         } else {

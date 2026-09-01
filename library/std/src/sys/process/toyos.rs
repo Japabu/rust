@@ -279,11 +279,7 @@ impl Command {
             // SAFETY: the kernel installed this handle in our table for this
             // call and no other.
             Process { handle: unsafe { toyos::process::Process::from_raw(handle) } },
-            StdioPipes {
-                stdin: stdin_pipe,
-                stdout: stdout_pipe,
-                stderr: stderr_pipe,
-            },
+            StdioPipes { stdin: stdin_pipe, stdout: stdout_pipe, stderr: stderr_pipe },
         ))
     }
 
@@ -300,7 +296,7 @@ impl Command {
         slot_map: &[[u32; 2]],
     ) -> io::Result<Option<Process>> {
         use toyos::launch::{
-            self, Launch, LaunchError, Outcome, MAX_LAUNCH_EXTRAS, MAX_LAUNCH_SLOTS,
+            self, Launch, LaunchError, MAX_LAUNCH_EXTRAS, MAX_LAUNCH_SLOTS, Outcome,
         };
 
         // A `provide` is a statement that the child's authority comes from its
@@ -342,12 +338,8 @@ impl Command {
             .iter()
             .map(|(name, handle)| (name.as_str(), toyos_abi::RawHandle(*handle)))
             .collect();
-        let cwd = self
-            .cwd
-            .as_ref()
-            .and_then(|c| c.to_str())
-            .map(String::from)
-            .unwrap_or_else(|| {
+        let cwd =
+            self.cwd.as_ref().and_then(|c| c.to_str()).map(String::from).unwrap_or_else(|| {
                 crate::env::current_dir()
                     .ok()
                     .and_then(|p| p.to_str().map(String::from))
@@ -519,11 +511,7 @@ impl Default for ExitStatus {
 
 impl ExitStatus {
     pub fn exit_ok(&self) -> Result<(), ExitStatusError> {
-        if self.0 == 0 {
-            Ok(())
-        } else {
-            Err(ExitStatusError(self.0))
-        }
+        if self.0 == 0 { Ok(()) } else { Err(ExitStatusError(self.0)) }
     }
 
     pub fn code(&self) -> Option<i32> {
@@ -595,10 +583,7 @@ impl Process {
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.handle
-            .wait()
-            .map(ExitStatus)
-            .map_err(|_| io::Error::from(io::ErrorKind::Other))
+        self.handle.wait().map(ExitStatus).map_err(|_| io::Error::from(io::ErrorKind::Other))
     }
 
     /// See `os::toyos::process::ChildExt::as_raw_handle`.
@@ -670,7 +655,10 @@ pub fn read_output(
     });
     out.read_to_end(stdout)?;
     match err_thread.join() {
-        Ok(Ok(buf)) => { *stderr = buf; Ok(()) }
+        Ok(Ok(buf)) => {
+            *stderr = buf;
+            Ok(())
+        }
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::new(io::ErrorKind::Other, "stderr reader thread panicked")),
     }

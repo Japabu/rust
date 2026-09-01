@@ -19,11 +19,7 @@ unsafe impl dlmalloc::Allocator for ToyOsAllocator {
                 MmapFlags::ANONYMOUS,
             )
         };
-        if ptr.is_null() {
-            (ptr::null_mut(), 0, 0)
-        } else {
-            (ptr, size, 0)
-        }
+        if ptr.is_null() { (ptr::null_mut(), 0, 0) } else { (ptr, size, 0) }
     }
 
     fn remap(&self, _ptr: *mut u8, _oldsize: usize, _newsize: usize, _can_move: bool) -> *mut u8 {

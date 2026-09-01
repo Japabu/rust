@@ -1,9 +1,7 @@
+use toyos_abi::{RawHandle, syscall};
+
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
-
 use crate::sys::to_io_error;
-
-use toyos_abi::RawHandle;
-use toyos_abi::syscall;
 
 #[derive(Debug)]
 pub struct Pipe {
@@ -82,4 +80,3 @@ impl Drop for Pipe {
         syscall::close(self.fd);
     }
 }
-

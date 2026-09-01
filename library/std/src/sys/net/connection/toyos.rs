@@ -1,15 +1,17 @@
+use toyos::AsHandle;
+use toyos::net::{NetError, TcpSocketId, UdpSocketId};
+use toyos::poller::{Poller, READABLE, WRITABLE};
+use toyos_abi::RawHandle;
+use toyos_abi::syscall::{self, SyscallError};
+
 use crate::fmt;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, ToSocketAddrs};
 use crate::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use crate::sync::Arc;
-use crate::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use crate::sync::atomic::Ordering::Relaxed;
+use crate::sync::atomic::{AtomicBool, AtomicU32};
 use crate::time::Duration;
-use toyos_abi::RawHandle;
-use toyos::AsHandle;
-use toyos::poller::{Poller, READABLE, WRITABLE};
-use toyos_abi::syscall::{self, SyscallError};
-use toyos::net::{NetError, TcpSocketId, UdpSocketId};
 
 // --- Helpers ---
 
@@ -30,10 +32,7 @@ fn net_err_to_io(e: NetError) -> io::Error {
 fn addr_to_v4(addr: &SocketAddr) -> io::Result<([u8; 4], u16)> {
     match addr {
         SocketAddr::V4(v4) => Ok((v4.ip().octets(), v4.port())),
-        SocketAddr::V6(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "IPv6 not supported",
-        )),
+        SocketAddr::V6(_) => Err(io::Error::new(io::ErrorKind::InvalidInput, "IPv6 not supported")),
     }
 }
 
@@ -99,9 +98,10 @@ impl TcpStream {
     }
 
     pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
-        let addr = addr.to_socket_addrs()?.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "no addresses found")
-        })?;
+        let addr = addr
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no addresses found"))?;
         Self::connect_timeout(&addr, Duration::from_secs(30))
     }
 
@@ -240,10 +240,7 @@ impl TcpStream {
     }
 
     pub fn socket_addr(&self) -> io::Result<SocketAddr> {
-        Ok(SocketAddr::V4(SocketAddrV4::new(
-            Ipv4Addr::new(10, 0, 2, 15),
-            self.local_port,
-        )))
+        Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), self.local_port)))
     }
 
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
@@ -349,9 +346,10 @@ impl TcpListener {
     }
 
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<TcpListener> {
-        let addr = addr.to_socket_addrs()?.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "no addresses found")
-        })?;
+        let addr = addr
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no addresses found"))?;
         let (ip, port) = addr_to_v4(&addr)?;
         let bound = toyos::net::tcp_bind(ip, port).map_err(net_err_to_io)?;
         Ok(TcpListener {
@@ -398,7 +396,8 @@ impl TcpListener {
     }
 
     pub fn duplicate(&self) -> io::Result<TcpListener> {
-        let new_fd = syscall::dup(RawHandle(self.notify_fd.as_raw_fd() as u32)).map_err(syscall_err)?;
+        let new_fd =
+            syscall::dup(RawHandle(self.notify_fd.as_raw_fd() as u32)).map_err(syscall_err)?;
         Ok(TcpListener {
             notify_fd: unsafe { OwnedFd::from_raw_fd(new_fd.0 as i32) },
             socket: Arc::clone(&self.socket),
@@ -470,19 +469,17 @@ impl UdpSocket {
     }
 
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
-        let addr = addr.to_socket_addrs()?.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "no addresses found")
-        })?;
+        let addr = addr
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no addresses found"))?;
         let (ip, port) = addr_to_v4(&addr)?;
         let bound = toyos::net::udp_bind(ip, port).map_err(net_err_to_io)?;
         Ok(UdpSocket {
             socket: Arc::new(NetdSocket::Udp(bound.socket_id)),
             tx_fd: unsafe { OwnedFd::from_raw_fd(bound.tx.into_raw().0 as i32) },
             rx_fd: unsafe { OwnedFd::from_raw_fd(bound.rx.into_raw().0 as i32) },
-            local: SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::from(ip),
-                bound.bound_port,
-            )),
+            local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), bound.bound_port)),
             peer: crate::sync::Mutex::new(None),
             read_timeout_ms: AtomicU32::new(0),
             write_timeout_ms: AtomicU32::new(0),
@@ -490,9 +487,10 @@ impl UdpSocket {
     }
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.peer.lock().unwrap().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "not connected")
-        })
+        self.peer
+            .lock()
+            .unwrap()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "not connected"))
     }
 
     pub fn socket_addr(&self) -> io::Result<SocketAddr> {
@@ -500,8 +498,8 @@ impl UdpSocket {
     }
 
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let resp = toyos::net::udp_recv_from(self.socket_id(), buf.len() as u32)
-            .map_err(net_err_to_io)?;
+        let resp =
+            toyos::net::udp_recv_from(self.socket_id(), buf.len() as u32).map_err(net_err_to_io)?;
 
         let n = (resp.len as usize).min(buf.len());
         if n > 0 {
@@ -532,8 +530,10 @@ impl UdpSocket {
     }
 
     pub fn duplicate(&self) -> io::Result<UdpSocket> {
-        let new_tx_fd = syscall::dup(RawHandle(self.tx_fd.as_raw_fd() as u32)).map_err(syscall_err)?;
-        let new_rx_fd = syscall::dup(RawHandle(self.rx_fd.as_raw_fd() as u32)).map_err(syscall_err)?;
+        let new_tx_fd =
+            syscall::dup(RawHandle(self.tx_fd.as_raw_fd() as u32)).map_err(syscall_err)?;
+        let new_rx_fd =
+            syscall::dup(RawHandle(self.rx_fd.as_raw_fd() as u32)).map_err(syscall_err)?;
         Ok(UdpSocket {
             socket: Arc::clone(&self.socket),
             tx_fd: unsafe { OwnedFd::from_raw_fd(new_tx_fd.0 as i32) },
@@ -639,16 +639,19 @@ impl UdpSocket {
     }
 
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        let peer = self.peer.lock().unwrap().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "not connected")
-        })?;
+        let peer = self
+            .peer
+            .lock()
+            .unwrap()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "not connected"))?;
         self.send_to(buf, &peer)
     }
 
     pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
-        let addr = addr.to_socket_addrs()?.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "no addresses found")
-        })?;
+        let addr = addr
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no addresses found"))?;
         *self.peer.lock().unwrap() = Some(addr);
         Ok(())
     }
@@ -685,10 +688,7 @@ impl Iterator for LookupHost {
 
 pub fn lookup_host(host: &str, port: u16) -> io::Result<LookupHost> {
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
-        return Ok(LookupHost {
-            addrs: vec![SocketAddr::V4(SocketAddrV4::new(ip, port))],
-            pos: 0,
-        });
+        return Ok(LookupHost { addrs: vec![SocketAddr::V4(SocketAddrV4::new(ip, port))], pos: 0 });
     }
 
     let mut results = [[0u8; 4]; 16];
