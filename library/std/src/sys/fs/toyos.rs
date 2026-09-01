@@ -6,22 +6,10 @@ use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
 use crate::path::{Path, PathBuf};
 pub use crate::sys::fs::common::Dir;
 use crate::sys::time::SystemTime;
+use crate::sys::to_io_error;
 
 use toyos_abi::RawHandle;
 use toyos_abi::syscall::{self, OpenFlags, SyscallError};
-
-fn to_io_error(e: SyscallError) -> io::Error {
-    let kind = match e {
-        SyscallError::NotFound => io::ErrorKind::NotFound,
-        SyscallError::PermissionDenied => io::ErrorKind::PermissionDenied,
-        SyscallError::AlreadyExists => io::ErrorKind::AlreadyExists,
-        SyscallError::InvalidArgument => io::ErrorKind::InvalidInput,
-        SyscallError::WouldBlock => io::ErrorKind::WouldBlock,
-        SyscallError::ResourceExhausted => io::ErrorKind::OutOfMemory,
-        _ => io::ErrorKind::Other,
-    };
-    io::Error::from(kind)
-}
 
 pub struct File(RawHandle);
 

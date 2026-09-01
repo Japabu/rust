@@ -1,16 +1,14 @@
 use crate::io::{self, IoSlice, IoSliceMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::sys::to_io_error;
+
 use toyos_abi::RawHandle;
-use toyos_abi::syscall::{self, FileType, SyscallError};
+use toyos_abi::syscall::{self, FileType};
 
 const STDIN: RawHandle = RawHandle(0);
 const STDOUT: RawHandle = RawHandle(1);
 const STDERR: RawHandle = RawHandle(2);
-
-fn to_io_error(e: SyscallError) -> io::Error {
-    io::Error::from(io::ErrorKind::Other)
-}
 
 // ---------------------------------------------------------------------------
 // Stdin mode flag (canonical by default, raw when explicitly switched)

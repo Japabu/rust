@@ -10,6 +10,30 @@ pub use unsupported_common::{cleanup, init};
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+/// The kernel's word as the `ErrorKind` a caller can act on.
+///
+/// Exhaustive: a new `SyscallError` has to be given a kind here rather than
+/// reaching callers as `Other` from whichever module mapped it last.
+pub fn to_io_error(e: toyos_abi::syscall::SyscallError) -> crate::io::Error {
+    use crate::io::ErrorKind;
+    use toyos_abi::syscall::SyscallError;
+
+    let kind = match e {
+        SyscallError::Unknown => ErrorKind::Uncategorized,
+        SyscallError::NotFound => ErrorKind::NotFound,
+        SyscallError::PermissionDenied => ErrorKind::PermissionDenied,
+        SyscallError::AlreadyExists => ErrorKind::AlreadyExists,
+        SyscallError::InvalidArgument => ErrorKind::InvalidInput,
+        SyscallError::BadAddress => ErrorKind::InvalidInput,
+        SyscallError::WouldBlock => ErrorKind::WouldBlock,
+        SyscallError::ResourceExhausted => ErrorKind::OutOfMemory,
+        SyscallError::NotSupported => ErrorKind::Unsupported,
+        SyscallError::Io => ErrorKind::Other,
+        SyscallError::Gone => ErrorKind::BrokenPipe,
+    };
+    crate::io::Error::from(kind)
+}
+
 // argc/argv stored by _start for std::env::args()
 pub(crate) static ARGC: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static ARGV: AtomicUsize = AtomicUsize::new(0); // *const *const u8 as usize

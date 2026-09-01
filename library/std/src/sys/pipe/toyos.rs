@@ -1,17 +1,9 @@
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 
-use toyos_abi::RawHandle;
-use toyos_abi::syscall::{self, SyscallError};
+use crate::sys::to_io_error;
 
-fn to_io_error(e: SyscallError) -> io::Error {
-    let kind = match e {
-        SyscallError::NotFound => io::ErrorKind::NotFound,
-        SyscallError::PermissionDenied => io::ErrorKind::PermissionDenied,
-        SyscallError::WouldBlock => io::ErrorKind::WouldBlock,
-        _ => io::ErrorKind::Other,
-    };
-    io::Error::from(kind)
-}
+use toyos_abi::RawHandle;
+use toyos_abi::syscall;
 
 #[derive(Debug)]
 pub struct Pipe {
