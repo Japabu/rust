@@ -31,9 +31,13 @@ impl SystemTime {
 
     pub const MIN: SystemTime = SystemTime(Duration::ZERO);
 
+    /// Panics on a machine whose clock will not answer, as the unix
+    /// implementation does for a failing `clock_gettime`: 1970 would be
+    /// indistinguishable from a machine that really is at the epoch.
     pub fn now() -> SystemTime {
-        // No wall clock — return epoch
-        SystemTime(Duration::from_secs(0))
+        let secs = toyos_abi::syscall::clock_epoch()
+            .expect("SYS_CLOCK_EPOCH: this machine will not say what time it is");
+        SystemTime(Duration::from_secs(secs))
     }
 
     pub fn sub_time(&self, other: &SystemTime) -> Result<Duration, Duration> {
